@@ -330,6 +330,55 @@ async function closeTabsByUrlPrefix(prefix, options = {}) {
   return matchedIds.length;
 }
 
+async function pingContentScriptOnTab(tabId) {
+  if (!Number.isInteger(tabId)) return null;
+
+  try {
+    return await chrome.tabs.sendMessage(tabId, {
+      type: 'PING',
+      source: 'background',
+      payload: {},
+    });
+  } catch {
+    return null;
+  }
+}
+
+async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
+  const { inject = null, injectSource = null } = options;
+  const pong = await pingContentScriptOnTab(tabId);
+
+  if (pong?.ok && (!pong.source || pong.source === source)) {
+    await registerTab(source, tabId);
+    return;
+  }
+
+  if (!inject || !inject.length) {
+    throw new Error(`${getSourceLabel(source)} 内容脚本未就绪，且未提供可用的注入文件。`);
+  }
+
+  const registry = await getTabRegistry();
+  if (registry[source]) {
+    registry[source].ready = false;
+    await setState({ tabRegistry: registry });
+  }
+
+  if (injectSource) {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: (injectedSource) => {
+        window.__MULTIPAGE_SOURCE = injectedSource;
+      },
+      args: [injectSource],
+    });
+  }
+
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: inject,
+  });
+}
+
 // ============================================================
 // Command Queue (for content scripts not yet ready)
 // ============================================================
@@ -2302,8 +2351,9 @@ async function executeStep8(state) {
         resolved = true;
         cleanupListener();
         clearTimeout(timeout);
-        completeStepFromBackground(8, { localhostUrl: details.url }).then(() => {
-          addLog(`步骤 8：已捕获 localhost 地址：${details.url}`, 'ok');
+        addLog(`步骤 8：已捕获 localhost 地址：${details.url}`, 'ok').then(() => {
+          return completeStepFromBackground(8, { localhostUrl: details.url });
+        }).then(() => {
           resolve();
         }).catch((err) => {
           reject(err);
@@ -2367,23 +2417,14 @@ async function executeStep9(state) {
 
   await addLog('步骤 9：正在打开 CPA 面板...');
 
+  const injectFiles = ['content/utils.js', 'content/vps-panel.js'];
   let tabId = await getTabId('vps-panel');
   const alive = tabId && await isTabAlive('vps-panel');
 
   if (!alive) {
-    await closeConflictingTabsForSource('vps-panel', state.vpsUrl);
-    // Create new tab
-    const tab = await chrome.tabs.create({ url: state.vpsUrl, active: true });
-    tabId = tab.id;
-    await rememberSourceLastUrl('vps-panel', state.vpsUrl);
-    await new Promise(resolve => {
-      const listener = (tid, info) => {
-        if (tid === tabId && info.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
+    tabId = await reuseOrCreateTab('vps-panel', state.vpsUrl, {
+      inject: injectFiles,
+      reloadIfSameUrl: true,
     });
   } else {
     await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
@@ -2391,21 +2432,25 @@ async function executeStep9(state) {
     await rememberSourceLastUrl('vps-panel', state.vpsUrl);
   }
 
-  // Inject scripts directly and wait for them to be ready
-  await chrome.scripting.executeScript({
-    target: { tabId },
-    files: ['content/utils.js', 'content/vps-panel.js'],
+  await ensureContentScriptReadyOnTab('vps-panel', tabId, {
+    inject: injectFiles,
   });
-  await new Promise(r => setTimeout(r, 1000));
 
-  // Send command directly — bypass queue/ready mechanism
   await addLog('步骤 9：正在填写回调地址...');
-  await chrome.tabs.sendMessage(tabId, {
+  const result = await sendToContentScriptResilient('vps-panel', {
     type: 'EXECUTE_STEP',
     step: 9,
     source: 'background',
     payload: { localhostUrl: state.localhostUrl, vpsPassword: state.vpsPassword },
+  }, {
+    timeoutMs: 30000,
+    retryDelayMs: 700,
+    logMessage: '步骤 9：CPA 面板通信未就绪，正在等待页面恢复...',
   });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
 }
 
 // ============================================================

@@ -17,10 +17,18 @@ const LOG_PREFIX = `[MultiPage:${SCRIPT_SOURCE}]`;
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 let flowStopped = false;
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'STOP_FLOW') {
     flowStopped = true;
     console.warn(LOG_PREFIX, STOP_ERROR_MESSAGE);
+    return;
+  }
+
+  if (message.type === 'PING') {
+    sendResponse({
+      ok: true,
+      source: SCRIPT_SOURCE,
+    });
   }
 });
 

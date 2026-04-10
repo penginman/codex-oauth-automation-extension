@@ -25,24 +25,32 @@
 
 console.log('[MultiPage:vps-panel] Content script loaded on', location.href);
 
-// Listen for commands from Background
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message.type === 'EXECUTE_STEP') {
-    resetStopState();
-    handleStep(message.step, message.payload).then(() => {
-      sendResponse({ ok: true });
-    }).catch(err => {
-      if (isStopError(err)) {
-        log(`步骤 ${message.step}：已被用户停止。`, 'warn');
-        sendResponse({ stopped: true, error: err.message });
-        return;
-      }
-      reportError(message.step, err.message);
-      sendResponse({ error: err.message });
-    });
-    return true;
-  }
-});
+const VPS_PANEL_LISTENER_SENTINEL = 'data-multipage-vps-panel-listener';
+
+if (document.documentElement.getAttribute(VPS_PANEL_LISTENER_SENTINEL) !== '1') {
+  document.documentElement.setAttribute(VPS_PANEL_LISTENER_SENTINEL, '1');
+
+  // Listen for commands from Background
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message.type === 'EXECUTE_STEP') {
+      resetStopState();
+      handleStep(message.step, message.payload).then(() => {
+        sendResponse({ ok: true });
+      }).catch(err => {
+        if (isStopError(err)) {
+          log(`步骤 ${message.step}：已被用户停止。`, 'warn');
+          sendResponse({ stopped: true, error: err.message });
+          return;
+        }
+        reportError(message.step, err.message);
+        sendResponse({ error: err.message });
+      });
+      return true;
+    }
+  });
+} else {
+  console.log('[MultiPage:vps-panel] 消息监听已存在，跳过重复注册');
+}
 
 async function handleStep(step, payload) {
   switch (step) {
