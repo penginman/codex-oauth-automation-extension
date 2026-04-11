@@ -436,6 +436,52 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
 
 const pendingCommands = new Map(); // source -> { message, resolve, reject, timer }
 
+function getContentScriptResponseTimeoutMs(message) {
+  if (!message || typeof message !== 'object') {
+    return 30000;
+  }
+
+  if (message.type === 'POLL_EMAIL') {
+    const maxAttempts = Math.max(1, Number(message.payload?.maxAttempts) || 1);
+    const intervalMs = Math.max(0, Number(message.payload?.intervalMs) || 0);
+    return Math.max(45000, maxAttempts * intervalMs + 25000);
+  }
+
+  if (message.type === 'FILL_CODE') {
+    return Number(message.step) === 7 ? 45000 : 30000;
+  }
+
+  if (message.type === 'PREPARE_SIGNUP_VERIFICATION') {
+    return 45000;
+  }
+
+  return 30000;
+}
+
+function sendTabMessageWithTimeout(tabId, source, message, responseTimeoutMs = getContentScriptResponseTimeoutMs(message)) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+
+    const finalize = (callback) => (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback(value);
+    };
+
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      const seconds = Math.ceil(responseTimeoutMs / 1000);
+      reject(new Error(`Content script on ${source} did not respond in ${seconds}s. Try refreshing the tab and retry.`));
+    }, responseTimeoutMs);
+
+    chrome.tabs.sendMessage(tabId, message)
+      .then(finalize(resolve))
+      .catch(finalize(reject));
+  });
+}
+
 function queueCommand(source, message, timeout = 15000) {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -454,7 +500,7 @@ function flushCommand(source, tabId) {
   if (pending) {
     clearTimeout(pending.timer);
     pendingCommands.delete(source);
-    chrome.tabs.sendMessage(tabId, pending.message).then(pending.resolve).catch(pending.reject);
+    sendTabMessageWithTimeout(tabId, source, pending.message).then(pending.resolve).catch(pending.reject);
     console.log(LOG_PREFIX, `Flushed queued command to ${source} (tab ${tabId})`);
   }
 }
@@ -614,7 +660,8 @@ async function reuseOrCreateTab(source, url, options = {}) {
 // Send command to content script (with readiness check)
 // ============================================================
 
-async function sendToContentScript(source, message) {
+async function sendToContentScript(source, message, options = {}) {
+  const { responseTimeoutMs = getContentScriptResponseTimeoutMs(message) } = options;
   const registry = await getTabRegistry();
   const entry = registry[source];
 
@@ -632,7 +679,7 @@ async function sendToContentScript(source, message) {
   }
 
   console.log(LOG_PREFIX, `Sending to ${source} (tab ${entry.tabId}):`, message.type);
-  return chrome.tabs.sendMessage(entry.tabId, message);
+  return sendTabMessageWithTimeout(entry.tabId, source, message, responseTimeoutMs);
 }
 
 async function sendToContentScriptResilient(source, message, options = {}) {
@@ -756,7 +803,7 @@ function isStopError(error) {
 
 function isRetryableContentScriptTransportError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response/i.test(message);
+  return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response|did not respond in \d+s/i.test(message);
 }
 
 function getErrorMessage(error) {
