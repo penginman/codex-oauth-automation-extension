@@ -2607,6 +2607,7 @@ let step8PendingReject = null;
 const STEP8_CLICK_EFFECT_TIMEOUT_MS = 3500;
 const STEP8_CLICK_RETRY_DELAY_MS = 500;
 const STEP8_READY_WAIT_TIMEOUT_MS = 30000;
+const STEP8_SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/signup-page.js'];
 const STEP8_STRATEGIES = [
   { mode: 'content', strategy: 'requestSubmit', label: 'form.requestSubmit' },
   { mode: 'debugger', label: 'debugger click' },
@@ -2643,6 +2644,16 @@ function throwIfStep8SettledOrStopped(isSettled = false) {
   }
 }
 
+async function ensureStep8SignupPageReady(tabId, options = {}) {
+  await ensureContentScriptReadyOnTab('signup-page', tabId, {
+    inject: STEP8_SIGNUP_PAGE_INJECT_FILES,
+    injectSource: 'signup-page',
+    timeoutMs: options.timeoutMs ?? 15000,
+    retryDelayMs: options.retryDelayMs ?? 600,
+    logMessage: options.logMessage || '',
+  });
+}
+
 async function getStep8PageState(tabId, responseTimeoutMs = 1500) {
   try {
     const result = await sendTabMessageWithTimeout(tabId, 'signup-page', {
@@ -2664,6 +2675,7 @@ async function getStep8PageState(tabId, responseTimeoutMs = 1500) {
 
 async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS) {
   const start = Date.now();
+  let recovered = false;
 
   while (Date.now() - start < timeoutMs) {
     throwIfStopped();
@@ -2674,13 +2686,26 @@ async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS)
     if (pageState?.consentReady) {
       return pageState;
     }
+    if (pageState === null && !recovered) {
+      recovered = true;
+      await ensureStep8SignupPageReady(tabId, {
+        timeoutMs: Math.min(10000, timeoutMs),
+        logMessage: '步骤 8：认证页内容脚本已失联，正在等待页面重新就绪...',
+      });
+      continue;
+    }
+    recovered = false;
     await sleepWithStop(250);
   }
 
   throw new Error('步骤 8：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
 }
 
-async function prepareStep8DebuggerClick() {
+async function prepareStep8DebuggerClick(tabId) {
+  await ensureStep8SignupPageReady(tabId, {
+    timeoutMs: 15000,
+    logMessage: '步骤 8：认证页内容脚本已失联，正在恢复后继续定位按钮...',
+  });
   const result = await sendToContentScriptResilient('signup-page', {
     type: 'STEP8_FIND_AND_CLICK',
     source: 'background',
@@ -2698,7 +2723,11 @@ async function prepareStep8DebuggerClick() {
   return result;
 }
 
-async function triggerStep8ContentStrategy(strategy) {
+async function triggerStep8ContentStrategy(tabId, strategy) {
+  await ensureStep8SignupPageReady(tabId, {
+    timeoutMs: 15000,
+    logMessage: '步骤 8：认证页内容脚本已失联，正在恢复后继续点击“继续”按钮...',
+  });
   const result = await sendToContentScriptResilient('signup-page', {
     type: 'STEP8_TRIGGER_CONTINUE',
     source: 'background',
@@ -2722,6 +2751,7 @@ async function triggerStep8ContentStrategy(strategy) {
 
 async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLICK_EFFECT_TIMEOUT_MS) {
   const start = Date.now();
+  let recovered = false;
 
   while (Date.now() - start < timeoutMs) {
     throwIfStopped();
@@ -2740,8 +2770,17 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
       throw new Error('步骤 8：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
     }
     if (pageState === null) {
+      if (!recovered) {
+        recovered = true;
+        await ensureStep8SignupPageReady(tabId, {
+          timeoutMs: Math.max(3000, Math.min(8000, timeoutMs)),
+          logMessage: '步骤 8：点击后认证页正在重载，正在等待内容脚本重新就绪...',
+        }).catch(() => null);
+        continue;
+      }
       return { progressed: true, reason: 'page_reloading' };
     }
+    recovered = false;
     if (pageState && !pageState.consentPage) {
       return { progressed: true, reason: 'left_consent_page', url: pageState.url };
     }
@@ -2846,6 +2885,10 @@ async function executeStep8(state) {
         chrome.webNavigation.onBeforeNavigate.addListener(webNavListener);
         chrome.webNavigation.onCommitted.addListener(webNavCommittedListener);
         chrome.tabs.onUpdated.addListener(step8TabUpdatedListener);
+        await ensureStep8SignupPageReady(signupTabId, {
+          timeoutMs: 15000,
+          logMessage: '步骤 8：认证页内容脚本尚未就绪，正在等待页面恢复...',
+        });
 
         let attempt = 0;
         while (!resolved) {
@@ -2863,11 +2906,11 @@ async function executeStep8(state) {
           await addLog(`步骤 8：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
 
           if (strategy.mode === 'debugger') {
-            const clickTarget = await prepareStep8DebuggerClick();
+            const clickTarget = await prepareStep8DebuggerClick(signupTabId);
             throwIfStep8SettledOrStopped(resolved);
             await clickWithDebugger(signupTabId, clickTarget?.rect);
           } else {
-            await triggerStep8ContentStrategy(strategy.strategy);
+            await triggerStep8ContentStrategy(signupTabId, strategy.strategy);
           }
 
           if (resolved) {
