@@ -2904,9 +2904,10 @@ let webNavListener = null;
 let webNavCommittedListener = null;
 let step8TabUpdatedListener = null;
 let step8PendingReject = null;
-const STEP8_CLICK_EFFECT_TIMEOUT_MS = 3500;
+const STEP8_CLICK_EFFECT_TIMEOUT_MS = 10000;
 const STEP8_CLICK_RETRY_DELAY_MS = 500;
 const STEP8_READY_WAIT_TIMEOUT_MS = 30000;
+const STEP8_MAX_ROUNDS = 5;
 const STEP8_SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/signup-page.js'];
 const STEP8_STRATEGIES = [
   { mode: 'content', strategy: 'requestSubmit', label: 'form.requestSubmit' },
@@ -3049,6 +3050,48 @@ async function triggerStep8ContentStrategy(tabId, strategy) {
   return result;
 }
 
+async function reloadStep8ConsentPage(tabId, timeoutMs = 30000) {
+  if (!Number.isInteger(tabId)) {
+    throw new Error('步骤 8：缺少有效的认证页标签页，无法刷新后重试。');
+  }
+
+  await chrome.tabs.update(tabId, { active: true }).catch(() => { });
+
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('步骤 8：刷新认证页后等待页面完成加载超时。'));
+    }, timeoutMs);
+
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status !== 'complete') return;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.reload(tabId, { bypassCache: false }).catch((err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(err);
+    });
+  });
+
+  await ensureStep8SignupPageReady(tabId, {
+    timeoutMs: Math.min(15000, timeoutMs),
+    logMessage: '步骤 8：认证页刷新后内容脚本尚未就绪，正在等待页面恢复...',
+  });
+}
+
 async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLICK_EFFECT_TIMEOUT_MS) {
   const start = Date.now();
   let recovered = false;
@@ -3078,12 +3121,10 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
         }).catch(() => null);
         continue;
       }
-      return { progressed: true, reason: 'page_reloading' };
+      await sleepWithStop(200);
+      continue;
     }
     recovered = false;
-    if (pageState && !pageState.consentPage) {
-      return { progressed: true, reason: 'left_consent_page', url: pageState.url };
-    }
 
     await sleepWithStop(200);
   }
@@ -3190,8 +3231,7 @@ async function executeStep8(state) {
           logMessage: '步骤 8：认证页内容脚本尚未就绪，正在等待页面恢复...',
         });
 
-        let attempt = 0;
-        while (!resolved) {
+        for (let round = 1; round <= STEP8_MAX_ROUNDS && !resolved; round++) {
           throwIfStep8SettledOrStopped(resolved);
           const pageState = await waitForStep8Ready(signupTabId);
           if (!pageState?.consentReady) {
@@ -3199,11 +3239,9 @@ async function executeStep8(state) {
             continue;
           }
 
-          const strategy = STEP8_STRATEGIES[attempt % STEP8_STRATEGIES.length];
-          const round = attempt + 1;
-          attempt += 1;
+          const strategy = STEP8_STRATEGIES[Math.min(round - 1, STEP8_STRATEGIES.length - 1)];
 
-          await addLog(`步骤 8：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
+          await addLog(`步骤 8：第 ${round}/${STEP8_MAX_ROUNDS} 轮尝试点击“继续”（${strategy.label}）...`);
 
           if (strategy.mode === 'debugger') {
             const clickTarget = await prepareStep8DebuggerClick(signupTabId);
@@ -3227,7 +3265,12 @@ async function executeStep8(state) {
             break;
           }
 
-          await addLog(`步骤 8：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
+          if (round >= STEP8_MAX_ROUNDS) {
+            throw new Error(`步骤 8：连续 ${STEP8_MAX_ROUNDS} 轮点击“继续”后页面仍无反应。`);
+          }
+
+          await addLog(`步骤 8：${strategy.label} 本轮点击后页面无反应，正在刷新认证页后重试（下一轮 ${round + 1}/${STEP8_MAX_ROUNDS}）...`, 'warn');
+          await reloadStep8ConsentPage(signupTabId);
           await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
         }
       } catch (err) {
