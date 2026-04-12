@@ -27,16 +27,28 @@ const stepsProgress = document.getElementById('steps-progress');
 const btnAutoRun = document.getElementById('btn-auto-run');
 const btnAutoContinue = document.getElementById('btn-auto-continue');
 const autoContinueBar = document.getElementById('auto-continue-bar');
+const autoScheduleBar = document.getElementById('auto-schedule-bar');
+const autoScheduleTitle = document.getElementById('auto-schedule-title');
+const autoScheduleMeta = document.getElementById('auto-schedule-meta');
+const btnAutoRunNow = document.getElementById('btn-auto-run-now');
+const btnAutoCancelSchedule = document.getElementById('btn-auto-cancel-schedule');
 const btnClearLog = document.getElementById('btn-clear-log');
 const inputVpsUrl = document.getElementById('input-vps-url');
 const inputVpsPassword = document.getElementById('input-vps-password');
 const selectMailProvider = document.getElementById('select-mail-provider');
+const selectEmailGenerator = document.getElementById('select-email-generator');
 const rowInbucketHost = document.getElementById('row-inbucket-host');
 const inputInbucketHost = document.getElementById('input-inbucket-host');
 const rowInbucketMailbox = document.getElementById('row-inbucket-mailbox');
 const inputInbucketMailbox = document.getElementById('input-inbucket-mailbox');
+const rowCfDomain = document.getElementById('row-cf-domain');
+const selectCfDomain = document.getElementById('select-cf-domain');
+const inputCfDomain = document.getElementById('input-cf-domain');
+const btnCfDomainMode = document.getElementById('btn-cf-domain-mode');
 const inputRunCount = document.getElementById('input-run-count');
 const inputAutoSkipFailures = document.getElementById('input-auto-skip-failures');
+const inputAutoDelayEnabled = document.getElementById('input-auto-delay-enabled');
+const inputAutoDelayMinutes = document.getElementById('input-auto-delay-minutes');
 const autoStartModal = document.getElementById('auto-start-modal');
 const autoStartTitle = autoStartModal?.querySelector('.modal-title');
 const autoStartMessage = document.getElementById('auto-start-message');
@@ -56,6 +68,9 @@ const STEP_DEFAULT_STATUSES = {
   9: 'pending',
 };
 const SKIPPABLE_STEPS = new Set([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+const AUTO_DELAY_MIN_MINUTES = 1;
+const AUTO_DELAY_MAX_MINUTES = 1440;
+const AUTO_DELAY_DEFAULT_MINUTES = 30;
 
 let latestState = null;
 let currentAutoRun = {
@@ -64,12 +79,15 @@ let currentAutoRun = {
   currentRun: 0,
   totalRuns: 1,
   attemptRun: 0,
+  scheduledAt: null,
 };
 let settingsDirty = false;
 let settingsSaveInFlight = false;
 let settingsAutoSaveTimer = null;
+let cloudflareDomainEditMode = false;
 let modalChoiceResolver = null;
 let currentModalActions = [];
+let scheduledCountdownTimer = null;
 
 const EYE_OPEN_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_CLOSED_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19C5 19 1 12 1 12a21.77 21.77 0 0 1 5.06-6.94"/><path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.86 21.86 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>';
@@ -240,7 +258,7 @@ function syncAutoRunState(source = {}) {
   const autoRunning = source.autoRunning !== undefined
     ? Boolean(source.autoRunning)
     : (source.autoRunPhase !== undefined || source.phase !== undefined
-      ? ['running', 'waiting_email', 'retrying'].includes(phase)
+      ? ['scheduled', 'running', 'waiting_email', 'retrying'].includes(phase)
       : currentAutoRun.autoRunning);
 
   currentAutoRun = {
@@ -249,6 +267,7 @@ function syncAutoRunState(source = {}) {
     currentRun: source.autoRunCurrentRun ?? source.currentRun ?? currentAutoRun.currentRun,
     totalRuns: source.autoRunTotalRuns ?? source.totalRuns ?? currentAutoRun.totalRuns,
     attemptRun: source.autoRunAttemptRun ?? source.attemptRun ?? currentAutoRun.attemptRun,
+    scheduledAt: source.scheduledAutoRunAt ?? source.scheduledAt ?? currentAutoRun.scheduledAt,
   };
 }
 
@@ -260,12 +279,92 @@ function isAutoRunPausedPhase() {
   return currentAutoRun.phase === 'waiting_email';
 }
 
+function isAutoRunScheduledPhase() {
+  return currentAutoRun.phase === 'scheduled';
+}
+
 function getAutoRunLabel(payload = currentAutoRun) {
+  if ((payload.phase ?? currentAutoRun.phase) === 'scheduled') {
+    return (payload.totalRuns || 1) > 1 ? ` (${payload.totalRuns}轮)` : '';
+  }
   const attemptLabel = payload.attemptRun ? ` · 尝试${payload.attemptRun}` : '';
   if ((payload.totalRuns || 1) > 1) {
     return ` (${payload.currentRun}/${payload.totalRuns}${attemptLabel})`;
   }
   return attemptLabel ? ` (${attemptLabel.slice(3)})` : '';
+}
+
+function normalizeAutoDelayMinutes(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return AUTO_DELAY_DEFAULT_MINUTES;
+  }
+  return Math.min(AUTO_DELAY_MAX_MINUTES, Math.max(AUTO_DELAY_MIN_MINUTES, Math.floor(numeric)));
+}
+
+function updateAutoDelayInputState() {
+  const scheduled = isAutoRunScheduledPhase();
+  inputAutoDelayEnabled.disabled = scheduled;
+  inputAutoDelayMinutes.disabled = scheduled || !inputAutoDelayEnabled.checked;
+}
+
+function formatCountdown(remainingMs) {
+  const totalSeconds = Math.max(0, Math.ceil(remainingMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+}
+
+function formatScheduleTime(timestamp) {
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    hour12: false,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+function stopScheduledCountdownTicker() {
+  clearInterval(scheduledCountdownTimer);
+  scheduledCountdownTimer = null;
+}
+
+function renderScheduledAutoRunInfo() {
+  if (!autoScheduleBar) {
+    return;
+  }
+
+  if (!isAutoRunScheduledPhase() || !Number.isFinite(currentAutoRun.scheduledAt)) {
+    autoScheduleBar.style.display = 'none';
+    return;
+  }
+
+  const remainingMs = currentAutoRun.scheduledAt - Date.now();
+  autoScheduleBar.style.display = 'flex';
+  autoScheduleTitle.textContent = '已计划自动运行';
+  autoScheduleMeta.textContent = remainingMs > 0
+    ? `计划于 ${formatScheduleTime(currentAutoRun.scheduledAt)} 开始，剩余 ${formatCountdown(remainingMs)}`
+    : '倒计时即将结束，正在准备启动...';
+}
+
+function syncScheduledCountdownTicker() {
+  renderScheduledAutoRunInfo();
+  if (!isAutoRunScheduledPhase() || !Number.isFinite(currentAutoRun.scheduledAt)) {
+    stopScheduledCountdownTicker();
+    return;
+  }
+
+  if (scheduledCountdownTimer) {
+    return;
+  }
+
+  scheduledCountdownTimer = setInterval(() => {
+    renderScheduledAutoRunInfo();
+    updateStatusDisplay(latestState);
+  }, 1000);
 }
 
 function setDefaultAutoRunButton() {
@@ -274,15 +373,99 @@ function setDefaultAutoRunButton() {
   btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg> 自动';
 }
 
+function normalizeCloudflareDomainValue(value = '') {
+  let normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '';
+  normalized = normalized.replace(/^@+/, '');
+  normalized = normalized.replace(/^https?:\/\//, '');
+  normalized = normalized.replace(/\/.*$/, '');
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(normalized)) {
+    return '';
+  }
+  return normalized;
+}
+
+function normalizeCloudflareDomains(values = []) {
+  const seen = new Set();
+  const domains = [];
+  for (const value of Array.isArray(values) ? values : []) {
+    const normalized = normalizeCloudflareDomainValue(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    domains.push(normalized);
+  }
+  return domains;
+}
+
+function getCloudflareDomainsFromState() {
+  const domains = normalizeCloudflareDomains(latestState?.cloudflareDomains || []);
+  const activeDomain = normalizeCloudflareDomainValue(latestState?.cloudflareDomain || '');
+  if (activeDomain && !domains.includes(activeDomain)) {
+    domains.unshift(activeDomain);
+  }
+  return { domains, activeDomain: activeDomain || domains[0] || '' };
+}
+
+function renderCloudflareDomainOptions(preferredDomain = '') {
+  const preferred = normalizeCloudflareDomainValue(preferredDomain);
+  const { domains, activeDomain } = getCloudflareDomainsFromState();
+  const selected = preferred || activeDomain;
+
+  selectCfDomain.innerHTML = '';
+  if (domains.length === 0) {
+    const option = document.createElement('option');
+    option.value = '';
+    option.textContent = '请先添加域名';
+    selectCfDomain.appendChild(option);
+    selectCfDomain.disabled = true;
+    selectCfDomain.value = '';
+    return;
+  }
+
+  for (const domain of domains) {
+    const option = document.createElement('option');
+    option.value = domain;
+    option.textContent = domain;
+    selectCfDomain.appendChild(option);
+  }
+  selectCfDomain.disabled = false;
+  selectCfDomain.value = domains.includes(selected) ? selected : domains[0];
+}
+
+function setCloudflareDomainEditMode(editing, options = {}) {
+  const { clearInput = false } = options;
+  cloudflareDomainEditMode = Boolean(editing);
+  selectCfDomain.style.display = cloudflareDomainEditMode ? 'none' : '';
+  inputCfDomain.style.display = cloudflareDomainEditMode ? '' : 'none';
+  btnCfDomainMode.textContent = cloudflareDomainEditMode ? '保存' : '添加';
+  if (cloudflareDomainEditMode) {
+    if (clearInput) {
+      inputCfDomain.value = '';
+    }
+    inputCfDomain.focus();
+  } else if (clearInput) {
+    inputCfDomain.value = '';
+  }
+}
+
 function collectSettingsPayload() {
+  const { domains, activeDomain } = getCloudflareDomainsFromState();
+  const selectedCloudflareDomain = normalizeCloudflareDomainValue(
+    !cloudflareDomainEditMode ? selectCfDomain.value : activeDomain
+  ) || activeDomain;
   return {
     vpsUrl: inputVpsUrl.value.trim(),
     vpsPassword: inputVpsPassword.value,
     customPassword: inputPassword.value,
     mailProvider: selectMailProvider.value,
+    emailGenerator: selectEmailGenerator.value,
     inbucketHost: inputInbucketHost.value.trim(),
     inbucketMailbox: inputInbucketMailbox.value.trim(),
+    cloudflareDomain: selectedCloudflareDomain,
+    cloudflareDomains: domains,
     autoRunSkipFailures: inputAutoSkipFailures.checked,
+    autoRunDelayEnabled: inputAutoDelayEnabled.checked,
+    autoRunDelayMinutes: normalizeAutoDelayMinutes(inputAutoDelayMinutes.value),
   };
 }
 
@@ -350,13 +533,23 @@ function applyAutoRunStatus(payload = currentAutoRun) {
   const runLabel = getAutoRunLabel(currentAutoRun);
   const locked = isAutoRunLockedPhase();
   const paused = isAutoRunPausedPhase();
+  const scheduled = isAutoRunScheduledPhase();
 
   inputRunCount.disabled = currentAutoRun.autoRunning;
   btnAutoRun.disabled = currentAutoRun.autoRunning;
   btnFetchEmail.disabled = locked;
   inputEmail.disabled = locked;
+  inputAutoSkipFailures.disabled = scheduled;
+
+  if (currentAutoRun.totalRuns > 0) {
+    inputRunCount.value = String(currentAutoRun.totalRuns);
+  }
 
   switch (currentAutoRun.phase) {
+    case 'scheduled':
+      autoContinueBar.style.display = 'none';
+      btnAutoRun.innerHTML = `已计划${runLabel}`;
+      break;
     case 'waiting_email':
       autoContinueBar.style.display = 'flex';
       btnAutoRun.innerHTML = `已暂停${runLabel}`;
@@ -379,7 +572,9 @@ function applyAutoRunStatus(payload = currentAutoRun) {
       break;
   }
 
-  updateStopButtonState(paused || locked || Object.values(getStepStatuses()).some(status => status === 'running'));
+  updateAutoDelayInputState();
+  syncScheduledCountdownTicker();
+  updateStopButtonState(scheduled || paused || locked || Object.values(getStepStatuses()).some(status => status === 'running'));
 }
 
 function initializeManualStepActions() {
@@ -444,13 +639,23 @@ async function restoreState() {
     if (state.mailProvider) {
       selectMailProvider.value = state.mailProvider;
     }
+    if (state.emailGenerator) {
+      selectEmailGenerator.value = state.emailGenerator;
+    }
     if (state.inbucketHost) {
       inputInbucketHost.value = state.inbucketHost;
     }
     if (state.inbucketMailbox) {
       inputInbucketMailbox.value = state.inbucketMailbox;
     }
+    renderCloudflareDomainOptions(state.cloudflareDomain || '');
+    setCloudflareDomainEditMode(false, { clearInput: true });
     inputAutoSkipFailures.checked = Boolean(state.autoRunSkipFailures);
+    inputAutoDelayEnabled.checked = Boolean(state.autoRunDelayEnabled);
+    inputAutoDelayMinutes.value = String(normalizeAutoDelayMinutes(state.autoRunDelayMinutes));
+    if (state.autoRunTotalRuns) {
+      inputRunCount.value = String(state.autoRunTotalRuns);
+    }
 
     if (state.stepStatuses) {
       for (const [step, status] of Object.entries(state.stepStatuses)) {
@@ -466,6 +671,7 @@ async function restoreState() {
 
     applyAutoRunStatus(state);
     markSettingsDirty(false);
+    updateAutoDelayInputState();
     updateStatusDisplay(latestState);
     updateProgressCounter();
     updateMailProviderUI();
@@ -479,10 +685,78 @@ function syncPasswordField(state) {
   inputPassword.value = state.customPassword || state.password || '';
 }
 
+function getSelectedEmailGenerator() {
+  return selectEmailGenerator.value === 'cloudflare' ? 'cloudflare' : 'duck';
+}
+
+function getEmailGeneratorUiCopy() {
+  if (getSelectedEmailGenerator() === 'cloudflare') {
+    return {
+      buttonLabel: '生成 Cloudflare',
+      placeholder: '点击生成 Cloudflare 邮箱，或手动粘贴邮箱',
+      successVerb: '生成',
+      label: 'Cloudflare 邮箱',
+    };
+  }
+
+  return {
+    buttonLabel: '获取 Duck',
+    placeholder: '点击获取 DuckDuckGo 邮箱，或手动粘贴邮箱',
+    successVerb: '获取',
+    label: 'Duck 邮箱',
+  };
+}
+
 function updateMailProviderUI() {
   const useInbucket = selectMailProvider.value === 'inbucket';
   rowInbucketHost.style.display = useInbucket ? '' : 'none';
   rowInbucketMailbox.style.display = useInbucket ? '' : 'none';
+  const useCloudflare = selectEmailGenerator.value === 'cloudflare';
+  rowCfDomain.style.display = useCloudflare ? '' : 'none';
+  const { domains } = getCloudflareDomainsFromState();
+  if (useCloudflare) {
+    setCloudflareDomainEditMode(cloudflareDomainEditMode || domains.length === 0, { clearInput: false });
+  } else {
+    setCloudflareDomainEditMode(false, { clearInput: false });
+  }
+
+  const uiCopy = getEmailGeneratorUiCopy();
+  inputEmail.placeholder = uiCopy.placeholder;
+  if (!btnFetchEmail.disabled) {
+    btnFetchEmail.textContent = uiCopy.buttonLabel;
+  }
+}
+
+async function saveCloudflareDomainSettings(domains, activeDomain, options = {}) {
+  const { silent = false } = options;
+  const normalizedDomains = normalizeCloudflareDomains(domains);
+  const normalizedActiveDomain = normalizeCloudflareDomainValue(activeDomain) || normalizedDomains[0] || '';
+  const payload = {
+    cloudflareDomain: normalizedActiveDomain,
+    cloudflareDomains: normalizedDomains,
+  };
+
+  const response = await chrome.runtime.sendMessage({
+    type: 'SAVE_SETTING',
+    source: 'sidepanel',
+    payload,
+  });
+
+  if (response?.error) {
+    throw new Error(response.error);
+  }
+
+  syncLatestState({
+    ...payload,
+  });
+  renderCloudflareDomainOptions(normalizedActiveDomain);
+  setCloudflareDomainEditMode(false, { clearInput: true });
+  markSettingsDirty(false);
+  updateMailProviderUI();
+
+  if (!silent) {
+    showToast('Cloudflare 域名已保存', 'success', 1800);
+  }
 }
 
 // ============================================================
@@ -518,12 +792,13 @@ function updateButtonStates() {
   const statuses = getStepStatuses();
   const anyRunning = Object.values(statuses).some(s => s === 'running');
   const autoLocked = isAutoRunLockedPhase();
+  const autoScheduled = isAutoRunScheduledPhase();
 
   for (let step = 1; step <= 9; step++) {
     const btn = document.querySelector(`.step-btn[data-step="${step}"]`);
     if (!btn) continue;
 
-    if (anyRunning || autoLocked) {
+    if (anyRunning || autoLocked || autoScheduled) {
       btn.disabled = true;
     } else if (step === 1) {
       btn.disabled = false;
@@ -539,7 +814,7 @@ function updateButtonStates() {
     const currentStatus = statuses[step];
     const prevStatus = statuses[step - 1];
 
-    if (!SKIPPABLE_STEPS.has(step) || anyRunning || autoLocked || currentStatus === 'running' || isDoneStatus(currentStatus)) {
+    if (!SKIPPABLE_STEPS.has(step) || anyRunning || autoLocked || autoScheduled || currentStatus === 'running' || isDoneStatus(currentStatus)) {
       btn.style.display = 'none';
       btn.disabled = true;
       btn.title = '当前不可跳过';
@@ -558,7 +833,8 @@ function updateButtonStates() {
     btn.title = `跳过步骤 ${step}`;
   });
 
-  updateStopButtonState(anyRunning || isAutoRunPausedPhase() || autoLocked);
+  btnReset.disabled = anyRunning || autoScheduled || isAutoRunPausedPhase() || autoLocked;
+  updateStopButtonState(anyRunning || autoScheduled || isAutoRunPausedPhase() || autoLocked);
 }
 
 function updateStopButtonState(active) {
@@ -569,6 +845,17 @@ function updateStatusDisplay(state) {
   if (!state || !state.stepStatuses) return;
 
   statusBar.className = 'status-bar';
+
+  if (isAutoRunScheduledPhase()) {
+    const remainingMs = Number.isFinite(currentAutoRun.scheduledAt)
+      ? currentAutoRun.scheduledAt - Date.now()
+      : 0;
+    displayStatus.textContent = remainingMs > 0
+      ? `自动计划中，剩余 ${formatCountdown(remainingMs)}`
+      : '倒计时即将结束，正在准备启动...';
+    statusBar.classList.add('scheduled');
+    return;
+  }
 
   if (isAutoRunPausedPhase()) {
     displayStatus.textContent = `自动已暂停${getAutoRunLabel()}，等待邮箱后继续`;
@@ -647,32 +934,36 @@ function escapeHtml(text) {
   return div.innerHTML;
 }
 
-async function fetchDuckEmail(options = {}) {
+async function fetchGeneratedEmail(options = {}) {
   const { showFailureToast = true } = options;
-  const defaultLabel = '获取';
+  const uiCopy = getEmailGeneratorUiCopy();
+  const defaultLabel = uiCopy.buttonLabel;
   btnFetchEmail.disabled = true;
   btnFetchEmail.textContent = '...';
 
   try {
     const response = await chrome.runtime.sendMessage({
-      type: 'FETCH_DUCK_EMAIL',
+      type: 'FETCH_GENERATED_EMAIL',
       source: 'sidepanel',
-      payload: { generateNew: true },
+      payload: {
+        generateNew: true,
+        generator: selectEmailGenerator.value,
+      },
     });
 
     if (response?.error) {
       throw new Error(response.error);
     }
     if (!response?.email) {
-      throw new Error('未返回 Duck 邮箱。');
+      throw new Error('未返回可用邮箱。');
     }
 
     inputEmail.value = response.email;
-    showToast(`已获取 ${response.email}`, 'success', 2500);
+    showToast(`已${uiCopy.successVerb} ${uiCopy.label}：${response.email}`, 'success', 2500);
     return response.email;
   } catch (err) {
     if (showFailureToast) {
-      showToast(`自动获取失败：${err.message}`, 'error');
+      showToast(`${uiCopy.label}${uiCopy.successVerb}失败：${err.message}`, 'error');
     }
     throw err;
   } finally {
@@ -771,7 +1062,7 @@ document.querySelectorAll('.step-btn').forEach(btn => {
         let email = inputEmail.value.trim();
         if (!email) {
           try {
-            email = await fetchDuckEmail({ showFailureToast: false });
+            email = await fetchGeneratedEmail({ showFailureToast: false });
           } catch (err) {
             showToast(`自动获取失败：${err.message}，请手动粘贴邮箱后重试。`, 'warn');
             return;
@@ -794,7 +1085,7 @@ document.querySelectorAll('.step-btn').forEach(btn => {
 });
 
 btnFetchEmail.addEventListener('click', async () => {
-  await fetchDuckEmail().catch(() => { });
+  await fetchGeneratedEmail().catch(() => { });
 });
 
 btnTogglePassword.addEventListener('click', () => {
@@ -818,7 +1109,7 @@ btnSaveSettings.addEventListener('click', async () => {
 btnStop.addEventListener('click', async () => {
   btnStop.disabled = true;
   await chrome.runtime.sendMessage({ type: 'STOP_FLOW', source: 'sidepanel', payload: {} });
-  showToast('正在停止当前流程...', 'warn', 2000);
+  showToast(isAutoRunScheduledPhase() ? '正在取消倒计时计划...' : '正在停止当前流程...', 'warn', 2000);
 });
 
 autoStartModal?.addEventListener('click', (event) => {
@@ -831,7 +1122,7 @@ btnAutoStartClose?.addEventListener('click', () => resolveModalChoice(null));
 // Auto Run
 btnAutoRun.addEventListener('click', async () => {
   try {
-    const totalRuns = parseInt(inputRunCount.value) || 1;
+    const totalRuns = Math.min(50, Math.max(1, parseInt(inputRunCount.value, 10) || 1));
     let mode = 'restart';
 
     if (shouldOfferAutoModeChoice()) {
@@ -845,12 +1136,18 @@ btnAutoRun.addEventListener('click', async () => {
 
     btnAutoRun.disabled = true;
     inputRunCount.disabled = true;
-    btnAutoRun.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 运行中...';
+    const delayEnabled = inputAutoDelayEnabled.checked;
+    const delayMinutes = normalizeAutoDelayMinutes(inputAutoDelayMinutes.value);
+    inputAutoDelayMinutes.value = String(delayMinutes);
+    btnAutoRun.innerHTML = delayEnabled
+      ? '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 计划中...'
+      : '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> 运行中...';
     const response = await chrome.runtime.sendMessage({
-      type: 'AUTO_RUN',
+      type: delayEnabled ? 'SCHEDULE_AUTO_RUN' : 'AUTO_RUN',
       source: 'sidepanel',
       payload: {
         totalRuns,
+        delayMinutes,
         autoRunSkipFailures: inputAutoSkipFailures.checked,
         mode,
       },
@@ -868,11 +1165,34 @@ btnAutoRun.addEventListener('click', async () => {
 btnAutoContinue.addEventListener('click', async () => {
   const email = inputEmail.value.trim();
   if (!email) {
-    showToast('请先获取或粘贴 DuckDuckGo 邮箱。', 'warn');
+    showToast('请先获取或粘贴邮箱。', 'warn');
     return;
   }
   autoContinueBar.style.display = 'none';
   await chrome.runtime.sendMessage({ type: 'RESUME_AUTO_RUN', source: 'sidepanel', payload: { email } });
+});
+
+btnAutoRunNow?.addEventListener('click', async () => {
+  try {
+    btnAutoRunNow.disabled = true;
+    await chrome.runtime.sendMessage({ type: 'START_SCHEDULED_AUTO_RUN_NOW', source: 'sidepanel', payload: {} });
+  } catch (err) {
+    showToast(err.message, 'error');
+  } finally {
+    btnAutoRunNow.disabled = false;
+  }
+});
+
+btnAutoCancelSchedule?.addEventListener('click', async () => {
+  try {
+    btnAutoCancelSchedule.disabled = true;
+    await chrome.runtime.sendMessage({ type: 'CANCEL_SCHEDULED_AUTO_RUN', source: 'sidepanel', payload: {} });
+    showToast('已取消倒计时计划。', 'info', 1800);
+  } catch (err) {
+    showToast(err.message, 'error');
+  } finally {
+    btnAutoCancelSchedule.disabled = false;
+  }
 });
 
 // Reset
@@ -889,7 +1209,7 @@ btnReset.addEventListener('click', async () => {
 
   await chrome.runtime.sendMessage({ type: 'RESET', source: 'sidepanel' });
   syncLatestState({ stepStatuses: STEP_DEFAULT_STATUSES });
-  syncAutoRunState({ autoRunning: false, autoRunPhase: 'idle', autoRunCurrentRun: 0, autoRunTotalRuns: 1, autoRunAttemptRun: 0 });
+  syncAutoRunState({ autoRunning: false, autoRunPhase: 'idle', autoRunCurrentRun: 0, autoRunTotalRuns: 1, autoRunAttemptRun: 0, scheduledAutoRunAt: null });
   displayOauthUrl.textContent = '等待中...';
   displayOauthUrl.classList.remove('has-value');
   displayLocalhostUrl.textContent = '等待中...';
@@ -952,6 +1272,48 @@ selectMailProvider.addEventListener('change', () => {
   saveSettings({ silent: true }).catch(() => { });
 });
 
+selectEmailGenerator.addEventListener('change', () => {
+  updateMailProviderUI();
+  markSettingsDirty(true);
+  saveSettings({ silent: true }).catch(() => { });
+});
+
+selectCfDomain.addEventListener('change', () => {
+  if (selectCfDomain.disabled) {
+    return;
+  }
+  markSettingsDirty(true);
+  saveSettings({ silent: true }).catch(() => { });
+});
+
+btnCfDomainMode.addEventListener('click', async () => {
+  try {
+    if (!cloudflareDomainEditMode) {
+      setCloudflareDomainEditMode(true, { clearInput: true });
+      return;
+    }
+
+    const newDomain = normalizeCloudflareDomainValue(inputCfDomain.value);
+    if (!newDomain) {
+      showToast('请输入有效的 Cloudflare 域名。', 'warn');
+      inputCfDomain.focus();
+      return;
+    }
+
+    const { domains } = getCloudflareDomainsFromState();
+    await saveCloudflareDomainSettings([...domains, newDomain], newDomain);
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+});
+
+inputCfDomain.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter') {
+    event.preventDefault();
+    btnCfDomainMode.click();
+  }
+});
+
 inputInbucketMailbox.addEventListener('input', () => {
   markSettingsDirty(true);
   scheduleSettingsAutoSave();
@@ -970,6 +1332,21 @@ inputInbucketHost.addEventListener('blur', () => {
 
 inputAutoSkipFailures.addEventListener('change', () => {
   markSettingsDirty(true);
+  saveSettings({ silent: true }).catch(() => { });
+});
+
+inputAutoDelayEnabled.addEventListener('change', () => {
+  updateAutoDelayInputState();
+  markSettingsDirty(true);
+  saveSettings({ silent: true }).catch(() => { });
+});
+
+inputAutoDelayMinutes.addEventListener('input', () => {
+  markSettingsDirty(true);
+  scheduleSettingsAutoSave();
+});
+inputAutoDelayMinutes.addEventListener('blur', () => {
+  inputAutoDelayMinutes.value = String(normalizeAutoDelayMinutes(inputAutoDelayMinutes.value));
   saveSettings({ silent: true }).catch(() => { });
 });
 
@@ -1019,6 +1396,7 @@ chrome.runtime.onMessage.addListener((message) => {
         password: null,
         stepStatuses: STEP_DEFAULT_STATUSES,
         logs: [],
+        scheduledAutoRunAt: null,
       });
       displayOauthUrl.textContent = '等待中...';
       displayOauthUrl.classList.remove('has-value');
@@ -1052,16 +1430,24 @@ chrome.runtime.onMessage.addListener((message) => {
         displayLocalhostUrl.textContent = message.payload.localhostUrl;
         displayLocalhostUrl.classList.add('has-value');
       }
+      if (message.payload.autoRunDelayEnabled !== undefined) {
+        inputAutoDelayEnabled.checked = Boolean(message.payload.autoRunDelayEnabled);
+        updateAutoDelayInputState();
+      }
+      if (message.payload.autoRunDelayMinutes !== undefined) {
+        inputAutoDelayMinutes.value = String(normalizeAutoDelayMinutes(message.payload.autoRunDelayMinutes));
+      }
       break;
     }
 
     case 'AUTO_RUN_STATUS': {
       syncLatestState({
-        autoRunning: ['running', 'waiting_email', 'retrying'].includes(message.payload.phase),
+        autoRunning: ['scheduled', 'running', 'waiting_email', 'retrying'].includes(message.payload.phase),
         autoRunPhase: message.payload.phase,
         autoRunCurrentRun: message.payload.currentRun,
         autoRunTotalRuns: message.payload.totalRuns,
         autoRunAttemptRun: message.payload.attemptRun,
+        scheduledAutoRunAt: message.payload.scheduledAt ?? null,
       });
       applyAutoRunStatus(message.payload);
       updateStatusDisplay(latestState);

@@ -8,6 +8,9 @@ const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 const HUMAN_STEP_DELAY_MIN = 700;
 const HUMAN_STEP_DELAY_MAX = 2200;
 const STEP7_RESTART_MAX_ROUNDS = 8;
+const AUTO_RUN_ALARM_NAME = 'scheduled-auto-run';
+const AUTO_RUN_DELAY_MIN_MINUTES = 1;
+const AUTO_RUN_DELAY_MAX_MINUTES = 1440;
 
 initializeSessionStorageAccess();
 
@@ -20,9 +23,14 @@ const PERSISTED_SETTING_DEFAULTS = {
   vpsPassword: '', // VPS 面板登录密码，可手动填写。
   customPassword: '', // 自定义账号密码；留空时由程序自动生成随机密码。
   autoRunSkipFailures: false, // 自动运行遇到失败步骤后，是否继续执行后续流程。
-  mailProvider: '163', // 验证码邮箱来源，当前支持 163 / inbucket。
+  autoRunDelayEnabled: false, // 自动运行是否启用启动前倒计时。
+  autoRunDelayMinutes: 30, // 自动运行倒计时分钟数。
+  mailProvider: '163', // 验证码邮箱来源（163 / 163-vip / qq / inbucket）。
+  emailGenerator: 'duck', // 注册邮箱生成方式：duck / cloudflare。
   inbucketHost: '', // 仅当 mailProvider 为 inbucket 时填写 Inbucket 地址，其他情况保持为空。
   inbucketMailbox: '', // 仅当 mailProvider 为 inbucket 时填写邮箱名，其他情况保持为空。
+  cloudflareDomain: '', // 仅当 emailGenerator=cloudflare 时填写自定义域名。
+  cloudflareDomains: [], // Cloudflare 可选域名列表。
 };
 
 const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
@@ -51,7 +59,54 @@ const DEFAULT_STATE = {
   autoRunCurrentRun: 0, // 自动运行当前执行到第几轮。
   autoRunTotalRuns: 1, // 自动运行计划总轮数。
   autoRunAttemptRun: 0, // 当前轮次的重试序号。
+  scheduledAutoRunAt: null, // 自动运行计划启动时间戳。
+  scheduledAutoRunPlan: null, // 自动运行计划参数快照。
 };
+
+function normalizeAutoRunDelayMinutes(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return PERSISTED_SETTING_DEFAULTS.autoRunDelayMinutes;
+  }
+  return Math.min(
+    AUTO_RUN_DELAY_MAX_MINUTES,
+    Math.max(AUTO_RUN_DELAY_MIN_MINUTES, Math.floor(numeric))
+  );
+}
+
+function normalizeRunCount(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return 1;
+  }
+  return Math.min(50, Math.max(1, Math.floor(numeric)));
+}
+
+function normalizeScheduledAutoRunPlan(plan) {
+  if (!plan || typeof plan !== 'object') {
+    return null;
+  }
+
+  return {
+    totalRuns: normalizeRunCount(plan.totalRuns),
+    autoRunSkipFailures: Boolean(plan.autoRunSkipFailures),
+    mode: plan.mode === 'continue' ? 'continue' : 'restart',
+  };
+}
+
+function normalizeEmailGenerator(value = '') {
+  return String(value || '').trim().toLowerCase() === 'cloudflare' ? 'cloudflare' : 'duck';
+}
+
+function normalizeCloudflareDomain(rawValue = '') {
+  let value = String(rawValue || '').trim().toLowerCase();
+  if (!value) return '';
+  value = value.replace(/^@+/, '');
+  value = value.replace(/^https?:\/\//, '');
+  value = value.replace(/\/.*$/, '');
+  if (!/^[a-z0-9.-]+\.[a-z]{2,}$/.test(value)) return '';
+  return value;
+}
 
 async function getPersistedSettings() {
   const stored = await chrome.storage.local.get(PERSISTED_SETTING_KEYS);
@@ -59,6 +114,9 @@ async function getPersistedSettings() {
     ...PERSISTED_SETTING_DEFAULTS,
     ...stored,
     autoRunSkipFailures: Boolean(stored.autoRunSkipFailures ?? PERSISTED_SETTING_DEFAULTS.autoRunSkipFailures),
+    autoRunDelayEnabled: Boolean(stored.autoRunDelayEnabled ?? PERSISTED_SETTING_DEFAULTS.autoRunDelayEnabled),
+    autoRunDelayMinutes: normalizeAutoRunDelayMinutes(stored.autoRunDelayMinutes ?? PERSISTED_SETTING_DEFAULTS.autoRunDelayMinutes),
+    emailGenerator: normalizeEmailGenerator(stored.emailGenerator ?? PERSISTED_SETTING_DEFAULTS.emailGenerator),
   };
 }
 
@@ -85,16 +143,22 @@ async function initializeSessionStorageAccess() {
 
 async function setState(updates) {
   console.log(LOG_PREFIX, 'storage.set:', JSON.stringify(updates).slice(0, 200));
-  await chrome.storage.session.set(updates);
+  if (Object.keys(updates || {}).length > 0) {
+    await chrome.storage.session.set(updates);
+  }
 }
 
 async function setPersistentSettings(updates) {
   const persistedUpdates = {};
   for (const key of PERSISTED_SETTING_KEYS) {
     if (updates[key] !== undefined) {
-      persistedUpdates[key] = key === 'autoRunSkipFailures'
-        ? Boolean(updates[key])
-        : updates[key];
+      if (key === 'autoRunSkipFailures' || key === 'autoRunDelayEnabled') {
+        persistedUpdates[key] = Boolean(updates[key]);
+      } else if (key === 'autoRunDelayMinutes') {
+        persistedUpdates[key] = normalizeAutoRunDelayMinutes(updates[key]);
+      } else {
+        persistedUpdates[key] = updates[key];
+      }
     }
   }
 
@@ -965,6 +1029,56 @@ function isVerificationMailPollingError(error) {
   return /未在 .*邮箱中找到新的匹配邮件|邮箱轮询结束，但未获取到验证码|无法获取新的(?:注册|登录)验证码|页面未能重新就绪|页面通信异常|did not respond in \d+s/i.test(message);
 }
 
+const STEP7_RESTART_FROM_STEP6_ERROR_CODE = 'STEP7_RESTART_FROM_STEP6';
+const STEP7_RESTART_FROM_STEP6_MARKER_PATTERN = /^STEP7_RESTART_FROM_STEP6::([^:]+)::(.*)$/;
+
+function createStep7RestartFromStep6Error(details = {}) {
+  const { reason = 'unknown', url = '' } = details || {};
+  const reasonLabel = reason === 'login_timeout_error_page'
+    ? '检测到登录页超时报错'
+    : '步骤 7 请求回到步骤 6';
+  const error = new Error(`步骤 7：${reasonLabel}。${url ? `URL: ${url}` : ''}`.trim());
+  error.code = STEP7_RESTART_FROM_STEP6_ERROR_CODE;
+  error.restartReason = reason;
+  error.restartUrl = url;
+  return error;
+}
+
+function parseStep7RestartFromStep6Marker(message) {
+  const normalized = getErrorMessage(message);
+  const match = normalized.match(STEP7_RESTART_FROM_STEP6_MARKER_PATTERN);
+  if (!match) {
+    return null;
+  }
+
+  return {
+    reason: match[1] || 'unknown',
+    url: match[2] || '',
+  };
+}
+
+function getStep7RestartFromStep6Error(result) {
+  if (result?.restartFromStep6) {
+    return createStep7RestartFromStep6Error(result);
+  }
+
+  const parsed = parseStep7RestartFromStep6Marker(result?.error);
+  if (!parsed) {
+    return null;
+  }
+
+  return createStep7RestartFromStep6Error(parsed);
+}
+
+function isStep7RestartFromStep6Error(error) {
+  return error?.code === STEP7_RESTART_FROM_STEP6_ERROR_CODE
+    || Boolean(parseStep7RestartFromStep6Marker(error));
+}
+
+function isStep7RecoverableError(error) {
+  return isVerificationMailPollingError(error) || isStep7RestartFromStep6Error(error);
+}
+
 function isRestartCurrentAttemptError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
   return /当前邮箱已存在，需要重新开始新一轮/.test(message);
@@ -1074,7 +1188,11 @@ function getAutoRunStatusPayload(phase, payload = {}) {
   const currentRun = payload.currentRun ?? autoRunCurrentRun;
   const totalRuns = payload.totalRuns ?? autoRunTotalRuns;
   const attemptRun = payload.attemptRun ?? autoRunAttemptRun;
-  const autoRunning = phase === 'running' || phase === 'waiting_email' || phase === 'retrying';
+  const rawScheduledAt = phase === 'scheduled'
+    ? (payload.scheduledAt ?? payload.scheduledAutoRunAt ?? null)
+    : null;
+  const scheduledAt = rawScheduledAt === null ? null : Number(rawScheduledAt);
+  const autoRunning = phase === 'scheduled' || phase === 'running' || phase === 'waiting_email' || phase === 'retrying';
 
   return {
     autoRunning,
@@ -1082,18 +1200,26 @@ function getAutoRunStatusPayload(phase, payload = {}) {
     autoRunCurrentRun: currentRun,
     autoRunTotalRuns: totalRuns,
     autoRunAttemptRun: attemptRun,
+    scheduledAutoRunAt: Number.isFinite(scheduledAt) ? scheduledAt : null,
   };
 }
 
-async function broadcastAutoRunStatus(phase, payload = {}) {
+async function broadcastAutoRunStatus(phase, payload = {}, extraState = {}) {
+  const rawScheduledAt = phase === 'scheduled'
+    ? (payload.scheduledAt ?? payload.scheduledAutoRunAt ?? null)
+    : null;
   const statusPayload = {
     phase,
     currentRun: payload.currentRun ?? autoRunCurrentRun,
     totalRuns: payload.totalRuns ?? autoRunTotalRuns,
     attemptRun: payload.attemptRun ?? autoRunAttemptRun,
+    scheduledAt: rawScheduledAt === null ? null : Number(rawScheduledAt),
   };
 
-  await setState(getAutoRunStatusPayload(phase, statusPayload));
+  await setState({
+    ...extraState,
+    ...getAutoRunStatusPayload(phase, statusPayload),
+  });
   chrome.runtime.sendMessage({
     type: 'AUTO_RUN_STATUS',
     payload: statusPayload,
@@ -1108,6 +1234,212 @@ function isAutoRunPausedState(state) {
   return Boolean(state.autoRunning) && state.autoRunPhase === 'waiting_email';
 }
 
+function isAutoRunScheduledState(state) {
+  const scheduledAt = state.scheduledAutoRunAt === null ? null : Number(state.scheduledAutoRunAt);
+  return Boolean(state.autoRunning)
+    && state.autoRunPhase === 'scheduled'
+    && Number.isFinite(scheduledAt)
+    && Boolean(normalizeScheduledAutoRunPlan(state.scheduledAutoRunPlan));
+}
+
+function formatAutoRunScheduleTime(timestamp) {
+  return new Date(timestamp).toLocaleString('zh-CN', {
+    hour12: false,
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+}
+
+async function setAutoRunDelayEnabledState(enabled) {
+  const normalized = Boolean(enabled);
+  await setPersistentSettings({ autoRunDelayEnabled: normalized });
+  await setState({ autoRunDelayEnabled: normalized });
+  broadcastDataUpdate({ autoRunDelayEnabled: normalized });
+}
+
+async function ensureScheduledAutoRunAlarm(scheduledAt) {
+  if (!Number.isFinite(scheduledAt) || scheduledAt <= Date.now()) {
+    return false;
+  }
+
+  const existingAlarm = await chrome.alarms.get(AUTO_RUN_ALARM_NAME);
+  if (!existingAlarm || Math.abs((existingAlarm.scheduledTime || 0) - scheduledAt) > 1000) {
+    await chrome.alarms.clear(AUTO_RUN_ALARM_NAME);
+    await chrome.alarms.create(AUTO_RUN_ALARM_NAME, { when: scheduledAt });
+  }
+
+  return true;
+}
+
+async function clearScheduledAutoRunAlarm() {
+  await chrome.alarms.clear(AUTO_RUN_ALARM_NAME);
+}
+
+async function scheduleAutoRun(totalRuns, options = {}) {
+  const state = await getState();
+  if (isAutoRunLockedState(state) || isAutoRunPausedState(state) || autoRunActive) {
+    throw new Error('自动运行已在进行中，请先停止后再重新计划。');
+  }
+  if (isAutoRunScheduledState(state)) {
+    throw new Error('已有自动运行倒计时计划，请先取消或立即开始。');
+  }
+
+  const delayMinutes = normalizeAutoRunDelayMinutes(options.delayMinutes);
+  const plan = normalizeScheduledAutoRunPlan({
+    totalRuns,
+    autoRunSkipFailures: options.autoRunSkipFailures,
+    mode: options.mode,
+  });
+  const scheduledAt = Date.now() + delayMinutes * 60 * 1000;
+
+  autoRunCurrentRun = 0;
+  autoRunTotalRuns = plan.totalRuns;
+  autoRunAttemptRun = 0;
+
+  await ensureScheduledAutoRunAlarm(scheduledAt);
+  await broadcastAutoRunStatus(
+    'scheduled',
+    {
+      currentRun: 0,
+      totalRuns: plan.totalRuns,
+      attemptRun: 0,
+      scheduledAt,
+    },
+    {
+      autoRunSkipFailures: plan.autoRunSkipFailures,
+      scheduledAutoRunPlan: plan,
+    }
+  );
+  await addLog(
+    `自动运行已计划：${delayMinutes} 分钟后启动（${formatAutoRunScheduleTime(scheduledAt)}），目标 ${plan.totalRuns} 轮。`,
+    'info'
+  );
+  return { ok: true, scheduledAt };
+}
+
+let scheduledAutoRunLaunching = false;
+
+async function launchScheduledAutoRun(trigger = 'alarm') {
+  if (scheduledAutoRunLaunching) {
+    return false;
+  }
+
+  scheduledAutoRunLaunching = true;
+  try {
+    const state = await getState();
+    if (!isAutoRunScheduledState(state)) {
+      return false;
+    }
+    if (autoRunActive) {
+      return false;
+    }
+
+    const plan = normalizeScheduledAutoRunPlan(state.scheduledAutoRunPlan);
+    if (!plan) {
+      await clearScheduledAutoRunAlarm();
+      await broadcastAutoRunStatus('idle', {
+        currentRun: 0,
+        totalRuns: 1,
+        attemptRun: 0,
+      }, {
+        scheduledAutoRunPlan: null,
+      });
+      return false;
+    }
+
+    await clearScheduledAutoRunAlarm();
+    if (trigger !== 'manual' && state.autoRunDelayEnabled) {
+      await setAutoRunDelayEnabledState(false);
+    }
+    await broadcastAutoRunStatus(
+      'running',
+      {
+        currentRun: 0,
+        totalRuns: plan.totalRuns,
+        attemptRun: 0,
+      },
+      {
+        autoRunSkipFailures: plan.autoRunSkipFailures,
+        scheduledAutoRunPlan: null,
+      }
+    );
+
+    clearStopRequest();
+    await addLog(
+      trigger === 'manual'
+        ? '已手动跳过倒计时，自动运行立即开始。'
+        : '倒计时结束，自动运行开始执行。',
+      'info'
+    );
+    autoRunLoop(plan.totalRuns, {
+      autoRunSkipFailures: plan.autoRunSkipFailures,
+      mode: plan.mode,
+    });
+    return true;
+  } finally {
+    scheduledAutoRunLaunching = false;
+  }
+}
+
+async function cancelScheduledAutoRun(options = {}) {
+  const state = await getState();
+  if (!isAutoRunScheduledState(state)) {
+    return false;
+  }
+  const plan = normalizeScheduledAutoRunPlan(state.scheduledAutoRunPlan);
+
+  await clearScheduledAutoRunAlarm();
+  autoRunCurrentRun = 0;
+  autoRunTotalRuns = plan?.totalRuns || 1;
+  autoRunAttemptRun = 0;
+  await broadcastAutoRunStatus(
+    'idle',
+    {
+      currentRun: 0,
+      totalRuns: plan?.totalRuns || 1,
+      attemptRun: 0,
+    },
+    {
+      scheduledAutoRunPlan: null,
+    }
+  );
+  if (options.logMessage !== false) {
+    await addLog(options.logMessage || '已取消自动运行倒计时计划。', 'warn');
+  }
+  return true;
+}
+
+async function restoreScheduledAutoRunIfNeeded() {
+  const state = await getState();
+  if (state.autoRunPhase !== 'scheduled') {
+    return;
+  }
+
+  const plan = normalizeScheduledAutoRunPlan(state.scheduledAutoRunPlan);
+  const scheduledAt = state.scheduledAutoRunAt === null ? null : Number(state.scheduledAutoRunAt);
+  if (!plan || !Number.isFinite(scheduledAt)) {
+    await clearScheduledAutoRunAlarm();
+    await broadcastAutoRunStatus('idle', {
+      currentRun: 0,
+      totalRuns: 1,
+      attemptRun: 0,
+    }, {
+      scheduledAutoRunPlan: null,
+    });
+    return;
+  }
+
+  if (scheduledAt <= Date.now()) {
+    await launchScheduledAutoRun('restore');
+    return;
+  }
+
+  await ensureScheduledAutoRunAlarm(scheduledAt);
+}
+
 async function ensureManualInteractionAllowed(actionLabel) {
   const state = await getState();
 
@@ -1116,6 +1448,9 @@ async function ensureManualInteractionAllowed(actionLabel) {
   }
   if (isAutoRunPausedState(state)) {
     throw new Error(`自动流程当前已暂停。请点击“继续”，或先确认接管自动流程后再${actionLabel}。`);
+  }
+  if (isAutoRunScheduledState(state)) {
+    throw new Error(`自动流程已计划启动。请先取消计划，或立即开始后再${actionLabel}。`);
   }
 
   return state;
@@ -1313,6 +1648,7 @@ async function handleMessage(message, sender) {
 
     case 'RESET': {
       clearStopRequest();
+      await clearScheduledAutoRunAlarm();
       await resetState();
       await addLog('流程已重置', 'info');
       return { ok: true };
@@ -1337,11 +1673,42 @@ async function handleMessage(message, sender) {
 
     case 'AUTO_RUN': {
       clearStopRequest();
-      const totalRuns = message.payload?.totalRuns || 1;
+      const state = await getState();
+      if (isAutoRunScheduledState(state)) {
+        throw new Error('已有自动运行倒计时计划，请先取消或立即开始。');
+      }
+      const totalRuns = normalizeRunCount(message.payload?.totalRuns || 1);
       const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
       const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
       await setState({ autoRunSkipFailures });
       autoRunLoop(totalRuns, { autoRunSkipFailures, mode });  // fire-and-forget
+      return { ok: true };
+    }
+
+    case 'SCHEDULE_AUTO_RUN': {
+      clearStopRequest();
+      const totalRuns = normalizeRunCount(message.payload?.totalRuns || 1);
+      return await scheduleAutoRun(totalRuns, {
+        delayMinutes: message.payload?.delayMinutes,
+        autoRunSkipFailures: Boolean(message.payload?.autoRunSkipFailures),
+        mode: message.payload?.mode,
+      });
+    }
+
+    case 'START_SCHEDULED_AUTO_RUN_NOW': {
+      clearStopRequest();
+      const started = await launchScheduledAutoRun('manual');
+      if (!started) {
+        throw new Error('当前没有可立即开始的倒计时计划。');
+      }
+      return { ok: true };
+    }
+
+    case 'CANCEL_SCHEDULED_AUTO_RUN': {
+      const cancelled = await cancelScheduledAutoRun();
+      if (!cancelled) {
+        throw new Error('当前没有可取消的倒计时计划。');
+      }
       return { ok: true };
     }
 
@@ -1371,9 +1738,16 @@ async function handleMessage(message, sender) {
       if (message.payload.vpsPassword !== undefined) updates.vpsPassword = message.payload.vpsPassword;
       if (message.payload.customPassword !== undefined) updates.customPassword = message.payload.customPassword;
       if (message.payload.autoRunSkipFailures !== undefined) updates.autoRunSkipFailures = Boolean(message.payload.autoRunSkipFailures);
+      if (message.payload.autoRunDelayEnabled !== undefined) updates.autoRunDelayEnabled = Boolean(message.payload.autoRunDelayEnabled);
+      if (message.payload.autoRunDelayMinutes !== undefined) updates.autoRunDelayMinutes = normalizeAutoRunDelayMinutes(message.payload.autoRunDelayMinutes);
       if (message.payload.mailProvider !== undefined) updates.mailProvider = message.payload.mailProvider;
+      if (message.payload.emailGenerator !== undefined) updates.emailGenerator = normalizeEmailGenerator(message.payload.emailGenerator);
       if (message.payload.inbucketHost !== undefined) updates.inbucketHost = message.payload.inbucketHost;
       if (message.payload.inbucketMailbox !== undefined) updates.inbucketMailbox = message.payload.inbucketMailbox;
+      if (message.payload.cloudflareDomain !== undefined) updates.cloudflareDomain = normalizeCloudflareDomain(message.payload.cloudflareDomain);
+      if (message.payload.cloudflareDomains !== undefined) updates.cloudflareDomains = Array.isArray(message.payload.cloudflareDomains)
+        ? message.payload.cloudflareDomains.map(domain => normalizeCloudflareDomain(domain)).filter(Boolean)
+        : [];
       await setPersistentSettings(updates);
       await setState(updates);
       return { ok: true };
@@ -1390,13 +1764,24 @@ async function handleMessage(message, sender) {
       return { ok: true, email: message.payload.email };
     }
 
+    case 'FETCH_GENERATED_EMAIL': {
+      clearStopRequest();
+      const state = await getState();
+      if (isAutoRunLockedState(state)) {
+        throw new Error('自动流程运行中，当前不能手动获取邮箱。');
+      }
+      const email = await fetchGeneratedEmail(state, message.payload || {});
+      await resumeAutoRun();
+      return { ok: true, email };
+    }
+
     case 'FETCH_DUCK_EMAIL': {
       clearStopRequest();
       const state = await getState();
       if (isAutoRunLockedState(state)) {
-        throw new Error('自动流程运行中，当前不能手动获取 Duck 邮箱。');
+        throw new Error('自动流程运行中，当前不能手动获取邮箱。');
       }
-      const email = await fetchDuckEmail(message.payload || {});
+      const email = await fetchGeneratedEmail(state, { ...(message.payload || {}), generator: 'duck' });
       await resumeAutoRun();
       return { ok: true, email };
     }
@@ -1516,6 +1901,17 @@ async function markRunningStepsStopped() {
 
 async function requestStop(options = {}) {
   const { logMessage = '已收到停止请求，正在取消当前操作...' } = options;
+  const state = await getState();
+
+  if (isAutoRunScheduledState(state) && !autoRunActive) {
+    await cancelScheduledAutoRun({
+      logMessage: options.logMessage === false
+        ? false
+        : (options.logMessage || '已取消自动运行倒计时计划。'),
+    });
+    return;
+  }
+
   if (stopRequested) return;
 
   stopRequested = true;
@@ -1631,6 +2027,40 @@ async function executeStepAndWait(step, delayAfter = 2000) {
   }
 }
 
+function getEmailGeneratorLabel(generator) {
+  return generator === 'cloudflare' ? 'Cloudflare 邮箱' : 'Duck 邮箱';
+}
+
+function generateCloudflareAliasLocalPart() {
+  const now = new Date();
+  const stamp = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, '0'),
+    String(now.getDate()).padStart(2, '0'),
+    String(now.getHours()).padStart(2, '0'),
+    String(now.getMinutes()).padStart(2, '0'),
+    String(now.getSeconds()).padStart(2, '0'),
+  ].join('');
+  const randomPart = String(Math.floor(Math.random() * 900) + 100);
+  return `user${stamp}${randomPart}`.toLowerCase();
+}
+
+async function fetchCloudflareEmail(state, options = {}) {
+  throwIfStopped();
+  const latestState = state || await getState();
+  const domain = normalizeCloudflareDomain(latestState.cloudflareDomain);
+  if (!domain) {
+    throw new Error('Cloudflare 域名为空或格式无效。');
+  }
+
+  const localPart = String(options.localPart || '').trim().toLowerCase() || generateCloudflareAliasLocalPart();
+  const aliasEmail = `${localPart}@${domain}`;
+
+  await setEmailState(aliasEmail);
+  await addLog(`Cloudflare 邮箱：已生成 ${aliasEmail}`, 'ok');
+  return aliasEmail;
+}
+
 async function fetchDuckEmail(options = {}) {
   throwIfStopped();
   const { generateNew = true } = options;
@@ -1656,6 +2086,15 @@ async function fetchDuckEmail(options = {}) {
   return result.email;
 }
 
+async function fetchGeneratedEmail(state, options = {}) {
+  const currentState = state || await getState();
+  const generator = normalizeEmailGenerator(options.generator ?? currentState.emailGenerator);
+  if (generator === 'cloudflare') {
+    return fetchCloudflareEmail(currentState, options);
+  }
+  return fetchDuckEmail(options);
+}
+
 // ============================================================
 // Auto Run Flow
 // ============================================================
@@ -1664,7 +2103,7 @@ let autoRunActive = false;
 let autoRunCurrentRun = 0;
 let autoRunTotalRuns = 1;
 let autoRunAttemptRun = 0;
-const DUCK_EMAIL_MAX_ATTEMPTS = 5;
+const EMAIL_FETCH_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
 const AUTO_STEP_DELAYS = {
   1: 2000,
@@ -1703,23 +2142,31 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
     return currentState.email;
   }
 
-  let lastDuckError = null;
-  for (let duckAttempt = 1; duckAttempt <= DUCK_EMAIL_MAX_ATTEMPTS; duckAttempt++) {
+  const generator = normalizeEmailGenerator(currentState.emailGenerator);
+  const generatorLabel = getEmailGeneratorLabel(generator);
+  let lastError = null;
+  for (let attempt = 1; attempt <= EMAIL_FETCH_MAX_ATTEMPTS; attempt++) {
     try {
-      if (duckAttempt > 1) {
-        await addLog(`Duck 邮箱：正在进行第 ${duckAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
+      if (attempt > 1) {
+        await addLog(`${generatorLabel}：正在进行第 ${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
       }
-      const duckEmail = await fetchDuckEmail({ generateNew: true });
-      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：Duck 邮箱已就绪：${duckEmail}（第 ${attemptRuns} 次尝试，Duck 第 ${duckAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS} 次获取）===`, 'ok');
-      return duckEmail;
+      const generatedEmail = await fetchGeneratedEmail(currentState, { generateNew: true, generator });
+      await addLog(
+        `=== 目标 ${targetRun}/${totalRuns} 轮：${generatorLabel}已就绪：${generatedEmail}（第 ${attemptRuns} 次尝试，第 ${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS} 次获取）===`,
+        'ok'
+      );
+      return generatedEmail;
     } catch (err) {
-      lastDuckError = err;
-      await addLog(`Duck 邮箱自动获取失败（${duckAttempt}/${DUCK_EMAIL_MAX_ATTEMPTS}）：${err.message}`, 'warn');
+      lastError = err;
+      await addLog(`${generatorLabel}自动获取失败（${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS}）：${err.message}`, 'warn');
+      if (generator === 'cloudflare' && /域名/.test(String(err.message || ''))) {
+        break;
+      }
     }
   }
 
-  await addLog(`Duck 邮箱自动获取已连续失败 ${DUCK_EMAIL_MAX_ATTEMPTS} 次：${lastDuckError?.message || '未知错误'}`, 'error');
-  await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮已暂停：请先获取 Duck 邮箱或手动粘贴邮箱，然后继续 ===`, 'warn');
+  await addLog(`${generatorLabel}自动获取已连续失败 ${EMAIL_FETCH_MAX_ATTEMPTS} 次：${lastError?.message || '未知错误'}`, 'error');
+  await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮已暂停：请先自动获取邮箱或手动粘贴邮箱，然后继续 ===`, 'warn');
   await broadcastAutoRunStatus('waiting_email', {
     currentRun: targetRun,
     totalRuns,
@@ -1855,9 +2302,14 @@ async function autoRunLoop(totalRuns, options = {}) {
         vpsPassword: prevState.vpsPassword,
         customPassword: prevState.customPassword,
         autoRunSkipFailures: prevState.autoRunSkipFailures,
+        autoRunDelayEnabled: prevState.autoRunDelayEnabled,
+        autoRunDelayMinutes: prevState.autoRunDelayMinutes,
         mailProvider: prevState.mailProvider,
+        emailGenerator: prevState.emailGenerator,
         inbucketHost: prevState.inbucketHost,
         inbucketMailbox: prevState.inbucketMailbox,
+        cloudflareDomain: prevState.cloudflareDomain,
+        cloudflareDomains: prevState.cloudflareDomains,
         ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun: attemptRuns }),
         ...(forceFreshTabsNextRun ? { tabRegistry: {} } : {}),
       };
@@ -2225,6 +2677,13 @@ async function requestVerificationCodeResend(step) {
     payload: {},
   });
 
+  if (step === 7) {
+    const restartError = getStep7RestartFromStep6Error(result);
+    if (restartError) {
+      throw restartError;
+    }
+  }
+
   if (result && result.error) {
     throw new Error(result.error);
   }
@@ -2311,6 +2770,13 @@ async function submitVerificationCode(step, code) {
     payload: { code },
   });
 
+  if (step === 7) {
+    const restartError = getStep7RestartFromStep6Error(result);
+    if (restartError) {
+      throw restartError;
+    }
+  }
+
   if (result && result.error) {
     throw new Error(result.error);
   }
@@ -2334,6 +2800,9 @@ async function resolveVerificationStep(step, state, mail, options = {}) {
       await requestVerificationCodeResend(step);
       await addLog(`步骤 ${step}：已先请求一封新的${getVerificationCodeLabel(step)}验证码，再开始轮询邮箱。`, 'warn');
     } catch (err) {
+      if (step === 7 && isStep7RestartFromStep6Error(err)) {
+        throw err;
+      }
       await addLog(`步骤 ${step}：首次重新获取验证码失败：${err.message}，将继续使用当前时间窗口轮询。`, 'warn');
     }
   }
@@ -2526,6 +2995,11 @@ async function runStep7Attempt(state) {
     payload: {},
   });
 
+  const restartError = getStep7RestartFromStep6Error(prepareResult);
+  if (restartError) {
+    throw restartError;
+  }
+
   if (prepareResult && prepareResult.error) {
     throw new Error(prepareResult.error);
   }
@@ -2580,7 +3054,7 @@ async function executeStep7(state) {
     } catch (err) {
       lastError = err;
 
-      if (!isVerificationMailPollingError(err)) {
+      if (!isStep7RecoverableError(err)) {
         throw err;
       }
 
@@ -2588,9 +3062,18 @@ async function executeStep7(state) {
         break;
       }
 
-      await addLog(`步骤 7：检测到邮箱轮询类失败，准备从步骤 6 重新开始（${round + 1}/${STEP7_RESTART_MAX_ROUNDS}）...`, 'warn');
+      await addLog(
+        isStep7RestartFromStep6Error(err)
+          ? `步骤 7：检测到登录页超时报错，准备从步骤 6 重新开始（${round + 1}/${STEP7_RESTART_MAX_ROUNDS}）...`
+          : `步骤 7：检测到邮箱轮询类失败，准备从步骤 6 重新开始（${round + 1}/${STEP7_RESTART_MAX_ROUNDS}）...`,
+        'warn'
+      );
       await rerunStep6ForStep7Recovery();
     }
+  }
+
+  if (lastError && isStep7RecoverableError(lastError)) {
+    throw new Error(`步骤 7：登录验证码流程在 ${STEP7_RESTART_MAX_ROUNDS} 轮恢复后仍未成功。最后一次原因：${lastError.message}`);
   }
 
   throw lastError || new Error(`步骤 7：登录验证码流程在 ${STEP7_RESTART_MAX_ROUNDS} 轮后仍未成功。`);
@@ -2604,9 +3087,11 @@ let webNavListener = null;
 let webNavCommittedListener = null;
 let step8TabUpdatedListener = null;
 let step8PendingReject = null;
-const STEP8_CLICK_EFFECT_TIMEOUT_MS = 3500;
+const STEP8_CLICK_EFFECT_TIMEOUT_MS = 10000;
 const STEP8_CLICK_RETRY_DELAY_MS = 500;
 const STEP8_READY_WAIT_TIMEOUT_MS = 30000;
+const STEP8_MAX_ROUNDS = 5;
+const STEP8_SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/signup-page.js'];
 const STEP8_STRATEGIES = [
   { mode: 'content', strategy: 'requestSubmit', label: 'form.requestSubmit' },
   { mode: 'debugger', label: 'debugger click' },
@@ -2643,6 +3128,16 @@ function throwIfStep8SettledOrStopped(isSettled = false) {
   }
 }
 
+async function ensureStep8SignupPageReady(tabId, options = {}) {
+  await ensureContentScriptReadyOnTab('signup-page', tabId, {
+    inject: STEP8_SIGNUP_PAGE_INJECT_FILES,
+    injectSource: 'signup-page',
+    timeoutMs: options.timeoutMs ?? 15000,
+    retryDelayMs: options.retryDelayMs ?? 600,
+    logMessage: options.logMessage || '',
+  });
+}
+
 async function getStep8PageState(tabId, responseTimeoutMs = 1500) {
   try {
     const result = await sendTabMessageWithTimeout(tabId, 'signup-page', {
@@ -2664,6 +3159,7 @@ async function getStep8PageState(tabId, responseTimeoutMs = 1500) {
 
 async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS) {
   const start = Date.now();
+  let recovered = false;
 
   while (Date.now() - start < timeoutMs) {
     throwIfStopped();
@@ -2674,13 +3170,26 @@ async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS)
     if (pageState?.consentReady) {
       return pageState;
     }
+    if (pageState === null && !recovered) {
+      recovered = true;
+      await ensureStep8SignupPageReady(tabId, {
+        timeoutMs: Math.min(10000, timeoutMs),
+        logMessage: '步骤 8：认证页内容脚本已失联，正在等待页面重新就绪...',
+      });
+      continue;
+    }
+    recovered = false;
     await sleepWithStop(250);
   }
 
   throw new Error('步骤 8：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
 }
 
-async function prepareStep8DebuggerClick() {
+async function prepareStep8DebuggerClick(tabId) {
+  await ensureStep8SignupPageReady(tabId, {
+    timeoutMs: 15000,
+    logMessage: '步骤 8：认证页内容脚本已失联，正在恢复后继续定位按钮...',
+  });
   const result = await sendToContentScriptResilient('signup-page', {
     type: 'STEP8_FIND_AND_CLICK',
     source: 'background',
@@ -2698,7 +3207,11 @@ async function prepareStep8DebuggerClick() {
   return result;
 }
 
-async function triggerStep8ContentStrategy(strategy) {
+async function triggerStep8ContentStrategy(tabId, strategy) {
+  await ensureStep8SignupPageReady(tabId, {
+    timeoutMs: 15000,
+    logMessage: '步骤 8：认证页内容脚本已失联，正在恢复后继续点击“继续”按钮...',
+  });
   const result = await sendToContentScriptResilient('signup-page', {
     type: 'STEP8_TRIGGER_CONTINUE',
     source: 'background',
@@ -2720,8 +3233,51 @@ async function triggerStep8ContentStrategy(strategy) {
   return result;
 }
 
+async function reloadStep8ConsentPage(tabId, timeoutMs = 30000) {
+  if (!Number.isInteger(tabId)) {
+    throw new Error('步骤 8：缺少有效的认证页标签页，无法刷新后重试。');
+  }
+
+  await chrome.tabs.update(tabId, { active: true }).catch(() => { });
+
+  await new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(new Error('步骤 8：刷新认证页后等待页面完成加载超时。'));
+    }, timeoutMs);
+
+    const listener = (updatedTabId, changeInfo) => {
+      if (updatedTabId !== tabId) return;
+      if (changeInfo.status !== 'complete') return;
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      resolve();
+    };
+
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs.reload(tabId, { bypassCache: false }).catch((err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(listener);
+      reject(err);
+    });
+  });
+
+  await ensureStep8SignupPageReady(tabId, {
+    timeoutMs: Math.min(15000, timeoutMs),
+    logMessage: '步骤 8：认证页刷新后内容脚本尚未就绪，正在等待页面恢复...',
+  });
+}
+
 async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLICK_EFFECT_TIMEOUT_MS) {
   const start = Date.now();
+  let recovered = false;
 
   while (Date.now() - start < timeoutMs) {
     throwIfStopped();
@@ -2740,11 +3296,18 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
       throw new Error('步骤 8：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
     }
     if (pageState === null) {
-      return { progressed: true, reason: 'page_reloading' };
+      if (!recovered) {
+        recovered = true;
+        await ensureStep8SignupPageReady(tabId, {
+          timeoutMs: Math.max(3000, Math.min(8000, timeoutMs)),
+          logMessage: '步骤 8：点击后认证页正在重载，正在等待内容脚本重新就绪...',
+        }).catch(() => null);
+        continue;
+      }
+      await sleepWithStop(200);
+      continue;
     }
-    if (pageState && !pageState.consentPage) {
-      return { progressed: true, reason: 'left_consent_page', url: pageState.url };
-    }
+    recovered = false;
 
     await sleepWithStop(200);
   }
@@ -2846,9 +3409,12 @@ async function executeStep8(state) {
         chrome.webNavigation.onBeforeNavigate.addListener(webNavListener);
         chrome.webNavigation.onCommitted.addListener(webNavCommittedListener);
         chrome.tabs.onUpdated.addListener(step8TabUpdatedListener);
+        await ensureStep8SignupPageReady(signupTabId, {
+          timeoutMs: 15000,
+          logMessage: '步骤 8：认证页内容脚本尚未就绪，正在等待页面恢复...',
+        });
 
-        let attempt = 0;
-        while (!resolved) {
+        for (let round = 1; round <= STEP8_MAX_ROUNDS && !resolved; round++) {
           throwIfStep8SettledOrStopped(resolved);
           const pageState = await waitForStep8Ready(signupTabId);
           if (!pageState?.consentReady) {
@@ -2856,18 +3422,16 @@ async function executeStep8(state) {
             continue;
           }
 
-          const strategy = STEP8_STRATEGIES[attempt % STEP8_STRATEGIES.length];
-          const round = attempt + 1;
-          attempt += 1;
+          const strategy = STEP8_STRATEGIES[Math.min(round - 1, STEP8_STRATEGIES.length - 1)];
 
-          await addLog(`步骤 8：第 ${round} 次尝试点击“继续”（${strategy.label}）...`);
+          await addLog(`步骤 8：第 ${round}/${STEP8_MAX_ROUNDS} 轮尝试点击“继续”（${strategy.label}）...`);
 
           if (strategy.mode === 'debugger') {
-            const clickTarget = await prepareStep8DebuggerClick();
+            const clickTarget = await prepareStep8DebuggerClick(signupTabId);
             throwIfStep8SettledOrStopped(resolved);
             await clickWithDebugger(signupTabId, clickTarget?.rect);
           } else {
-            await triggerStep8ContentStrategy(strategy.strategy);
+            await triggerStep8ContentStrategy(signupTabId, strategy.strategy);
           }
 
           if (resolved) {
@@ -2884,7 +3448,12 @@ async function executeStep8(state) {
             break;
           }
 
-          await addLog(`步骤 8：${strategy.label} 本次未触发页面离开同意页，准备继续重试。`, 'warn');
+          if (round >= STEP8_MAX_ROUNDS) {
+            throw new Error(`步骤 8：连续 ${STEP8_MAX_ROUNDS} 轮点击“继续”后页面仍无反应。`);
+          }
+
+          await addLog(`步骤 8：${strategy.label} 本轮点击后页面无反应，正在刷新认证页后重试（下一轮 ${round + 1}/${STEP8_MAX_ROUNDS}）...`, 'warn');
+          await reloadStep8ConsentPage(signupTabId);
           await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
         }
       } catch (err) {
@@ -2961,3 +3530,28 @@ async function executeStep9(state) {
 // ============================================================
 
 chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name !== AUTO_RUN_ALARM_NAME) {
+    return;
+  }
+  launchScheduledAutoRun('alarm').catch((err) => {
+    console.error(LOG_PREFIX, 'Failed to launch scheduled auto run from alarm:', err);
+  });
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  restoreScheduledAutoRunIfNeeded().catch((err) => {
+    console.error(LOG_PREFIX, 'Failed to restore scheduled auto run on startup:', err);
+  });
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  restoreScheduledAutoRunIfNeeded().catch((err) => {
+    console.error(LOG_PREFIX, 'Failed to restore scheduled auto run on install/update:', err);
+  });
+});
+
+restoreScheduledAutoRunIfNeeded().catch((err) => {
+  console.error(LOG_PREFIX, 'Failed to restore scheduled auto run:', err);
+});
