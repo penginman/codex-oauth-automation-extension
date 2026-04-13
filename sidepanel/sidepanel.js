@@ -60,10 +60,12 @@ const selectMailProvider = document.getElementById('select-mail-provider');
 const rowEmailGenerator = document.getElementById('row-email-generator');
 const selectEmailGenerator = document.getElementById('select-email-generator');
 const hotmailSection = document.getElementById('hotmail-section');
-const inputHotmailApiUrl = document.getElementById('input-hotmail-api-url');
-const inputHotmailApiResponseType = document.getElementById('input-hotmail-api-response-type');
-const inputHotmailApiInboxMailbox = document.getElementById('input-hotmail-api-inbox-mailbox');
-const inputHotmailApiJunkMailbox = document.getElementById('input-hotmail-api-junk-mailbox');
+const rowHotmailServiceMode = document.getElementById('row-hotmail-service-mode');
+const hotmailServiceModeButtons = Array.from(document.querySelectorAll('[data-hotmail-service-mode]'));
+const rowHotmailRemoteBaseUrl = document.getElementById('row-hotmail-remote-base-url');
+const inputHotmailRemoteBaseUrl = document.getElementById('input-hotmail-remote-base-url');
+const rowHotmailLocalBaseUrl = document.getElementById('row-hotmail-local-base-url');
+const inputHotmailLocalBaseUrl = document.getElementById('input-hotmail-local-base-url');
 const inputHotmailEmail = document.getElementById('input-hotmail-email');
 const inputHotmailClientId = document.getElementById('input-hotmail-client-id');
 const inputHotmailPassword = document.getElementById('input-hotmail-password');
@@ -112,6 +114,8 @@ const AUTO_DELAY_MIN_MINUTES = 1;
 const AUTO_DELAY_MAX_MINUTES = 1440;
 const AUTO_DELAY_DEFAULT_MINUTES = 30;
 const DEFAULT_LOCAL_CPA_STEP9_MODE = 'submit';
+const HOTMAIL_SERVICE_MODE_REMOTE = 'remote';
+const HOTMAIL_SERVICE_MODE_LOCAL = 'local';
 
 let latestState = null;
 let currentAutoRun = {
@@ -601,10 +605,9 @@ function collectSettingsPayload() {
     emailGenerator: selectEmailGenerator.value,
     inbucketHost: inputInbucketHost.value.trim(),
     inbucketMailbox: inputInbucketMailbox.value.trim(),
-    hotmailApiUrl: inputHotmailApiUrl.value.trim(),
-    hotmailApiResponseType: inputHotmailApiResponseType.value.trim(),
-    hotmailApiInboxMailbox: inputHotmailApiInboxMailbox.value.trim(),
-    hotmailApiJunkMailbox: inputHotmailApiJunkMailbox.value.trim(),
+    hotmailServiceMode: getSelectedHotmailServiceMode(),
+    hotmailRemoteBaseUrl: inputHotmailRemoteBaseUrl.value.trim(),
+    hotmailLocalBaseUrl: inputHotmailLocalBaseUrl.value.trim(),
     cloudflareDomain: selectedCloudflareDomain,
     cloudflareDomains: domains,
     autoRunSkipFailures: inputAutoSkipFailures.checked,
@@ -619,6 +622,12 @@ function normalizeLocalCpaStep9Mode(value = '') {
     : DEFAULT_LOCAL_CPA_STEP9_MODE;
 }
 
+function normalizeHotmailServiceMode(value = '') {
+  return String(value || '').trim().toLowerCase() === HOTMAIL_SERVICE_MODE_LOCAL
+    ? HOTMAIL_SERVICE_MODE_LOCAL
+    : HOTMAIL_SERVICE_MODE_REMOTE;
+}
+
 function getSelectedLocalCpaStep9Mode() {
   const activeButton = localCpaStep9ModeButtons.find((button) => button.classList.contains('is-active'));
   return normalizeLocalCpaStep9Mode(activeButton?.dataset.localCpaStep9Mode);
@@ -628,6 +637,20 @@ function setLocalCpaStep9Mode(mode) {
   const resolvedMode = normalizeLocalCpaStep9Mode(mode);
   localCpaStep9ModeButtons.forEach((button) => {
     const active = button.dataset.localCpaStep9Mode === resolvedMode;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-pressed', String(active));
+  });
+}
+
+function getSelectedHotmailServiceMode() {
+  const activeButton = hotmailServiceModeButtons.find((button) => button.classList.contains('is-active'));
+  return normalizeHotmailServiceMode(activeButton?.dataset.hotmailServiceMode);
+}
+
+function setHotmailServiceMode(mode) {
+  const resolvedMode = normalizeHotmailServiceMode(mode);
+  hotmailServiceModeButtons.forEach((button) => {
+    const active = button.dataset.hotmailServiceMode === resolvedMode;
     button.classList.toggle('is-active', active);
     button.setAttribute('aria-pressed', String(active));
   });
@@ -850,10 +873,9 @@ function applySettingsState(state) {
   selectEmailGenerator.value = state?.emailGenerator || 'duck';
   inputInbucketHost.value = state?.inbucketHost || '';
   inputInbucketMailbox.value = state?.inbucketMailbox || '';
-  inputHotmailApiUrl.value = state?.hotmailApiUrl || '';
-  inputHotmailApiResponseType.value = state?.hotmailApiResponseType ?? '';
-  inputHotmailApiInboxMailbox.value = state?.hotmailApiInboxMailbox || '';
-  inputHotmailApiJunkMailbox.value = state?.hotmailApiJunkMailbox || '';
+  setHotmailServiceMode(state?.hotmailServiceMode);
+  inputHotmailRemoteBaseUrl.value = state?.hotmailRemoteBaseUrl || '';
+  inputHotmailLocalBaseUrl.value = state?.hotmailLocalBaseUrl || '';
   renderCloudflareDomainOptions(state?.cloudflareDomain || '');
   setCloudflareDomainEditMode(false, { clearInput: true });
   inputAutoSkipFailures.checked = Boolean(state?.autoRunSkipFailures);
@@ -1160,6 +1182,7 @@ function renderHotmailAccounts() {
 function updateMailProviderUI() {
   const useInbucket = selectMailProvider.value === 'inbucket';
   const useHotmail = selectMailProvider.value === 'hotmail-api';
+  const hotmailServiceMode = getSelectedHotmailServiceMode();
   const useEmailGenerator = !useHotmail;
   rowInbucketHost.style.display = useInbucket ? '' : 'none';
   rowInbucketMailbox.style.display = useInbucket ? '' : 'none';
@@ -1179,6 +1202,15 @@ function updateMailProviderUI() {
   if (hotmailSection) {
     hotmailSection.style.display = useHotmail ? '' : 'none';
   }
+  if (rowHotmailServiceMode) {
+    rowHotmailServiceMode.style.display = useHotmail ? '' : 'none';
+  }
+  if (rowHotmailRemoteBaseUrl) {
+    rowHotmailRemoteBaseUrl.style.display = useHotmail && hotmailServiceMode === HOTMAIL_SERVICE_MODE_REMOTE ? '' : 'none';
+  }
+  if (rowHotmailLocalBaseUrl) {
+    rowHotmailLocalBaseUrl.style.display = useHotmail && hotmailServiceMode === HOTMAIL_SERVICE_MODE_LOCAL ? '' : 'none';
+  }
   selectEmailGenerator.disabled = useHotmail;
   btnFetchEmail.hidden = useHotmail;
   inputEmail.readOnly = useHotmail;
@@ -1189,7 +1221,7 @@ function updateMailProviderUI() {
   }
   if (autoHintText) {
     autoHintText.textContent = useHotmail
-      ? '请先校验并选择一个 Hotmail 账号'
+      ? `请先校验并选择一个 Hotmail 账号（当前：${hotmailServiceMode === HOTMAIL_SERVICE_MODE_LOCAL ? '本地助手' : '远程服务'}）`
       : '先自动获取邮箱，或手动粘贴邮箱后再继续';
   }
   if (useHotmail) {
@@ -2003,6 +2035,19 @@ localCpaStep9ModeButtons.forEach((button) => {
   });
 });
 
+hotmailServiceModeButtons.forEach((button) => {
+  button.addEventListener('click', () => {
+    const nextMode = button.dataset.hotmailServiceMode;
+    if (getSelectedHotmailServiceMode() === normalizeHotmailServiceMode(nextMode)) {
+      return;
+    }
+    setHotmailServiceMode(nextMode);
+    updateMailProviderUI();
+    markSettingsDirty(true);
+    saveSettings({ silent: true }).catch(() => { });
+  });
+});
+
 btnSaveSettings.addEventListener('click', async () => {
   if (!settingsDirty) {
     showToast('配置已是最新', 'info', 1400);
@@ -2216,7 +2261,7 @@ inputVpsPassword.addEventListener('blur', () => {
   saveSettings({ silent: true }).catch(() => { });
 });
 
-[inputHotmailApiUrl, inputHotmailApiResponseType, inputHotmailApiInboxMailbox, inputHotmailApiJunkMailbox].forEach((input) => {
+[inputHotmailRemoteBaseUrl, inputHotmailLocalBaseUrl].forEach((input) => {
   input?.addEventListener('input', () => {
     markSettingsDirty(true);
     scheduleSettingsAutoSave();

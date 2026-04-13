@@ -130,7 +130,7 @@
       <div class="data-row">
         <span class="data-label">邮箱服务</span>
         <select id="select-mail-provider" class="data-select">
-          <option value="hotmail-api">Hotmail（第三方邮件 API）</option>
+          <option value="hotmail-api">Hotmail（远程/本地）</option>
           <option value="163">163 邮箱 (mail.163.com)</option>
           <option value="163-vip">163 VIP 邮箱 (webmail.vip.163.com)</option>
           <option value="qq">QQ 邮箱 (wx.mail.qq.com)</option>
@@ -205,7 +205,7 @@
       <div class="section-mini-header">
         <div class="section-mini-copy">
           <span class="section-label">Hotmail 账号池</span>
-          <span class="section-hint">先配置 API，再维护账号池并校验</span>
+          <span class="section-hint">支持远程服务与本地助手两种接码模式</span>
         </div>
         <div class="section-mini-actions">
           <button id="btn-clear-used-hotmail-accounts" class="btn btn-ghost btn-xs" type="button">清空已用</button>
@@ -213,21 +213,20 @@
           <button id="btn-toggle-hotmail-list" class="btn btn-ghost btn-xs" type="button" aria-expanded="false">展开列表</button>
         </div>
       </div>
-      <div class="data-row">
-        <span class="data-label">API 地址</span>
-        <input type="text" id="input-hotmail-api-url" class="data-input mono" placeholder="https://apple.882263.xyz/api/mail-new" />
+      <div class="data-row" id="row-hotmail-service-mode">
+        <span class="data-label">接码模式</span>
+        <div id="hotmail-service-mode-group" class="choice-group" role="group" aria-label="Hotmail 接码模式">
+          <button type="button" class="choice-btn" data-hotmail-service-mode="remote">远程服务</button>
+          <button type="button" class="choice-btn" data-hotmail-service-mode="local">本地助手</button>
+        </div>
       </div>
-      <div class="data-row">
-        <span class="data-label">响应类型</span>
-        <input type="text" id="input-hotmail-api-response-type" class="data-input mono" placeholder="json；留空则不传 response_type" />
+      <div class="data-row" id="row-hotmail-remote-base-url">
+        <span class="data-label">远程服务</span>
+        <input type="text" id="input-hotmail-remote-base-url" class="data-input mono" placeholder="请输入远程服务地址" />
       </div>
-      <div class="data-row">
-        <span class="data-label">收件箱参数</span>
-        <input type="text" id="input-hotmail-api-inbox-mailbox" class="data-input mono" placeholder="INBOX" />
-      </div>
-      <div class="data-row">
-        <span class="data-label">垃圾箱参数</span>
-        <input type="text" id="input-hotmail-api-junk-mailbox" class="data-input mono" placeholder="Junk" />
+      <div class="data-row" id="row-hotmail-local-base-url" style="display:none;">
+        <span class="data-label">本地助手</span>
+        <input type="text" id="input-hotmail-local-base-url" class="data-input mono" placeholder="http://127.0.0.1:17373" />
       </div>
       <div class="data-row">
         <span class="data-label">邮箱</span>
