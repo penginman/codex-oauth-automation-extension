@@ -11,6 +11,14 @@ const STATUS_ICONS = {
 };
 
 const logArea = document.getElementById('log-area');
+const updateSection = document.getElementById('update-section');
+const extensionUpdateStatus = document.getElementById('extension-update-status');
+const extensionVersionMeta = document.getElementById('extension-version-meta');
+const btnReleaseLog = document.getElementById('btn-release-log');
+const updateCardVersion = document.getElementById('update-card-version');
+const updateCardSummary = document.getElementById('update-card-summary');
+const updateReleaseList = document.getElementById('update-release-list');
+const btnOpenRelease = document.getElementById('btn-open-release');
 const settingsCard = document.getElementById('settings-card');
 const displayOauthUrl = document.getElementById('display-oauth-url');
 const displayLocalhostUrl = document.getElementById('display-localhost-url');
@@ -139,6 +147,7 @@ let hotmailActionInFlight = false;
 let hotmailListExpanded = false;
 let configMenuOpen = false;
 let configActionInFlight = false;
+let currentReleaseSnapshot = null;
 
 const EYE_OPEN_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-7 11-7 11 7 11 7-4 7-11 7S1 12 1 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 const EYE_CLOSED_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.94 10.94 0 0 1 12 19C5 19 1 12 1 12a21.77 21.77 0 0 1 5.06-6.94"/><path d="M9.9 4.24A10.94 10.94 0 0 1 12 5c7 0 11 7 11 7a21.86 21.86 0 0 1-2.16 3.19"/><path d="M1 1l22 22"/><path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/></svg>';
@@ -150,6 +159,7 @@ const filterHotmailAccountsByUsage = window.HotmailUtils?.filterHotmailAccountsB
 const getHotmailBulkActionLabel = window.HotmailUtils?.getHotmailBulkActionLabel;
 const getHotmailListToggleLabel = window.HotmailUtils?.getHotmailListToggleLabel;
 const HOTMAIL_LIST_EXPANDED_STORAGE_KEY = 'multipage-hotmail-list-expanded';
+const sidepanelUpdateService = window.SidepanelUpdateService;
 const MAIL_PROVIDER_LOGIN_CONFIGS = {
   '163': {
     label: '163 邮箱',
@@ -948,6 +958,212 @@ async function restoreState() {
   } catch (err) {
     console.error('Failed to restore state:', err);
   }
+}
+
+function openExternalUrl(url) {
+  const targetUrl = String(url || '').trim();
+  if (!targetUrl) {
+    return;
+  }
+
+  if (chrome?.tabs?.create) {
+    chrome.tabs.create({ url: targetUrl, active: true }).catch(() => {
+      window.open(targetUrl, '_blank', 'noopener');
+    });
+    return;
+  }
+
+  window.open(targetUrl, '_blank', 'noopener');
+}
+
+function createUpdateNoteList(notes = []) {
+  if (!Array.isArray(notes) || notes.length === 0) {
+    const empty = document.createElement('p');
+    empty.className = 'update-release-empty';
+    empty.textContent = '该版本未提供可解析的更新说明，请查看完整更新日志。';
+    return empty;
+  }
+
+  const list = document.createElement('ul');
+  list.className = 'update-release-notes';
+
+  notes.forEach((note) => {
+    const item = document.createElement('li');
+    item.textContent = note;
+    list.appendChild(item);
+  });
+
+  return list;
+}
+
+function renderUpdateReleaseList(releases = []) {
+  if (!updateReleaseList) {
+    return;
+  }
+
+  updateReleaseList.innerHTML = '';
+
+  releases.forEach((release) => {
+    const item = document.createElement('article');
+    item.className = 'update-release-item';
+
+    const head = document.createElement('div');
+    head.className = 'update-release-head';
+
+    const titleRow = document.createElement('div');
+    titleRow.className = 'update-release-title-row';
+
+    const version = document.createElement('span');
+    version.className = 'update-release-version';
+    version.textContent = `v${release.version}`;
+    titleRow.appendChild(version);
+
+    if (release.title) {
+      const name = document.createElement('span');
+      name.className = 'update-release-name';
+      name.textContent = release.title;
+      titleRow.appendChild(name);
+    }
+
+    head.appendChild(titleRow);
+
+    const publishedAt = sidepanelUpdateService?.formatReleaseDate?.(release.publishedAt) || '';
+    if (publishedAt) {
+      const date = document.createElement('span');
+      date.className = 'update-release-date';
+      date.textContent = publishedAt;
+      head.appendChild(date);
+    }
+
+    item.appendChild(head);
+    item.appendChild(createUpdateNoteList(release.notes));
+    updateReleaseList.appendChild(item);
+  });
+}
+
+function resetUpdateCard() {
+  if (updateSection) {
+    updateSection.hidden = true;
+  }
+  if (updateCardVersion) {
+    updateCardVersion.textContent = '';
+  }
+  if (updateCardSummary) {
+    updateCardSummary.textContent = '';
+  }
+  if (updateReleaseList) {
+    updateReleaseList.innerHTML = '';
+  }
+  if (btnOpenRelease) {
+    btnOpenRelease.hidden = true;
+    btnOpenRelease.onclick = null;
+  }
+}
+
+function renderReleaseSnapshot(snapshot) {
+  currentReleaseSnapshot = snapshot;
+
+  if (!extensionUpdateStatus || !extensionVersionMeta) {
+    return;
+  }
+
+  extensionUpdateStatus.classList.remove('is-update-available', 'is-check-failed', 'is-version-label');
+
+  const localVersionText = snapshot?.localVersion ? `v${snapshot.localVersion}` : '';
+  const logUrl = snapshot?.logUrl || snapshot?.releasesPageUrl || sidepanelUpdateService?.releasesPageUrl || '';
+
+  if (btnReleaseLog) {
+    btnReleaseLog.onclick = () => openExternalUrl(logUrl);
+    btnReleaseLog.hidden = true;
+  }
+  extensionVersionMeta.hidden = true;
+  extensionVersionMeta.textContent = '';
+
+  switch (snapshot?.status) {
+    case 'update-available': {
+      extensionUpdateStatus.textContent = '有更新';
+      extensionUpdateStatus.classList.add('is-update-available');
+      if (btnReleaseLog) {
+        btnReleaseLog.hidden = false;
+      }
+
+      if (updateSection) {
+        updateSection.hidden = false;
+      }
+      if (updateCardVersion) {
+        updateCardVersion.textContent = `最新版本 v${snapshot.latestVersion}`;
+      }
+      if (updateCardSummary) {
+        const updateCount = Array.isArray(snapshot.newerReleases) ? snapshot.newerReleases.length : 0;
+        updateCardSummary.textContent = updateCount > 1
+          ? `当前 ${localVersionText}，共有 ${updateCount} 个新版本可更新。`
+          : `当前 ${localVersionText}，可更新到 v${snapshot.latestVersion}。`;
+      }
+      renderUpdateReleaseList(snapshot.newerReleases || []);
+      if (btnOpenRelease) {
+        btnOpenRelease.hidden = false;
+        btnOpenRelease.textContent = '前往更新';
+        btnOpenRelease.onclick = () => openExternalUrl(logUrl);
+      }
+      break;
+    }
+
+    case 'latest': {
+      extensionUpdateStatus.textContent = localVersionText || 'v0.0.0';
+      extensionUpdateStatus.classList.add('is-version-label');
+      resetUpdateCard();
+      break;
+    }
+
+    case 'empty': {
+      extensionUpdateStatus.textContent = localVersionText || 'v0.0.0';
+      extensionUpdateStatus.classList.add('is-version-label');
+      resetUpdateCard();
+      break;
+    }
+
+    case 'error':
+    default: {
+      extensionUpdateStatus.textContent = localVersionText || 'v0.0.0';
+      extensionUpdateStatus.classList.add('is-version-label', 'is-check-failed');
+      extensionVersionMeta.textContent = snapshot?.errorMessage || 'GitHub Releases 检查失败';
+      extensionVersionMeta.hidden = false;
+      resetUpdateCard();
+      break;
+    }
+  }
+}
+
+async function initializeReleaseInfo() {
+  const fallbackReleaseUrl = sidepanelUpdateService?.releasesPageUrl || 'https://github.com/QLHazyCoder/codex-oauth-automation-extension/releases';
+
+  if (btnReleaseLog) {
+    btnReleaseLog.onclick = () => openExternalUrl(currentReleaseSnapshot?.logUrl || fallbackReleaseUrl);
+  }
+
+  if (!extensionUpdateStatus || !extensionVersionMeta) {
+    return;
+  }
+
+  const localVersion = sidepanelUpdateService?.stripVersionPrefix?.(chrome.runtime.getManifest()?.version || '') || '';
+  extensionUpdateStatus.textContent = localVersion ? `v${localVersion}` : 'v0.0.0';
+  extensionUpdateStatus.classList.remove('is-update-available', 'is-check-failed');
+  extensionUpdateStatus.classList.add('is-version-label');
+  extensionVersionMeta.hidden = true;
+  extensionVersionMeta.textContent = '';
+  if (btnReleaseLog) {
+    btnReleaseLog.hidden = true;
+  }
+  resetUpdateCard();
+
+  if (!sidepanelUpdateService) {
+    extensionVersionMeta.textContent = '更新检查服务不可用';
+    extensionVersionMeta.hidden = false;
+    return;
+  }
+
+  const snapshot = await sidepanelUpdateService.getReleaseSnapshot();
+  renderReleaseSnapshot(snapshot);
 }
 
 function syncPasswordField(state) {
@@ -2679,6 +2895,9 @@ initHotmailListExpandedState();
 updateSaveButtonState();
 updateConfigMenuControls();
 setLocalCpaStep9Mode(DEFAULT_LOCAL_CPA_STEP9_MODE);
+initializeReleaseInfo().catch((err) => {
+  console.error('Failed to initialize release info:', err);
+});
 restoreState().then(() => {
   syncPasswordToggleLabel();
   syncVpsUrlToggleLabel();

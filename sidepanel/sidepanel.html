@@ -20,7 +20,13 @@
         stroke-linecap="round" stroke-linejoin="round">
         <path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z" />
       </svg>
-      <h1>多页面</h1>
+      <div class="header-version-block">
+        <div class="header-version-main">
+          <div id="extension-update-status" class="header-version-title">v0.0.0</div>
+          <button id="btn-release-log" class="header-link-btn" type="button" hidden>更新日志</button>
+        </div>
+        <span id="extension-version-meta" class="header-version-meta" hidden></span>
+      </div>
     </div>
     <div class="header-btns">
       <div class="run-group">
@@ -68,6 +74,20 @@
       </div>
     </div>
   </header>
+
+  <section id="update-section" hidden>
+    <div class="update-card">
+      <div class="update-card-header">
+        <div class="update-card-copy">
+          <span class="section-label">更新内容</span>
+          <div id="update-card-version" class="update-card-version"></div>
+          <p id="update-card-summary" class="update-card-summary"></p>
+        </div>
+        <button id="btn-open-release" class="btn btn-primary btn-sm" type="button">前往更新</button>
+      </div>
+      <div id="update-release-list" class="update-release-list"></div>
+    </div>
+  </section>
 
   <section id="data-section">
     <div id="settings-card" class="data-card">
@@ -374,6 +394,7 @@
   <div id="toast-container"></div>
   <input id="input-import-settings-file" type="file" accept=".json,application/json" hidden />
   <script src="../hotmail-utils.js"></script>
+  <script src="update-service.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 

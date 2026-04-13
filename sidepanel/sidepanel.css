@@ -102,21 +102,77 @@ header {
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
+  flex: 1;
 }
 
 .header-left svg { color: var(--blue); }
 
-.header-left h1 {
-  font-size: 16px;
+.header-version-block {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.header-version-main {
+  min-width: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.header-version-title {
+  font-size: 15px;
   font-weight: 700;
   letter-spacing: -0.02em;
   color: var(--text-primary);
+  min-width: 0;
+  flex: 0 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.header-version-title.is-version-label { color: var(--blue); }
+.header-version-title.is-update-available { color: var(--orange); }
+.header-version-title.is-check-failed { color: var(--text-primary); }
+
+.header-version-meta {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.header-version-meta[hidden] {
+  display: none !important;
+}
+
+.header-link-btn {
+  padding: 0;
+  border: none;
+  background: transparent;
+  color: var(--blue);
+  font: inherit;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.header-link-btn:hover {
+  color: var(--text-primary);
+  text-decoration: underline;
 }
 
 .header-btns {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-shrink: 0;
 }
 
 /* ============================================================
@@ -281,6 +337,118 @@ header {
 
 .btn-sm { padding: 5px 12px; font-size: 12px; }
 .btn-xs { padding: 4px 10px; font-size: 11px; }
+
+/* ============================================================
+   Extension Updates
+   ============================================================ */
+
+#update-section { margin-bottom: 14px; }
+
+.update-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  box-shadow: var(--shadow-sm);
+}
+
+.update-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.update-card-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.update-card-version {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--orange);
+}
+
+.update-card-summary {
+  font-size: 12px;
+  color: var(--text-secondary);
+  line-height: 1.6;
+}
+
+.update-release-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.update-release-item {
+  padding-top: 10px;
+  border-top: 1px solid var(--border-subtle);
+}
+
+.update-release-item:first-child {
+  padding-top: 0;
+  border-top: none;
+}
+
+.update-release-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+
+.update-release-title-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.update-release-version {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.update-release-name {
+  min-width: 0;
+  font-size: 12px;
+  color: var(--text-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.update-release-date {
+  flex-shrink: 0;
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.update-release-notes {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.update-release-notes li + li { margin-top: 4px; }
+
+.update-release-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+}
 
 /* ============================================================
    Data Card
