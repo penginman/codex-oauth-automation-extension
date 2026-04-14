@@ -767,10 +767,6 @@ function renderScheduledAutoRunInfo() {
     ? `${countdown.note ? `${countdown.note}，` : ''}剩余 ${formatCountdown(remainingMs)}`
     : '倒计时即将结束，正在准备继续...';
   return;
-  autoScheduleTitle.textContent = '已计划自动运行';
-  autoScheduleMeta.textContent = remainingMs > 0
-    ? `计划于 ${formatScheduleTime(currentAutoRun.scheduledAt)} 开始，剩余 ${formatCountdown(remainingMs)}`
-    : '倒计时即将结束，正在准备启动...';
 }
 
 function syncScheduledCountdownTicker() {

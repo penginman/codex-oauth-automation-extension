@@ -73,7 +73,7 @@ if (-not (Test-Path $GH)) {
 }
 
 $Repo = 'QLHazyCoder/codex-oauth-automation-extension'
-$TargetVersion = '<用户指定的版本号，例如 6.5.0>'
+$TargetVersion = '<用户指定的版本号，但是必须按照版本标准写，v+x.x.x。比如： v6.5.0>'
 $TargetTag = "v$TargetVersion"
 $ManifestPath = 'manifest.json'
 ```
