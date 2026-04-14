@@ -1,15 +1,23 @@
 // background.js — Service Worker: orchestration, state, tab management, message routing
 
-importScripts('data/names.js', 'hotmail-utils.js', 'luckmail-utils.js', 'cloudflare-temp-email-utils.js', 'icloud-utils.js', 'content/activation-utils.js');
+importScripts(
+  'data/names.js',
+  'hotmail-utils.js',
+  'microsoft-email.js',
+  'luckmail-utils.js',
+  'cloudflare-temp-email-utils.js',
+  'icloud-utils.js',
+  'content/activation-utils.js'
+);
 
 const {
-  buildHotmailMailApiLatestUrl,
   extractVerificationCodeFromMessage,
   filterHotmailAccountsByUsage,
   getLatestHotmailMessage,
   getHotmailMailApiRequestConfig,
   getHotmailVerificationPollConfig,
   getHotmailVerificationRequestTimestamp,
+  normalizeHotmailServiceMode,
   normalizeHotmailMailApiMessages,
   pickHotmailAccountForRun,
   pickVerificationMessage,
@@ -17,6 +25,9 @@ const {
   pickVerificationMessageWithTimeFallback,
   shouldClearHotmailCurrentSelection,
 } = self.HotmailUtils;
+const {
+  fetchMicrosoftMailboxMessages,
+} = self.MultiPageMicrosoftEmail;
 const {
   DEFAULT_LUCKMAIL_PRESERVE_TAG_NAME,
   DEFAULT_LUCKMAIL_BASE_URL,
@@ -114,9 +125,37 @@ const DEFAULT_HOTMAIL_LOCAL_BASE_URL = 'http://127.0.0.1:17373';
 const HOTMAIL_LOCAL_HELPER_TIMEOUT_MS = 45000;
 const DEFAULT_LUCKMAIL_PROJECT_CODE = 'openai';
 const DISPLAY_TIMEZONE = 'Asia/Shanghai';
+const MICROSOFT_TOKEN_DNR_RULE_ID = 1001;
 const PERSISTENT_ALIAS_STATE_KEYS = ['manualAliasUsage', 'preservedAliases'];
 
 initializeSessionStorageAccess();
+setupDeclarativeNetRequestRules();
+
+function setupDeclarativeNetRequestRules() {
+  if (!chrome.declarativeNetRequest?.updateDynamicRules) {
+    return;
+  }
+
+  chrome.declarativeNetRequest.updateDynamicRules({
+    removeRuleIds: [MICROSOFT_TOKEN_DNR_RULE_ID],
+    addRules: [{
+      id: MICROSOFT_TOKEN_DNR_RULE_ID,
+      priority: 1,
+      action: {
+        type: 'modifyHeaders',
+        requestHeaders: [
+          { header: 'Origin', operation: 'remove' },
+        ],
+      },
+      condition: {
+        urlFilter: 'login.microsoftonline.com/*/oauth2/v2.0/token',
+        resourceTypes: ['xmlhttprequest'],
+      },
+    }],
+  }).catch((error) => {
+    console.warn(LOG_PREFIX, 'Failed to setup declarativeNetRequest rules:', error?.message || error);
+  });
+}
 
 // ============================================================
 // 状态管理（chrome.storage.session + chrome.storage.local）
@@ -410,10 +449,6 @@ function normalizeCloudflareDomains(values) {
   }
 
   return normalizedDomains;
-}
-
-function normalizeHotmailServiceMode(rawValue = '') {
-  return HOTMAIL_SERVICE_MODE_LOCAL;
 }
 
 function normalizeHotmailRemoteBaseUrl(rawValue = '') {
@@ -1180,11 +1215,6 @@ async function ensureHotmailAccountForFlow(options = {}) {
   return setCurrentHotmailAccount(account.id, { markUsed, syncEmail: true });
 }
 
-function buildHotmailRemoteEndpoint(baseUrl, path) {
-  const normalizedBaseUrl = normalizeHotmailRemoteBaseUrl(baseUrl);
-  return new URL(path, `${normalizedBaseUrl}/`).toString();
-}
-
 function buildHotmailLocalEndpoint(baseUrl, path) {
   const normalizedBaseUrl = normalizeHotmailLocalBaseUrl(baseUrl);
   return new URL(path, `${normalizedBaseUrl}/`).toString();
@@ -1201,55 +1231,40 @@ async function requestHotmailRemoteMailbox(account, mailbox = 'INBOX') {
     throw new Error(`Hotmail 账号 ${account.email || account.id} 缺少刷新令牌（refresh token）。`);
   }
 
-  const serviceSettings = getHotmailServiceSettings(await getState());
-  const url = buildHotmailMailApiLatestUrl({
-    apiUrl: buildHotmailRemoteEndpoint(serviceSettings.remoteBaseUrl, '/api/mail-new'),
-    clientId: account.clientId,
-    email: account.email,
-    refreshToken: account.refreshToken,
-    mailbox,
-    responseType: 'json',
-  });
   const { timeoutMs } = getHotmailMailApiRequestConfig();
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
 
-  let response;
   try {
-    response = await fetch(url, { method: 'GET', signal: controller.signal });
+    const result = await fetchMicrosoftMailboxMessages({
+      clientId: account.clientId,
+      refreshToken: account.refreshToken,
+      mailbox,
+      top: 10,
+      signal: controller.signal,
+    });
+
+    return {
+      mailbox,
+      payload: {
+        source: 'microsoft-api',
+        transport: result.transport,
+        tokenStrategy: result.tokenStrategy,
+      },
+      messages: normalizeHotmailMailApiMessages(result.messages).map((message) => ({
+        ...message,
+        mailbox: message?.mailbox || mailbox,
+      })),
+      nextRefreshToken: result.nextRefreshToken,
+    };
   } catch (err) {
     if (err?.name === 'AbortError') {
-      throw new Error(`Hotmail API 请求超时（>${Math.round(timeoutMs / 1000)} 秒）：${mailbox}`);
+      throw new Error(`Hotmail API 对接请求超时（>${Math.round(timeoutMs / 1000)} 秒）：${mailbox}`);
     }
-    throw new Error(`Hotmail API 请求失败：${err.message}`);
+    throw new Error(`Hotmail API 对接请求失败：${err.message}`);
   } finally {
     clearTimeout(timeoutId);
   }
-
-  const text = await response.text();
-  let payload = {};
-  try {
-    payload = text ? JSON.parse(text) : {};
-  } catch {
-    payload = { raw: text };
-  }
-
-  if (!response.ok) {
-    const errorText = payload?.message || payload?.error || payload?.msg || text || `HTTP ${response.status}`;
-    throw new Error(`Hotmail API 请求失败：${errorText}`);
-  }
-
-  if (payload && payload.success === false) {
-    const errorText = payload?.message || payload?.msg || payload?.error || '未知错误';
-    throw new Error(`Hotmail API 返回失败：${errorText}`);
-  }
-
-  return {
-    mailbox,
-    payload,
-    messages: normalizeHotmailMailApiMessages(payload?.data),
-    nextRefreshToken: String(payload?.new_refresh_token || payload?.newRefreshToken || '').trim(),
-  };
 }
 
 function applyHotmailApiResultToAccount(account, apiResult) {
@@ -1282,7 +1297,10 @@ async function fetchHotmailMailboxMessagesFromRemoteService(account, mailboxes =
       mailboxResults.push({
         mailbox,
         count: result.messages.length,
-        messages: result.messages.map((message) => ({ ...message, mailbox })),
+        messages: result.messages.map((message) => ({
+          ...message,
+          mailbox: message?.mailbox || mailbox,
+        })),
       });
     }
   } catch (err) {
@@ -1592,7 +1610,7 @@ async function pollHotmailVerificationCode(step, state, pollPayload = {}) {
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     throwIfStopped();
     try {
-      await addLog(`步骤 ${step}：正在轮询 Hotmail 邮件（${attempt}/${maxAttempts}）...`, 'info');
+      await addLog(`步骤 ${step}：正在通过 API对接 轮询 Hotmail 邮件（${attempt}/${maxAttempts}）...`, 'info');
       const fetchResult = await fetchHotmailMailboxMessages(account, HOTMAIL_MAILBOXES);
       account = fetchResult.account;
       const matchResult = pickVerificationMessageWithTimeFallback(fetchResult.messages, {
@@ -1609,7 +1627,7 @@ async function pollHotmailVerificationCode(step, state, pollPayload = {}) {
           const fallbackLabel = matchResult.usedTimeFallback ? '宽松匹配 + 时间回退' : '宽松匹配';
           await addLog(`步骤 ${step}：严格规则未命中，已改用 ${fallbackLabel} 并命中 Hotmail ${mailboxLabel} 验证码。`, 'warn');
         }
-        await addLog(`步骤 ${step}：已在 Hotmail ${mailboxLabel} 中找到验证码：${match.code}`, 'ok');
+        await addLog(`步骤 ${step}：已通过 API对接 在 Hotmail ${mailboxLabel} 中找到验证码：${match.code}`, 'ok');
         return {
           ok: true,
           code: match.code,
@@ -1626,7 +1644,7 @@ async function pollHotmailVerificationCode(step, state, pollPayload = {}) {
       }
     } catch (err) {
       lastError = err;
-      await addLog(`步骤 ${step}：Hotmail 收件箱轮询失败：${err.message}`, 'warn');
+      await addLog(`步骤 ${step}：Hotmail API 对接轮询失败：${err.message}`, 'warn');
     }
 
     if (attempt < maxAttempts) {
@@ -3720,7 +3738,7 @@ function getSourceLabel(source) {
     'mail-2925': '2925 邮箱',
     'inbucket-mail': 'Inbucket 邮箱',
     'duck-mail': 'Duck 邮箱',
-    'hotmail-api': 'Hotmail（远程/本地）',
+    'hotmail-api': 'Hotmail（API对接/本地助手）',
     'luckmail-api': 'LuckMail（API 购邮）',
     'cloudflare-temp-email': 'Cloudflare Temp Email',
   };
@@ -6514,7 +6532,7 @@ function getMailConfig(state) {
     return { provider: 'custom', label: '自定义邮箱' };
   }
   if (provider === HOTMAIL_PROVIDER) {
-    return { provider: HOTMAIL_PROVIDER, label: 'Hotmail（远程/本地）' };
+    return { provider: HOTMAIL_PROVIDER, label: 'Hotmail（API对接/本地助手）' };
   }
   if (provider === LUCKMAIL_PROVIDER) {
     return { provider: LUCKMAIL_PROVIDER, label: 'LuckMail（API 购邮）' };
