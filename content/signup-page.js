@@ -18,6 +18,7 @@ if (document.documentElement.getAttribute(SIGNUP_PAGE_LISTENER_SENTINEL) !== '1'
       || message.type === 'STEP8_GET_STATE'
       || message.type === 'STEP8_TRIGGER_CONTINUE'
       || message.type === 'GET_LOGIN_AUTH_STATE'
+      || message.type === 'GET_SIGNUP_PAGE_HEALTH'
       || message.type === 'PREPARE_SIGNUP_VERIFICATION'
       || message.type === 'RESEND_VERIFICATION_CODE'
       || message.type === 'ENSURE_SIGNUP_ENTRY_READY'
@@ -69,6 +70,8 @@ async function handleCommand(message) {
       return await fillVerificationCode(message.step, message.payload);
     case 'GET_LOGIN_AUTH_STATE':
       return serializeLoginAuthState(inspectLoginAuthState());
+    case 'GET_SIGNUP_PAGE_HEALTH':
+      return inspectSignupPageHealth();
     case 'PREPARE_SIGNUP_VERIFICATION':
       return await prepareSignupVerificationFlow(message.payload);
     case 'RESEND_VERIFICATION_CODE':
@@ -501,12 +504,13 @@ const INVALID_VERIFICATION_CODE_PATTERN = /代码不正确|验证码不正确|�
 const VERIFICATION_PAGE_PATTERN = /检查您的收件箱|输入我们刚刚向|重新发送电子邮件|重新发送验证码|代码不正确|email\s+verification|check\s+your\s+inbox|enter\s+the\s+code|we\s+just\s+sent|we\s+emailed|resend/i;
 const OAUTH_CONSENT_PAGE_PATTERN = /使用\s*ChatGPT\s*登录到\s*Codex|sign\s+in\s+to\s+codex(?:\s+with\s+chatgpt)?|login\s+to\s+codex|log\s+in\s+to\s+codex|authorize|授权/i;
 const OAUTH_CONSENT_FORM_SELECTOR = 'form[action*="/sign-in-with-chatgpt/" i][action*="/consent" i]';
+const STEP5_SKIP_PAGE_PATTERN = /chatgpt|入门技巧|盡管问|尽管问|请勿共享敏感信息|请核实你的信息|好的[,，\s]*开始吧|是什么促使你使用\s*chatgpt|我们会利用这些信息提出一些可能会对你有用的建议|学校|工作|个人任务|乐趣和娱乐|其他|下一步|跳过|get\s+started|tips|don't\s+share\s+sensitive\s+info|verify\s+your\s+information|what\s+brings\s+you\s+to\s+chatgpt|we(?:'ll| will)\s+use\s+this\s+information|school|work|personal\s+tasks|fun\s+and\s+entertainment|other|skip|next/i;
 const CONTINUE_ACTION_PATTERN = /继续|continue/i;
 const ADD_PHONE_PAGE_PATTERN = /add[\s-]*phone|添加手机号|手机号码|手机号|phone\s+number|telephone/i;
 const STEP5_SUBMIT_ERROR_PATTERN = /无法根据该信息创建帐户|请重试|unable\s+to\s+create\s+(?:your\s+)?account|couldn'?t\s+create\s+(?:your\s+)?account|something\s+went\s+wrong|invalid\s+(?:birthday|birth|date)|生日|出生日期/i;
 const AUTH_TIMEOUT_ERROR_TITLE_PATTERN = /糟糕，出错了|something\s+went\s+wrong|oops/i;
 const AUTH_TIMEOUT_ERROR_DETAIL_PATTERN = /operation\s+timed\s+out|timed\s+out|请求超时|操作超时/i;
-const SIGNUP_EMAIL_EXISTS_PATTERN = /与此电子邮件地址相关联的帐户已存在|account\s+associated\s+with\s+this\s+email\s+address\s+already\s+exists|email\s+address.*already\s+exists/i;
+const SIGNUP_EMAIL_EXISTS_PATTERN = /user[_\s-]*already[_\s-]*exists|与此电子邮件地址相关联的帐户已存在|account\s+associated\s+with\s+this\s+email\s+address\s+already\s+exists|email\s+address.*already\s+exists/i;
 
 function getVerificationErrorText() {
   const messages = [];
@@ -546,6 +550,18 @@ function isStep5Ready() {
   return Boolean(
     document.querySelector('input[name="name"], input[autocomplete="name"], input[name="birthday"], input[name="age"], [role="spinbutton"][data-type="year"]')
   );
+}
+
+function isStep5SkippableWelcomePage() {
+  const pageText = getPageTextSnapshot();
+  if (!STEP5_SKIP_PAGE_PATTERN.test(pageText)) {
+    return false;
+  }
+
+  const startButton = Array.from(document.querySelectorAll('button, [role="button"], a'))
+    .find((el) => isVisibleElement(el) && /好的[,，\s]*开始吧|开始吧|下一步|跳过|get\s+started|continue|next|skip/i.test(getActionText(el)));
+
+  return Boolean(startButton);
 }
 
 function getPageTextSnapshot() {
@@ -720,31 +736,88 @@ function getStep5ErrorText() {
   return messages.find((text) => STEP5_SUBMIT_ERROR_PATTERN.test(text)) || '';
 }
 
-async function waitForStep5SubmitOutcome(timeout = 15000) {
+function getStep5EmailExistsText() {
+  const pageText = getPageTextSnapshot();
+  if (SIGNUP_EMAIL_EXISTS_PATTERN.test(pageText)) {
+    return pageText;
+  }
+
+  const messages = [];
+  const selectors = [
+    '.react-aria-FieldError',
+    '[slot="errorMessage"]',
+    '[id$="-error"]',
+    '[id$="-errors"]',
+    '[role="alert"]',
+    '[aria-live="assertive"]',
+    '[aria-live="polite"]',
+    '[class*="error"]',
+  ];
+
+  for (const selector of selectors) {
+    document.querySelectorAll(selector).forEach((el) => {
+      if (!isVisibleElement(el)) return;
+      const text = normalizeInlineText(el.textContent);
+      if (text) {
+        messages.push(text);
+      }
+    });
+  }
+
+  return messages.find((text) => SIGNUP_EMAIL_EXISTS_PATTERN.test(text)) || '';
+}
+
+async function waitForStep5SubmitOutcome(timeout = 5000) {
   const start = Date.now();
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
 
-    const errorText = getStep5ErrorText();
-    if (errorText) {
-      return { invalidProfile: true, errorText };
+    const emailExistsText = getStep5EmailExistsText();
+    if (emailExistsText) {
+      return { invalidProfile: true, errorText: '当前邮箱已存在，需要重新开始新一轮。', emailExists: true };
     }
 
-    if (isAddPhonePageReady()) {
-      return { success: true, addPhonePage: true };
-    }
-
-    if (isStep8Ready()) {
-      return { success: true };
-    }
-
-    await sleep(150);
+    await sleep(250);
   }
 
-  const errorText = getStep5ErrorText();
-  if (errorText) {
-    return { invalidProfile: true, errorText };
+  const emailExistsText = getStep5EmailExistsText();
+  if (emailExistsText) {
+    return { invalidProfile: true, errorText: '当前邮箱已存在，需要重新开始新一轮。', emailExists: true };
+  }
+
+  return {
+    success: true,
+    assumed: true,
+    reason: 'step5_submit_completed_continue_step6',
+    url: location.href,
+  };
+
+  if (isStep5SkippableWelcomePage()) {
+    return {
+      success: true,
+      skipped: true,
+      skipToStep6: true,
+      reason: 'welcome_page_after_signup',
+      url: location.href,
+    };
+  }
+
+  if (isAddPhonePageReady()) {
+    return { success: true, addPhonePage: true };
+  }
+
+  if (isStep8Ready()) {
+    return { success: true };
+  }
+
+  if (sawStep5FormDisappear || !isStep5Ready()) {
+    return {
+      success: true,
+      assumed: true,
+      reason: 'step5_form_disappeared_after_submit',
+      url: location.href,
+    };
   }
 
   return {
@@ -964,6 +1037,17 @@ function serializeLoginAuthState(snapshot) {
   };
 }
 
+function inspectSignupPageHealth() {
+  const pageText = getPageTextSnapshot();
+  const isMethodNotAllowed = /405\b[\s\S]{0,80}method\s+not\s+allowed|method\s+not\s+allowed|405/i.test(pageText);
+  return {
+    url: location.href,
+    path: location.pathname || '',
+    title: document.title || '',
+    isMethodNotAllowed,
+  };
+}
+
 function getLoginAuthStateLabel(snapshot) {
   switch (snapshot?.state) {
     case 'verification_page':
@@ -1093,6 +1177,10 @@ function inspectSignupVerificationState() {
     return { state: 'step5' };
   }
 
+  if (isStep5SkippableWelcomePage()) {
+    return { state: 'step5_skippable_welcome' };
+  }
+
   if (isVerificationPageStillVisible()) {
     return { state: 'verification' };
   }
@@ -1128,7 +1216,13 @@ async function waitForSignupVerificationTransition(timeout = 5000) {
     throwIfStopped();
 
     const snapshot = inspectSignupVerificationState();
-    if (snapshot.state === 'step5' || snapshot.state === 'verification' || snapshot.state === 'error' || snapshot.state === 'email_exists') {
+    if (
+      snapshot.state === 'step5'
+      || snapshot.state === 'step5_skippable_welcome'
+      || snapshot.state === 'verification'
+      || snapshot.state === 'error'
+      || snapshot.state === 'email_exists'
+    ) {
       return snapshot;
     }
 
@@ -1151,7 +1245,7 @@ async function prepareSignupVerificationFlow(payload = {}, timeout = 30000) {
     log(`步骤 4：等待页面进入验证码阶段（第 ${roundNo}/${maxRecoveryRounds} 轮，先等待 5 秒）...`, 'info');
     const snapshot = await waitForSignupVerificationTransition(5000);
 
-    if (snapshot.state === 'step5') {
+    if (snapshot.state === 'step5' || snapshot.state === 'step5_skippable_welcome') {
       log('步骤 4：页面已进入验证码后的下一阶段，本步骤按已完成处理。', 'ok');
       return { ready: true, alreadyVerified: true, retried: recoveryRound };
     }
@@ -1841,6 +1935,15 @@ function getSerializableRect(el) {
 
 async function step5_fillNameBirthday(payload) {
   const { firstName, lastName, age, year, month, day } = payload;
+  if (isStep5SkippableWelcomePage()) {
+    log('步骤 5：检测到 ChatGPT 入门提示页，无需填写姓名和生日，直接跳过并进入步骤 6。', 'warn');
+    return {
+      skipped: true,
+      skipToStep6: true,
+      reason: 'welcome_page_after_signup',
+      url: location.href,
+    };
+  }
   if (!firstName || !lastName) throw new Error('未提供姓名数据。');
 
   const resolvedAge = age ?? (year ? new Date().getFullYear() - Number(year) : null);
@@ -2043,6 +2146,10 @@ async function step5_fillNameBirthday(payload) {
   // }
 
   log(`步骤 5：资料已通过。`, 'ok');
-  reportComplete(5, {});
-  // reportComplete(5, { addPhonePage: Boolean(outcome.addPhonePage) });
+  if (outcome.skipToStep6) {
+    log('步骤 5：提交后进入欢迎/引导页，改为跳过步骤 5 并直接进入步骤 6。', 'warn');
+    return outcome;
+  }
+
+  reportComplete(5, { addPhonePage: Boolean(outcome.addPhonePage) });
 }
