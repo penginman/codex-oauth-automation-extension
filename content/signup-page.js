@@ -2190,7 +2190,7 @@ async function step5_fillNameBirthday(payload) {
 
   const isAgeMode = !birthdayMode && Boolean(ageInput);
   if (isAgeMode) {
-    log('步骤 5：当前为年龄输入模式，点击“继续”后将直接完成当前步骤。', 'warn');
+    log('步骤 5：当前为年龄输入模式，点击“完成帐户创建”后将直接完成当前步骤。', 'warn');
   }
 
   await humanPause(500, 1300);
@@ -2200,7 +2200,7 @@ async function step5_fillNameBirthday(payload) {
   reportComplete(5, completionPayload);
 
   if (isAgeMode) {
-    log('步骤 5：年龄模式已点击“继续”，当前步骤直接完成，不再等待页面结果。', 'warn');
+    log('步骤 5：年龄模式已点击“完成帐户创建”，当前步骤直接完成，不再等待页面结果。', 'warn');
     return completionPayload;
   }
 
