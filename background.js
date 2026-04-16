@@ -3210,6 +3210,10 @@ function isSignupPageHost(hostname = '') {
   return ['auth0.openai.com', 'auth.openai.com', 'accounts.openai.com'].includes(hostname);
 }
 
+function isSignupEntryHost(hostname = '') {
+  return ['chatgpt.com', 'chat.openai.com'].includes(hostname);
+}
+
 function isSignupPasswordPageUrl(rawUrl) {
   const parsed = parseUrlSafely(rawUrl);
   if (!parsed) return false;
@@ -3261,7 +3265,7 @@ function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
 
   switch (source) {
     case 'signup-page':
-      return isSignupPageHost(candidate.hostname);
+      return isSignupPageHost(candidate.hostname) || isSignupEntryHost(candidate.hostname);
     case 'duck-mail':
       return candidate.hostname === 'duckduckgo.com' && candidate.pathname.startsWith('/email/');
     case 'qq-mail':

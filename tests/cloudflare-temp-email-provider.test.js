@@ -125,7 +125,12 @@ return {
     return { logs, listCalls };
   },
 };
-`)(options);
+`)({
+  ...options,
+  receiveMailbox,
+  messages,
+  deleteShouldFail,
+});
 }
 
 test('pollCloudflareTempEmailVerificationCode returns code even if delete fails', async () => {

@@ -70,6 +70,7 @@ let autoRunActive = true;
 let autoRunCurrentRun = 2;
 let autoRunTotalRuns = 3;
 let autoRunAttemptRun = 4;
+const AUTO_RUN_TIMER_KIND_SCHEDULED_START = 'scheduled_start';
 
 const added = {
   beforeNavigate: 0,
@@ -127,6 +128,9 @@ async function markRunningStepsStopped() {}
 async function broadcastAutoRunStatus() {}
 async function getState() {
   return { autoRunning: false };
+}
+function getPendingAutoRunTimerPlan() {
+  return null;
 }
 function isAutoRunScheduledState() {
   return false;
