@@ -1,6 +1,9 @@
 // background.js — Service Worker: orchestration, state, tab management, message routing
 
 importScripts(
+  'background/panel-bridge.js',
+  'background/generated-email-helpers.js',
+  'background/signup-flow-helpers.js',
   'data/names.js',
   'hotmail-utils.js',
   'microsoft-email.js',
@@ -5508,186 +5511,52 @@ function getEmailGeneratorLabel(generator) {
   if (generator === CLOUDFLARE_TEMP_EMAIL_GENERATOR) return 'Cloudflare Temp Email';
   return 'Duck 邮箱';
 }
+const generatedEmailHelpers = self.MultiPageGeneratedEmailHelpers?.createGeneratedEmailHelpers({
+  addLog,
+  buildCloudflareTempEmailHeaders,
+  CLOUDFLARE_TEMP_EMAIL_GENERATOR,
+  DUCK_AUTOFILL_URL,
+  fetch,
+  fetchIcloudHideMyEmail,
+  getCloudflareTempEmailAddressFromResponse,
+  getCloudflareTempEmailConfig,
+  getState,
+  joinCloudflareTempEmailUrl,
+  normalizeCloudflareDomain,
+  normalizeCloudflareTempEmailAddress,
+  normalizeEmailGenerator,
+  reuseOrCreateTab,
+  sendToContentScript,
+  setEmailState,
+  throwIfStopped,
+});
 
 function generateCloudflareAliasLocalPart() {
-  const letters = 'abcdefghijklmnopqrstuvwxyz';
-  const digits = '0123456789';
-  const chars = [];
-
-  for (let i = 0; i < 6; i++) {
-    chars.push(letters[Math.floor(Math.random() * letters.length)]);
-  }
-
-  for (let i = 0; i < 4; i++) {
-    chars.push(digits[Math.floor(Math.random() * digits.length)]);
-  }
-
-  for (let i = chars.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [chars[i], chars[j]] = [chars[j], chars[i]];
-  }
-
-  return chars.join('');
+  return generatedEmailHelpers.generateCloudflareAliasLocalPart();
 }
 
 async function fetchCloudflareEmail(state, options = {}) {
-  throwIfStopped();
-  const latestState = state || await getState();
-  const domain = normalizeCloudflareDomain(latestState.cloudflareDomain);
-  if (!domain) {
-    throw new Error('Cloudflare 域名为空或格式无效。');
-  }
-
-  const localPart = String(options.localPart || '').trim().toLowerCase() || generateCloudflareAliasLocalPart();
-  const aliasEmail = `${localPart}@${domain}`;
-
-  await setEmailState(aliasEmail);
-  await addLog(`Cloudflare 邮箱：已生成 ${aliasEmail}`, 'ok');
-  return aliasEmail;
+  return generatedEmailHelpers.fetchCloudflareEmail(state, options);
 }
 
 function ensureCloudflareTempEmailConfig(state, options = {}) {
-  const {
-    requireAdminAuth = false,
-    requireDomain = false,
-  } = options;
-  const config = getCloudflareTempEmailConfig(state);
-  if (!config.baseUrl) {
-    throw new Error('Cloudflare Temp Email 服务地址为空或格式无效。');
-  }
-  if (requireAdminAuth && !config.adminAuth) {
-    throw new Error('Cloudflare Temp Email 缺少 Admin Auth。');
-  }
-  if (requireDomain && !config.domain) {
-    throw new Error('Cloudflare Temp Email 域名为空或格式无效。');
-  }
-  return config;
+  return generatedEmailHelpers.ensureCloudflareTempEmailConfig(state, options);
 }
 
 async function requestCloudflareTempEmailJson(config, path, options = {}) {
-  const {
-    method = 'GET',
-    payload,
-    searchParams,
-    timeoutMs = 20000,
-  } = options;
-
-  const url = new URL(joinCloudflareTempEmailUrl(config.baseUrl, path));
-  if (searchParams && typeof searchParams === 'object') {
-    for (const [key, value] of Object.entries(searchParams)) {
-      if (value === undefined || value === null || value === '') continue;
-      url.searchParams.set(key, String(value));
-    }
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
-
-  let response;
-  try {
-    response = await fetch(url.toString(), {
-      method,
-      headers: buildCloudflareTempEmailHeaders(config, {
-        json: payload !== undefined,
-      }),
-      body: payload !== undefined ? JSON.stringify(payload) : undefined,
-      signal: controller.signal,
-    });
-  } catch (err) {
-    const errorMessage = err?.name === 'AbortError'
-      ? `Cloudflare Temp Email 请求超时（>${Math.round(timeoutMs / 1000)} 秒）`
-      : `Cloudflare Temp Email 请求失败：${err.message}`;
-    throw new Error(errorMessage);
-  } finally {
-    clearTimeout(timeoutId);
-  }
-
-  const text = await response.text();
-  let parsed;
-  try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    parsed = text;
-  }
-
-  if (!response.ok) {
-    const payloadError = typeof parsed === 'object' && parsed
-      ? (parsed.message || parsed.error || parsed.msg)
-      : '';
-    throw new Error(`Cloudflare Temp Email 请求失败：${payloadError || text || `HTTP ${response.status}`}`);
-  }
-
-  return parsed;
+  return generatedEmailHelpers.requestCloudflareTempEmailJson(config, path, options);
 }
 
 async function fetchCloudflareTempEmailAddress(state, options = {}) {
-  throwIfStopped();
-  const latestState = state || await getState();
-  const config = ensureCloudflareTempEmailConfig(latestState, {
-    requireAdminAuth: true,
-    requireDomain: true,
-  });
-  const requestedName = String(options.localPart || options.name || '').trim().toLowerCase() || generateCloudflareAliasLocalPart();
-  const payload = {
-    enablePrefix: true,
-    name: requestedName,
-    domain: config.domain,
-  };
-  const result = await requestCloudflareTempEmailJson(config, '/admin/new_address', {
-    method: 'POST',
-    payload,
-  });
-  const address = normalizeCloudflareTempEmailAddress(getCloudflareTempEmailAddressFromResponse(result));
-  if (!address) {
-    throw new Error('Cloudflare Temp Email 未返回可用邮箱地址。');
-  }
-
-  await setEmailState(address);
-  await addLog(`Cloudflare Temp Email：已生成 ${address}`, 'ok');
-  return address;
+  return generatedEmailHelpers.fetchCloudflareTempEmailAddress(state, options);
 }
 
 async function fetchDuckEmail(options = {}) {
-  throwIfStopped();
-  const { generateNew = true } = options;
-
-  await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
-  await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
-
-  const result = await sendToContentScript('duck-mail', {
-    type: 'FETCH_DUCK_EMAIL',
-    source: 'background',
-    payload: { generateNew },
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-  if (!result?.email) {
-    throw new Error('未返回 Duck 邮箱地址。');
-  }
-
-  await setEmailState(result.email);
-  await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
-  return result.email;
+  return generatedEmailHelpers.fetchDuckEmail(options);
 }
 
 async function fetchGeneratedEmail(state, options = {}) {
-  const currentState = state || await getState();
-  const generator = normalizeEmailGenerator(options.generator ?? currentState.emailGenerator);
-  if (generator === 'custom') {
-    throw new Error('当前邮箱生成方式为自定义邮箱，请直接填写注册邮箱。');
-  }
-  if (generator === 'icloud') {
-    return fetchIcloudHideMyEmail();
-  }
-  if (generator === 'cloudflare') {
-    return fetchCloudflareEmail(currentState, options);
-  }
-  if (generator === CLOUDFLARE_TEMP_EMAIL_GENERATOR) {
-    return fetchCloudflareTempEmailAddress(currentState, options);
-  }
-  return fetchDuckEmail(options);
+  return generatedEmailHelpers.fetchGeneratedEmail(state, options);
 }
 
 // ============================================================
@@ -6504,219 +6373,67 @@ async function resumeAutoRun() {
 
 const SIGNUP_ENTRY_URL = 'https://chatgpt.com/';
 const SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/signup-page.js'];
+const panelBridge = self.MultiPageBackgroundPanelBridge?.createPanelBridge({
+  chrome,
+  addLog,
+  closeConflictingTabsForSource,
+  ensureContentScriptReadyOnTab,
+  getPanelMode,
+  normalizeSub2ApiUrl,
+  rememberSourceLastUrl,
+  sendToContentScript,
+  sendToContentScriptResilient,
+  waitForTabUrlFamily,
+  DEFAULT_SUB2API_GROUP_NAME,
+  SUB2API_STEP1_RESPONSE_TIMEOUT_MS,
+});
+const signupFlowHelpers = self.MultiPageSignupFlowHelpers?.createSignupFlowHelpers({
+  addLog,
+  buildGeneratedAliasEmail,
+  chrome,
+  ensureContentScriptReadyOnTab,
+  ensureHotmailAccountForFlow,
+  ensureLuckmailPurchaseForFlow,
+  getTabId,
+  isGeneratedAliasProvider,
+  isHotmailProvider,
+  isLuckmailProvider,
+  isSignupPasswordPageUrl,
+  isTabAlive,
+  reuseOrCreateTab,
+  sendToContentScriptResilient,
+  setEmailState,
+  SIGNUP_ENTRY_URL,
+  SIGNUP_PAGE_INJECT_FILES,
+  waitForTabUrlMatch,
+});
 
 async function requestOAuthUrlFromPanel(state, options = {}) {
-  if (getPanelMode(state) === 'sub2api') {
-    return requestSub2ApiOAuthUrl(state, options);
-  }
-  return requestCpaOAuthUrl(state, options);
+  return panelBridge.requestOAuthUrlFromPanel(state, options);
 }
 
 async function requestCpaOAuthUrl(state, options = {}) {
-  const { logLabel = 'OAuth 刷新' } = options;
-  if (!state.vpsUrl) {
-    throw new Error('尚未配置 CPA 地址，请先在侧边栏填写。');
-  }
-
-  await addLog(`${logLabel}：正在打开 CPA 面板...`);
-
-  const injectFiles = ['content/activation-utils.js', 'content/utils.js', 'content/vps-panel.js'];
-  await closeConflictingTabsForSource('vps-panel', state.vpsUrl);
-
-  const tab = await chrome.tabs.create({ url: state.vpsUrl, active: true });
-  const tabId = tab.id;
-  await rememberSourceLastUrl('vps-panel', state.vpsUrl);
-
-  await addLog(`${logLabel}：CPA 面板已打开，正在等待页面进入目标地址...`);
-  const matchedTab = await waitForTabUrlFamily('vps-panel', tabId, state.vpsUrl, {
-    timeoutMs: 15000,
-    retryDelayMs: 400,
-  });
-  if (!matchedTab) {
-    await addLog(`${logLabel}：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...`, 'warn');
-  }
-
-  await ensureContentScriptReadyOnTab('vps-panel', tabId, {
-    inject: injectFiles,
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `${logLabel}：CPA 面板仍在加载，正在重试连接内容脚本...`,
-  });
-
-  const result = await sendToContentScriptResilient('vps-panel', {
-    type: 'REQUEST_OAUTH_URL',
-    source: 'background',
-    payload: {
-      vpsPassword: state.vpsPassword,
-      logStep: 6,
-    },
-  }, {
-    timeoutMs: 30000,
-    retryDelayMs: 700,
-    logMessage: `${logLabel}：CPA 面板通信未就绪，正在等待页面恢复...`,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-  return result || {};
+  return panelBridge.requestCpaOAuthUrl(state, options);
 }
 
 async function requestSub2ApiOAuthUrl(state, options = {}) {
-  const { logLabel = 'OAuth 刷新' } = options;
-  const sub2apiUrl = normalizeSub2ApiUrl(state.sub2apiUrl);
-  const groupName = (state.sub2apiGroupName || DEFAULT_SUB2API_GROUP_NAME).trim() || DEFAULT_SUB2API_GROUP_NAME;
-
-  if (!state.sub2apiEmail) {
-    throw new Error('尚未配置 SUB2API 登录邮箱，请先在侧边栏填写。');
-  }
-  if (!state.sub2apiPassword) {
-    throw new Error('尚未配置 SUB2API 登录密码，请先在侧边栏填写。');
-  }
-
-  await addLog(`${logLabel}：正在打开 SUB2API 后台...`);
-
-  const injectFiles = ['content/utils.js', 'content/sub2api-panel.js'];
-  await closeConflictingTabsForSource('sub2api-panel', sub2apiUrl);
-
-  const tab = await chrome.tabs.create({ url: sub2apiUrl, active: true });
-  const tabId = tab.id;
-  await rememberSourceLastUrl('sub2api-panel', sub2apiUrl);
-
-  await addLog(`${logLabel}：SUB2API 页面已打开，正在等待页面进入目标地址...`);
-  const matchedTab = await waitForTabUrlFamily('sub2api-panel', tabId, sub2apiUrl, {
-    timeoutMs: 15000,
-    retryDelayMs: 400,
-  });
-  if (!matchedTab) {
-    await addLog(`${logLabel}：SUB2API 页面尚未稳定，继续尝试连接内容脚本...`, 'warn');
-  }
-
-  await ensureContentScriptReadyOnTab('sub2api-panel', tabId, {
-    inject: injectFiles,
-    injectSource: 'sub2api-panel',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `${logLabel}：SUB2API 页面仍在加载，正在重试连接内容脚本...`,
-  });
-
-  const result = await sendToContentScript('sub2api-panel', {
-    type: 'REQUEST_OAUTH_URL',
-    source: 'background',
-    payload: {
-      sub2apiUrl,
-      sub2apiEmail: state.sub2apiEmail,
-      sub2apiPassword: state.sub2apiPassword,
-      sub2apiGroupName: groupName,
-      logStep: 6,
-    },
-  }, {
-    responseTimeoutMs: SUB2API_STEP1_RESPONSE_TIMEOUT_MS,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-  return result || {};
+  return panelBridge.requestSub2ApiOAuthUrl(state, options);
 }
 
 async function openSignupEntryTab(step = 1) {
-  const tabId = await reuseOrCreateTab('signup-page', SIGNUP_ENTRY_URL, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-  });
-
-  await ensureContentScriptReadyOnTab('signup-page', tabId, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `步骤 ${step}：ChatGPT 官网仍在加载，正在重试连接内容脚本...`,
-  });
-
-  return tabId;
+  return signupFlowHelpers.openSignupEntryTab(step);
 }
 
 async function ensureSignupEntryPageReady(step = 1) {
-  const tabId = await openSignupEntryTab(step);
-  const result = await sendToContentScriptResilient('signup-page', {
-    type: 'ENSURE_SIGNUP_ENTRY_READY',
-    step,
-    source: 'background',
-    payload: {},
-  }, {
-    timeoutMs: 20000,
-    retryDelayMs: 700,
-    logMessage: `步骤 ${step}：官网注册入口正在切换，等待页面恢复...`,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-
-  return { tabId, result: result || {} };
+  return signupFlowHelpers.ensureSignupEntryPageReady(step);
 }
 
 async function ensureSignupPasswordPageReadyInTab(tabId, step = 2, options = {}) {
-  const { skipUrlWait = false } = options;
-
-  if (!skipUrlWait) {
-    const matchedTab = await waitForTabUrlMatch(tabId, (url) => isSignupPasswordPageUrl(url), {
-      timeoutMs: 45000,
-      retryDelayMs: 300,
-    });
-    if (!matchedTab) {
-      throw new Error('等待进入密码页超时，请检查邮箱提交后页面是否仍停留在官网或邮箱页。');
-    }
-  }
-
-  await ensureContentScriptReadyOnTab('signup-page', tabId, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `步骤 ${step}：密码页仍在加载，正在重试连接内容脚本...`,
-  });
-
-  const result = await sendToContentScriptResilient('signup-page', {
-    type: 'ENSURE_SIGNUP_PASSWORD_PAGE_READY',
-    step,
-    source: 'background',
-    payload: {},
-  }, {
-    timeoutMs: 20000,
-    retryDelayMs: 700,
-    logMessage: `步骤 ${step}：认证页正在切换，等待密码页重新就绪...`,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-
-  return result || {};
+  return signupFlowHelpers.ensureSignupPasswordPageReadyInTab(tabId, step, options);
 }
 
 async function resolveSignupEmailForFlow(state) {
-  let resolvedEmail = state.email;
-  if (isHotmailProvider(state)) {
-    const account = await ensureHotmailAccountForFlow({
-      allowAllocate: true,
-      markUsed: true,
-      preferredAccountId: state.currentHotmailAccountId || null,
-    });
-    resolvedEmail = account.email;
-  } else if (isLuckmailProvider(state)) {
-    const purchase = await ensureLuckmailPurchaseForFlow({ allowReuse: true });
-    resolvedEmail = purchase.email_address;
-  } else if (isGeneratedAliasProvider(state)) {
-    resolvedEmail = buildGeneratedAliasEmail(state);
-  }
-
-  if (!resolvedEmail) {
-    throw new Error('缺少邮箱地址，请先在侧边栏粘贴邮箱。');
-  }
-
-  return resolvedEmail;
+  return signupFlowHelpers.resolveSignupEmailForFlow(state);
 }
 
 // ============================================================
@@ -6735,9 +6452,6 @@ async function executeStep1() {
 
 async function executeStep2(state) {
   const resolvedEmail = await resolveSignupEmailForFlow(state);
-  if (resolvedEmail !== state.email) {
-    await setEmailState(resolvedEmail);
-  }
 
   let signupTabId = await getTabId('signup-page');
   if (!signupTabId || !(await isTabAlive('signup-page'))) {
