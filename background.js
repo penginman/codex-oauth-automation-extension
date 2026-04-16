@@ -4052,6 +4052,7 @@ function isVerificationMailPollingError(error) {
 }
 
 function getLoginAuthStateLabel(state) {
+  state = state === 'oauth_consent_page' ? 'unknown' : state;
   switch (state) {
     case 'verification_page':
       return '登录验证码页';

@@ -1045,13 +1045,6 @@ function inspectLoginAuthState() {
     };
   }
 
-  if (oauthConsentPage) {
-    return {
-      ...baseState,
-      state: 'oauth_consent_page',
-    };
-  }
-
   if (passwordInput || switchTrigger) {
     return {
       ...baseState,
@@ -1097,7 +1090,8 @@ function serializeLoginAuthState(snapshot) {
 }
 
 function getLoginAuthStateLabel(snapshot) {
-  switch (snapshot?.state) {
+  const state = snapshot?.state === 'oauth_consent_page' ? 'unknown' : snapshot?.state;
+  switch (state) {
     case 'verification_page':
       return '登录验证码页';
     case 'password_page':
@@ -1117,11 +1111,11 @@ function getLoginAuthStateLabel(snapshot) {
 
 async function waitForKnownLoginAuthState(timeout = 15000) {
   const start = Date.now();
-  let snapshot = inspectLoginAuthState();
+  let snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
-    snapshot = inspectLoginAuthState();
+    snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
     if (snapshot.state !== 'unknown') {
       return snapshot;
     }
@@ -1173,7 +1167,19 @@ function createStep6RecoverableResult(reason, snapshot, options = {}) {
   };
 }
 
+function normalizeStep6Snapshot(snapshot) {
+  if (snapshot?.state !== 'oauth_consent_page') {
+    return snapshot;
+  }
+
+  return {
+    ...snapshot,
+    state: 'unknown',
+  };
+}
+
 function throwForStep6FatalState(snapshot) {
+  snapshot = normalizeStep6Snapshot(snapshot);
   switch (snapshot?.state) {
     case 'oauth_consent_page':
       throw new Error(`当前页面已进入 OAuth 授权页，未经过登录验证码页，无法完成步骤 6。URL: ${snapshot.url}`);
@@ -1476,11 +1482,11 @@ async function fillVerificationCode(step, payload) {
 
 async function waitForStep6EmailSubmitTransition(emailSubmittedAt, timeout = 12000) {
   const start = Date.now();
-  let snapshot = inspectLoginAuthState();
+  let snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
-    snapshot = inspectLoginAuthState();
+    snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
     if (snapshot.state === 'verification_page') {
       return {
@@ -1516,7 +1522,7 @@ async function waitForStep6EmailSubmitTransition(emailSubmittedAt, timeout = 120
     await sleep(250);
   }
 
-  snapshot = inspectLoginAuthState();
+  snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
   if (snapshot.state === 'verification_page') {
     return {
       action: 'done',
@@ -1554,11 +1560,11 @@ async function waitForStep6EmailSubmitTransition(emailSubmittedAt, timeout = 120
 
 async function waitForStep6PasswordSubmitTransition(passwordSubmittedAt, timeout = 10000) {
   const start = Date.now();
-  let snapshot = inspectLoginAuthState();
+  let snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
-    snapshot = inspectLoginAuthState();
+    snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
     if (snapshot.state === 'verification_page') {
       return {
@@ -1590,7 +1596,7 @@ async function waitForStep6PasswordSubmitTransition(passwordSubmittedAt, timeout
     await sleep(250);
   }
 
-  snapshot = inspectLoginAuthState();
+  snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
   if (snapshot.state === 'verification_page') {
     return {
       action: 'done',
@@ -1628,11 +1634,11 @@ async function waitForStep6PasswordSubmitTransition(passwordSubmittedAt, timeout
 
 async function waitForStep6SwitchTransition(loginVerificationRequestedAt, timeout = 10000) {
   const start = Date.now();
-  let snapshot = inspectLoginAuthState();
+  let snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
   while (Date.now() - start < timeout) {
     throwIfStopped();
-    snapshot = inspectLoginAuthState();
+    snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
 
     if (snapshot.state === 'verification_page') {
       return createStep6SuccessResult(snapshot, {
@@ -1658,7 +1664,7 @@ async function waitForStep6SwitchTransition(loginVerificationRequestedAt, timeou
     await sleep(250);
   }
 
-  snapshot = inspectLoginAuthState();
+  snapshot = normalizeStep6Snapshot(inspectLoginAuthState());
   if (snapshot.state === 'verification_page') {
     return createStep6SuccessResult(snapshot, {
       via: 'switch_to_one_time_code_login',
@@ -1685,7 +1691,7 @@ async function waitForStep6SwitchTransition(loginVerificationRequestedAt, timeou
 async function step6SwitchToOneTimeCodeLogin(snapshot) {
   const switchTrigger = snapshot?.switchTrigger || findOneTimeCodeLoginTrigger();
   if (!switchTrigger || !isActionEnabled(switchTrigger)) {
-    return createStep6RecoverableResult('missing_one_time_code_trigger', inspectLoginAuthState(), {
+    return createStep6RecoverableResult('missing_one_time_code_trigger', normalizeStep6Snapshot(inspectLoginAuthState()), {
       message: '当前登录页没有可用的一次性验证码登录入口。',
     });
   }
@@ -1700,7 +1706,7 @@ async function step6SwitchToOneTimeCodeLogin(snapshot) {
 }
 
 async function step6LoginFromPasswordPage(payload, snapshot) {
-  const currentSnapshot = snapshot || inspectLoginAuthState();
+  const currentSnapshot = normalizeStep6Snapshot(snapshot || inspectLoginAuthState());
 
   if (currentSnapshot.passwordInput) {
     if (!payload.password) {
@@ -1730,7 +1736,7 @@ async function step6LoginFromPasswordPage(payload, snapshot) {
       return step6SwitchToOneTimeCodeLogin(transition.snapshot);
     }
 
-    return createStep6RecoverableResult('password_submit_unknown', inspectLoginAuthState(), {
+    return createStep6RecoverableResult('password_submit_unknown', normalizeStep6Snapshot(inspectLoginAuthState()), {
       message: '提交密码后未得到可用的下一步状态。',
     });
   }
@@ -1745,7 +1751,7 @@ async function step6LoginFromPasswordPage(payload, snapshot) {
 }
 
 async function step6LoginFromEmailPage(payload, snapshot) {
-  const currentSnapshot = snapshot || inspectLoginAuthState();
+  const currentSnapshot = normalizeStep6Snapshot(snapshot || inspectLoginAuthState());
   const emailInput = currentSnapshot.emailInput || getLoginEmailInput();
   if (!emailInput) {
     throw new Error('在登录页未找到邮箱输入框。URL: ' + location.href);
@@ -1777,7 +1783,7 @@ async function step6LoginFromEmailPage(payload, snapshot) {
     return step6LoginFromPasswordPage(payload, transition.snapshot);
   }
 
-  return createStep6RecoverableResult('email_submit_unknown', inspectLoginAuthState(), {
+  return createStep6RecoverableResult('email_submit_unknown', normalizeStep6Snapshot(inspectLoginAuthState()), {
     message: '提交邮箱后未得到可用的下一步状态。',
   });
 }
@@ -1788,7 +1794,7 @@ async function step6_login(payload) {
 
   log(`步骤 6：正在使用 ${email} 登录...`);
 
-  const snapshot = await waitForKnownLoginAuthState(15000);
+  const snapshot = normalizeStep6Snapshot(await waitForKnownLoginAuthState(15000));
 
   if (snapshot.state === 'verification_page') {
     log('步骤 6：登录验证码页面已就绪。', 'ok');
