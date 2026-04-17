@@ -1540,6 +1540,8 @@ function applySettingsState(state) {
     const restoredEmailGenerator = String(state?.emailGenerator || '').trim().toLowerCase();
     if (restoredEmailGenerator === 'icloud') {
       selectEmailGenerator.value = 'icloud';
+    } else if (restoredEmailGenerator === 'icloud-standard-alias') {
+      selectEmailGenerator.value = 'icloud-standard-alias';
     } else if (restoredEmailGenerator === 'cloudflare') {
       selectEmailGenerator.value = 'cloudflare';
     } else if (restoredEmailGenerator === 'cloudflare-temp-email') {
@@ -1606,7 +1608,7 @@ async function restoreState() {
   try {
     const state = await chrome.runtime.sendMessage({ type: 'GET_STATE', source: 'sidepanel' });
     applySettingsState(state);
-    if (getSelectedEmailGenerator() === 'icloud' && icloudSection?.style.display !== 'none') {
+    if ((getSelectedEmailGenerator() === 'icloud' || getSelectedEmailGenerator() === 'icloud-standard-alias') && icloudSection?.style.display !== 'none') {
       refreshIcloudAliases({ silent: true }).catch(() => { });
     }
 
@@ -1894,6 +1896,9 @@ function getSelectedEmailGenerator() {
   if (generator === 'icloud') {
     return 'icloud';
   }
+  if (generator === 'icloud-standard-alias') {
+    return 'icloud-standard-alias';
+  }
   if (generator === 'cloudflare') return 'cloudflare';
   if (generator === 'cloudflare-temp-email') return 'cloudflare-temp-email';
   return 'duck';
@@ -1909,6 +1914,14 @@ function getEmailGeneratorUiCopy() {
       placeholder: '点击获取 iCloud 隐私邮箱，或手动粘贴邮箱',
       successVerb: '获取',
       label: 'iCloud 隐私邮箱',
+    };
+  }
+  if (getSelectedEmailGenerator() === 'icloud-standard-alias') {
+    return {
+      buttonLabel: '获取',
+      placeholder: '点击获取普通 iCloud 别名邮箱，或手动粘贴邮箱',
+      successVerb: '获取',
+      label: '普通 iCloud 别名邮箱',
     };
   }
   if (getSelectedEmailGenerator() === 'cloudflare') {
@@ -2133,7 +2146,7 @@ function updateMailProviderUI() {
   rowInbucketMailbox.style.display = useInbucket ? '' : 'none';
   const selectedGenerator = getSelectedEmailGenerator();
   const useCloudflare = selectedGenerator === 'cloudflare';
-  const useIcloud = selectedGenerator === 'icloud';
+  const useIcloud = selectedGenerator === 'icloud' || selectedGenerator === 'icloud-standard-alias';
   const useCloudflareTempEmailGenerator = selectedGenerator === 'cloudflare-temp-email';
   const showCloudflareDomain = useEmailGenerator && useCloudflare;
   const showCloudflareTempEmailSettings = useCloudflareTempEmailProvider || (useEmailGenerator && useCloudflareTempEmailGenerator);
@@ -2737,7 +2750,7 @@ async function fetchGeneratedEmail(options = {}) {
     }
 
     inputEmail.value = response.email;
-    if (getSelectedEmailGenerator() === 'icloud') {
+    if (getSelectedEmailGenerator() === 'icloud' || getSelectedEmailGenerator() === 'icloud-standard-alias') {
       queueIcloudAliasRefresh();
     }
     showToast(`已${uiCopy.successVerb} ${uiCopy.label}：${response.email}`, 'success', 2500);
@@ -3572,7 +3585,7 @@ selectEmailGenerator.addEventListener('change', () => {
 selectIcloudHostPreference?.addEventListener('change', () => {
   markSettingsDirty(true);
   saveSettings({ silent: true }).catch(() => { });
-  if (getSelectedEmailGenerator() === 'icloud') {
+  if (getSelectedEmailGenerator() === 'icloud' || getSelectedEmailGenerator() === 'icloud-standard-alias') {
     queueIcloudAliasRefresh();
   }
 });

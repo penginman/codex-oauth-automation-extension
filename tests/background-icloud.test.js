@@ -164,10 +164,12 @@ return {
 `)(overrides);
 }
 
-test('normalizeEmailGenerator and label support icloud', () => {
+test('normalizeEmailGenerator and label support icloud generators', () => {
   const api = createApi();
   assert.equal(api.normalizeEmailGenerator('icloud'), 'icloud');
   assert.equal(api.getEmailGeneratorLabel('icloud'), 'iCloud 隐私邮箱');
+  assert.equal(api.normalizeEmailGenerator('icloud-standard-alias'), 'icloud-standard-alias');
+  assert.equal(api.getEmailGeneratorLabel('icloud-standard-alias'), '普通 iCloud 别名邮箱');
 });
 
 test('normalizePersistentSettingValue handles icloud settings', () => {

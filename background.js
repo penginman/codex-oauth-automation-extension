@@ -233,7 +233,6 @@ const PERSISTED_SETTING_DEFAULTS = {
 };
 
 const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
-const ACCOUNT_RUN_HISTORY_STORAGE_KEY = 'accountRunHistory';
 const SETTINGS_EXPORT_SCHEMA_VERSION = 1;
 const SETTINGS_EXPORT_FILENAME_PREFIX = 'multipage-settings';
 const STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS = 3000;
@@ -523,6 +522,9 @@ function normalizeEmailGenerator(value = '') {
   }
   if (normalized === 'icloud') {
     return 'icloud';
+  }
+  if (normalized === 'icloud-standard-alias') {
+    return 'icloud-standard-alias';
   }
   if (normalized === 'cloudflare') return 'cloudflare';
   if (normalized === CLOUDFLARE_TEMP_EMAIL_GENERATOR) return CLOUDFLARE_TEMP_EMAIL_GENERATOR;
@@ -4860,6 +4862,9 @@ function getEmailGeneratorLabel(generator) {
   if (generator === 'icloud') {
     return 'iCloud 隐私邮箱';
   }
+  if (generator === 'icloud-standard-alias') {
+    return '普通 iCloud 别名邮箱';
+  }
   if (generator === 'cloudflare') return 'Cloudflare 邮箱';
   if (generator === CLOUDFLARE_TEMP_EMAIL_GENERATOR) return 'Cloudflare Temp Email';
   return 'Duck 邮箱';
@@ -4871,10 +4876,13 @@ const generatedEmailHelpers = self.MultiPageGeneratedEmailHelpers?.createGenerat
   DUCK_AUTOFILL_URL,
   fetch,
   fetchIcloudHideMyEmail,
+  getConfiguredIcloudHostPreference,
   getCloudflareTempEmailAddressFromResponse,
   getCloudflareTempEmailConfig,
+  getIcloudMailUrlForHost,
   getState,
   joinCloudflareTempEmailUrl,
+  normalizeIcloudHost,
   normalizeCloudflareDomain,
   normalizeCloudflareTempEmailAddress,
   normalizeEmailGenerator,
