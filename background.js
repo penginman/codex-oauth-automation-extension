@@ -1,6 +1,27 @@
 // background.js — Service Worker: orchestration, state, tab management, message routing
 
 importScripts(
+  'background/account-run-history.js',
+  'background/panel-bridge.js',
+  'background/generated-email-helpers.js',
+  'background/signup-flow-helpers.js',
+  'background/message-router.js',
+  'background/verification-flow.js',
+  'background/auto-run-controller.js',
+  'background/tab-runtime.js',
+  'background/navigation-utils.js',
+  'background/logging-status.js',
+  'background/steps/registry.js',
+  'data/step-definitions.js',
+  'background/steps/open-chatgpt.js',
+  'background/steps/submit-signup-email.js',
+  'background/steps/fill-password.js',
+  'background/steps/fetch-signup-code.js',
+  'background/steps/fill-profile.js',
+  'background/steps/oauth-login.js',
+  'background/steps/fetch-login-code.js',
+  'background/steps/confirm-oauth.js',
+  'background/steps/platform-verify.js',
   'data/names.js',
   'hotmail-utils.js',
   'microsoft-email.js',
@@ -130,11 +151,13 @@ const HOTMAIL_SERVICE_MODE_REMOTE = 'remote';
 const HOTMAIL_SERVICE_MODE_LOCAL = 'local';
 const DEFAULT_HOTMAIL_REMOTE_BASE_URL = '';
 const DEFAULT_HOTMAIL_LOCAL_BASE_URL = 'http://127.0.0.1:17373';
+const DEFAULT_ACCOUNT_RUN_HISTORY_HELPER_BASE_URL = DEFAULT_HOTMAIL_LOCAL_BASE_URL;
 const HOTMAIL_LOCAL_HELPER_TIMEOUT_MS = 45000;
 const DEFAULT_LUCKMAIL_PROJECT_CODE = 'openai';
 const DISPLAY_TIMEZONE = 'Asia/Shanghai';
 const MICROSOFT_TOKEN_DNR_RULE_ID = 1001;
 const PERSISTENT_ALIAS_STATE_KEYS = ['manualAliasUsage', 'preservedAliases'];
+const ACCOUNT_RUN_HISTORY_STORAGE_KEY = 'accountRunHistory';
 
 initializeSessionStorageAccess();
 setupDeclarativeNetRequestRules();
@@ -190,6 +213,8 @@ const PERSISTED_SETTING_DEFAULTS = {
   emailGenerator: 'duck',
   autoDeleteUsedIcloudAlias: false,
   icloudHostPreference: 'auto',
+  accountRunHistoryTextEnabled: false,
+  accountRunHistoryHelperBaseUrl: DEFAULT_ACCOUNT_RUN_HISTORY_HELPER_BASE_URL,
   emailPrefix: '',
   inbucketHost: '',
   inbucketMailbox: '',
@@ -239,6 +264,7 @@ const DEFAULT_STATE = {
   email: null, // 运行时邮箱，由程序自动获取并写入，不能手动预填。
   password: null, // 运行时实际密码，由 customPassword 或程序自动生成后写入。
   accounts: [], // 已生成账号记录：{ email, password, createdAt }。
+  accountRunHistory: [], // 账号运行历史快照，实际持久化在 chrome.storage.local。
   manualAliasUsage: {},
   preservedAliases: {},
   lastEmailTimestamp: null, // 最近一次获取到邮箱数据的运行时时间戳。
@@ -655,6 +681,23 @@ function normalizeHotmailLocalBaseUrl(rawValue = '') {
   }
 }
 
+function normalizeAccountRunHistoryHelperBaseUrl(rawValue = '') {
+  const value = String(rawValue || '').trim();
+  if (!value) return DEFAULT_ACCOUNT_RUN_HISTORY_HELPER_BASE_URL;
+
+  try {
+    const parsed = new URL(value);
+    if (parsed.pathname === '/append-account-log') {
+      parsed.pathname = '';
+      parsed.search = '';
+      parsed.hash = '';
+    }
+    return normalizeHotmailLocalBaseUrl(parsed.toString());
+  } catch {
+    return normalizeHotmailLocalBaseUrl(value);
+  }
+}
+
 function getHotmailServiceSettings(state = {}) {
   return {
     mode: normalizeHotmailServiceMode(state.hotmailServiceMode),
@@ -732,9 +775,12 @@ function normalizePersistentSettingValue(key, value) {
     case 'emailGenerator':
       return normalizeEmailGenerator(value);
     case 'autoDeleteUsedIcloudAlias':
+    case 'accountRunHistoryTextEnabled':
       return Boolean(value);
     case 'icloudHostPreference':
       return normalizeIcloudHost(value) || 'auto';
+    case 'accountRunHistoryHelperBaseUrl':
+      return normalizeAccountRunHistoryHelperBaseUrl(value);
     case 'emailPrefix':
       return String(value || '').trim();
     case 'inbucketHost':
@@ -838,12 +884,13 @@ async function getPersistedAliasState() {
 }
 
 async function getState() {
-  const [state, persistedSettings, persistedAliasState] = await Promise.all([
+  const [state, persistedSettings, persistedAliasState, accountRunHistory] = await Promise.all([
     chrome.storage.session.get(null),
     getPersistedSettings(),
     getPersistedAliasState(),
+    accountRunHistoryHelpers?.getPersistedAccountRunHistory?.() || [],
   ]);
-  return { ...DEFAULT_STATE, ...persistedSettings, ...persistedAliasState, ...state };
+  return { ...DEFAULT_STATE, ...persistedSettings, ...persistedAliasState, accountRunHistory, ...state };
 }
 
 async function initializeSessionStorageAccess() {
@@ -3271,38 +3318,25 @@ async function finalizeIcloudAliasAfterSuccessfulFlow(state) {
 // ============================================================
 
 async function getTabRegistry() {
-  const state = await getState();
-  return state.tabRegistry || {};
+  return tabRuntime.getTabRegistry();
 }
 
 async function registerTab(source, tabId) {
-  const registry = await getTabRegistry();
-  registry[source] = { tabId, ready: true };
-  await setState({ tabRegistry: registry });
-  console.log(LOG_PREFIX, `Tab registered: ${source} -> ${tabId}`);
+  return tabRuntime.registerTab(source, tabId);
 }
 
 async function isTabAlive(source) {
-  const registry = await getTabRegistry();
-  const entry = registry[source];
-  if (!entry) return false;
-  try {
-    await chrome.tabs.get(entry.tabId);
-    return true;
-  } catch {
-    // Tab no longer exists — clean up registry
-    registry[source] = null;
-    await setState({ tabRegistry: registry });
-    return false;
-  }
+  return tabRuntime.isTabAlive(source);
 }
 
 async function getTabId(source) {
-  const registry = await getTabRegistry();
-  return registry[source]?.tabId || null;
+  return tabRuntime.getTabId(source);
 }
 
 function parseUrlSafely(rawUrl) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.parseUrlSafely) {
+    return navigationUtils.parseUrlSafely(rawUrl);
+  }
   if (!rawUrl) return null;
   try {
     return new URL(rawUrl);
@@ -3312,6 +3346,9 @@ function parseUrlSafely(rawUrl) {
 }
 
 function normalizeSub2ApiUrl(rawUrl) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.normalizeSub2ApiUrl) {
+    return navigationUtils.normalizeSub2ApiUrl(rawUrl);
+  }
   const input = (rawUrl || '').trim() || DEFAULT_SUB2API_URL;
   const withProtocol = /^https?:\/\//i.test(input) ? input : `https://${input}`;
   const parsed = new URL(withProtocol);
@@ -3323,48 +3360,81 @@ function normalizeSub2ApiUrl(rawUrl) {
 }
 
 function getPanelMode(state = {}) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.getPanelMode) {
+    return navigationUtils.getPanelMode(state);
+  }
   return state.panelMode === 'sub2api' ? 'sub2api' : 'cpa';
 }
 
 function getPanelModeLabel(modeOrState) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.getPanelModeLabel) {
+    return navigationUtils.getPanelModeLabel(modeOrState);
+  }
   const mode = typeof modeOrState === 'string' ? modeOrState : getPanelMode(modeOrState);
   return mode === 'sub2api' ? 'SUB2API' : 'CPA';
 }
 
 function isSignupPageHost(hostname = '') {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.isSignupPageHost) {
+    return navigationUtils.isSignupPageHost(hostname);
+  }
   return ['auth0.openai.com', 'auth.openai.com', 'accounts.openai.com'].includes(hostname);
 }
 
 function isSignupEntryHost(hostname = '') {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.isSignupEntryHost) {
+    return navigationUtils.isSignupEntryHost(hostname);
+  }
   return ['chatgpt.com', 'chat.openai.com'].includes(hostname);
 }
 
 function isSignupPasswordPageUrl(rawUrl) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.isSignupPasswordPageUrl) {
+    return navigationUtils.isSignupPasswordPageUrl(rawUrl);
+  }
   const parsed = parseUrlSafely(rawUrl);
   if (!parsed) return false;
   return isSignupPageHost(parsed.hostname)
     && /\/create-account\/password(?:[/?#]|$)/i.test(parsed.pathname || '');
 }
 
+function isSignupEmailVerificationPageUrl(rawUrl) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.isSignupEmailVerificationPageUrl) {
+    return navigationUtils.isSignupEmailVerificationPageUrl(rawUrl);
+  }
+  const parsed = parseUrlSafely(rawUrl);
+  if (!parsed) return false;
+  return isSignupPageHost(parsed.hostname)
+    && /\/email-verification(?:[/?#]|$)/i.test(parsed.pathname || '');
+}
+
 function is163MailHost(hostname = '') {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.is163MailHost) {
+    return navigationUtils.is163MailHost(hostname);
+  }
   return hostname === 'mail.163.com'
     || hostname.endsWith('.mail.163.com')
     || hostname === 'webmail.vip.163.com';
 }
 
 function isLocalhostOAuthCallbackUrl(rawUrl) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.isLocalhostOAuthCallbackUrl) {
+    return navigationUtils.isLocalhostOAuthCallbackUrl(rawUrl);
+  }
   const parsed = parseUrlSafely(rawUrl);
   if (!parsed) return false;
   if (!['http:', 'https:'].includes(parsed.protocol)) return false;
   if (!['localhost', '127.0.0.1'].includes(parsed.hostname)) return false;
   if (!['/auth/callback', '/codex/callback'].includes(parsed.pathname)) return false;
-
   const code = (parsed.searchParams.get('code') || '').trim();
   const state = (parsed.searchParams.get('state') || '').trim();
   return Boolean(code && state);
 }
 
 function isLocalCpaUrl(rawUrl) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.isLocalCpaUrl) {
+    return navigationUtils.isLocalCpaUrl(rawUrl);
+  }
   const parsed = parseUrlSafely(rawUrl);
   if (!parsed) return false;
   if (!['http:', 'https:'].includes(parsed.protocol)) return false;
@@ -3372,22 +3442,29 @@ function isLocalCpaUrl(rawUrl) {
 }
 
 function shouldBypassStep9ForLocalCpa(state) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.shouldBypassStep9ForLocalCpa) {
+    return navigationUtils.shouldBypassStep9ForLocalCpa(state);
+  }
   return normalizeLocalCpaStep9Mode(state?.localCpaStep9Mode) === 'bypass'
     && Boolean(state?.localhostUrl)
     && isLocalCpaUrl(state?.vpsUrl);
 }
 
 function shouldSkipLoginVerificationForCpaCallback(state) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.shouldSkipLoginVerificationForCpaCallback) {
+    return navigationUtils.shouldSkipLoginVerificationForCpaCallback(state);
+  }
   return getPanelMode(state) === 'cpa'
     && normalizeCpaCallbackMode(state?.cpaCallbackMode) === 'step6';
 }
 
 function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.matchesSourceUrlFamily) {
+    return navigationUtils.matchesSourceUrlFamily(source, candidateUrl, referenceUrl);
+  }
   const candidate = parseUrlSafely(candidateUrl);
   if (!candidate) return false;
-
   const reference = parseUrlSafely(referenceUrl);
-
   switch (source) {
     case 'signup-page':
       return isSignupPageHost(candidate.hostname) || isSignupEntryHost(candidate.hostname);
@@ -3400,280 +3477,62 @@ function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
     case 'gmail-mail':
       return candidate.hostname === 'mail.google.com';
     case 'inbucket-mail':
-      return Boolean(reference)
-        && candidate.origin === reference.origin
-        && candidate.pathname.startsWith('/m/');
+      return Boolean(reference) && candidate.origin === reference.origin && candidate.pathname.startsWith('/m/');
     case 'mail-2925':
       return candidate.hostname === '2925.com' || candidate.hostname === 'www.2925.com';
     case 'vps-panel':
-      return Boolean(reference)
-        && candidate.origin === reference.origin
-        && candidate.pathname === reference.pathname;
+      return Boolean(reference) && candidate.origin === reference.origin && candidate.pathname === reference.pathname;
     case 'sub2api-panel':
       return Boolean(reference)
         && candidate.origin === reference.origin
-        && (
-          candidate.pathname.startsWith('/admin/accounts')
-          || candidate.pathname.startsWith('/login')
-          || candidate.pathname === '/'
-        );
+        && (candidate.pathname.startsWith('/admin/accounts') || candidate.pathname.startsWith('/login') || candidate.pathname === '/');
     default:
       return false;
   }
 }
 
 async function rememberSourceLastUrl(source, url) {
-  if (!source || !url) return;
-  const state = await getState();
-  const sourceLastUrls = { ...(state.sourceLastUrls || {}) };
-  sourceLastUrls[source] = url;
-  await setState({ sourceLastUrls });
+  return tabRuntime.rememberSourceLastUrl(source, url);
 }
 
 async function closeConflictingTabsForSource(source, currentUrl, options = {}) {
-  const { excludeTabIds = [] } = options;
-  const excluded = new Set(excludeTabIds.filter(id => Number.isInteger(id)));
-  const state = await getState();
-  const lastUrl = state.sourceLastUrls?.[source];
-  const referenceUrls = [currentUrl, lastUrl].filter(Boolean);
-
-  if (!referenceUrls.length) return;
-
-  const tabs = await chrome.tabs.query({});
-  const matchedIds = tabs
-    .filter((tab) => Number.isInteger(tab.id) && !excluded.has(tab.id))
-    .filter((tab) => referenceUrls.some((refUrl) => matchesSourceUrlFamily(source, tab.url, refUrl)))
-    .map(tab => tab.id);
-
-  if (!matchedIds.length) return;
-
-  await chrome.tabs.remove(matchedIds).catch(() => { });
-
-  const registry = await getTabRegistry();
-  if (registry[source]?.tabId && matchedIds.includes(registry[source].tabId)) {
-    registry[source] = null;
-    await setState({ tabRegistry: registry });
-  }
-
-  await addLog(`已关闭 ${matchedIds.length} 个旧的${getSourceLabel(source)}标签页。`, 'info');
+  return tabRuntime.closeConflictingTabsForSource(source, currentUrl, options);
 }
 
 function isLocalhostOAuthCallbackTabMatch(callbackUrl, candidateUrl) {
-  if (!isLocalhostOAuthCallbackUrl(callbackUrl) || !isLocalhostOAuthCallbackUrl(candidateUrl)) {
-    return false;
-  }
-
-  const callback = parseUrlSafely(callbackUrl);
-  const candidate = parseUrlSafely(candidateUrl);
-  if (!callback || !candidate) return false;
-
-  return callback.origin === candidate.origin
-    && callback.pathname === candidate.pathname
-    && callback.searchParams.get('code') === candidate.searchParams.get('code')
-    && callback.searchParams.get('state') === candidate.searchParams.get('state');
+  return tabRuntime.isLocalhostOAuthCallbackTabMatch(callbackUrl, candidateUrl);
 }
 
 async function closeLocalhostCallbackTabs(callbackUrl, options = {}) {
-  if (!isLocalhostOAuthCallbackUrl(callbackUrl)) return 0;
-
-  const { excludeTabIds = [] } = options;
-  const excluded = new Set(excludeTabIds.filter(id => Number.isInteger(id)));
-  const tabs = await chrome.tabs.query({});
-  const matchedIds = tabs
-    .filter((tab) => Number.isInteger(tab.id) && !excluded.has(tab.id))
-    .filter((tab) => isLocalhostOAuthCallbackTabMatch(callbackUrl, tab.url))
-    .map((tab) => tab.id);
-
-  if (!matchedIds.length) return 0;
-
-  await chrome.tabs.remove(matchedIds).catch(() => { });
-
-  const registry = await getTabRegistry();
-  if (registry['signup-page']?.tabId && matchedIds.includes(registry['signup-page'].tabId)) {
-    registry['signup-page'] = null;
-    await setState({ tabRegistry: registry });
-  }
-
-  await addLog(`已关闭 ${matchedIds.length} 个匹配当前 OAuth callback 的 localhost 残留标签页。`, 'info');
-  return matchedIds.length;
+  return tabRuntime.closeLocalhostCallbackTabs(callbackUrl, options);
 }
 
 function buildLocalhostCleanupPrefix(rawUrl) {
-  if (!isLocalhostOAuthCallbackUrl(rawUrl)) return '';
-  const parsed = parseUrlSafely(rawUrl);
-  if (!parsed) return '';
-
-  const segments = parsed.pathname.split('/').filter(Boolean);
-  if (!segments.length) {
-    return parsed.origin;
-  }
-
-  return `${parsed.origin}/${segments[0]}`;
+  return tabRuntime.buildLocalhostCleanupPrefix(rawUrl);
 }
 
 async function closeTabsByUrlPrefix(prefix, options = {}) {
-  if (!prefix) return 0;
-
-  const { excludeTabIds = [], excludeUrls = [], excludeLocalhostCallbacks = false } = options;
-  const excluded = new Set(excludeTabIds.filter(id => Number.isInteger(id)));
-  const excludedUrls = new Set((Array.isArray(excludeUrls) ? excludeUrls : []).filter(Boolean));
-  const tabs = await chrome.tabs.query({});
-  const matchedIds = tabs
-    .filter((tab) => Number.isInteger(tab.id) && !excluded.has(tab.id))
-    .filter((tab) => typeof tab.url === 'string' && !excludedUrls.has(tab.url))
-    .filter((tab) => !(excludeLocalhostCallbacks && isLocalhostOAuthCallbackUrl(tab.url)))
-    .filter((tab) => typeof tab.url === 'string' && tab.url.startsWith(prefix))
-    .filter((tab) => !isLocalhostOAuthCallbackUrl(tab.url))
-    .map((tab) => tab.id);
-
-  if (!matchedIds.length) return 0;
-
-  await chrome.tabs.remove(matchedIds).catch(() => { });
-  await addLog(`已关闭 ${matchedIds.length} 个匹配 ${prefix} 的 localhost 残留标签页。`, 'info');
-  return matchedIds.length;
+  return tabRuntime.closeTabsByUrlPrefix(prefix, options);
 }
 
 async function pingContentScriptOnTab(tabId) {
-  if (!Number.isInteger(tabId)) return null;
-
-  try {
-    return await chrome.tabs.sendMessage(tabId, {
-      type: 'PING',
-      source: 'background',
-      payload: {},
-    });
-  } catch {
-    return null;
-  }
+  return tabRuntime.pingContentScriptOnTab(tabId);
 }
 
 async function waitForTabUrlFamily(source, tabId, referenceUrl, options = {}) {
-  const { timeoutMs = 15000, retryDelayMs = 400 } = options;
-  const start = Date.now();
-
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (matchesSourceUrlFamily(source, tab.url, referenceUrl)) {
-        return tab;
-      }
-    } catch {
-      return null;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-  }
-
-  return null;
+  return tabRuntime.waitForTabUrlFamily(source, tabId, referenceUrl, options);
 }
 
 async function waitForTabUrlMatch(tabId, matcher, options = {}) {
-  const { timeoutMs = 15000, retryDelayMs = 400 } = options;
-  const start = Date.now();
+  return tabRuntime.waitForTabUrlMatch(tabId, matcher, options);
+}
 
-  while (Date.now() - start < timeoutMs) {
-    try {
-      const tab = await chrome.tabs.get(tabId);
-      if (matcher(tab.url || '', tab)) {
-        return tab;
-      }
-    } catch {
-      return null;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-  }
-
-  return null;
+async function waitForTabComplete(tabId, options = {}) {
+  return tabRuntime.waitForTabComplete(tabId, options);
 }
 
 async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
-  const {
-    inject = null,
-    injectSource = null,
-    timeoutMs = 30000,
-    retryDelayMs = 700,
-    logMessage = '',
-  } = options;
-
-  const start = Date.now();
-  let lastError = null;
-  let logged = false;
-  let attempt = 0;
-
-  console.log(
-    LOG_PREFIX,
-    `[ensureContentScriptReadyOnTab] start ${source} tab=${tabId}, timeout=${timeoutMs}ms, inject=${Array.isArray(inject) ? inject.join(',') : 'none'}`
-  );
-
-  while (Date.now() - start < timeoutMs) {
-    attempt += 1;
-    const pong = await pingContentScriptOnTab(tabId);
-    if (pong?.ok && (!pong.source || pong.source === source)) {
-      console.log(
-        LOG_PREFIX,
-        `[ensureContentScriptReadyOnTab] ready ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
-      );
-      await registerTab(source, tabId);
-      return;
-    }
-
-    if (!inject || !inject.length) {
-      throw new Error(`${getSourceLabel(source)} 内容脚本未就绪，且未提供可用的注入文件。`);
-    }
-
-    const registry = await getTabRegistry();
-    if (registry[source]) {
-      registry[source].ready = false;
-      await setState({ tabRegistry: registry });
-    }
-
-    try {
-      if (injectSource) {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (injectedSource) => {
-            window.__MULTIPAGE_SOURCE = injectedSource;
-          },
-          args: [injectSource],
-        });
-      }
-
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: inject,
-      });
-    } catch (err) {
-      lastError = err;
-      console.warn(
-        LOG_PREFIX,
-        `[ensureContentScriptReadyOnTab] inject attempt ${attempt} failed for ${source} tab=${tabId}: ${err?.message || err}`
-      );
-    }
-
-    const pongAfterInject = await pingContentScriptOnTab(tabId);
-    if (pongAfterInject?.ok && (!pongAfterInject.source || pongAfterInject.source === source)) {
-      console.log(
-        LOG_PREFIX,
-        `[ensureContentScriptReadyOnTab] ready after inject ${source} tab=${tabId} on attempt ${attempt} after ${Date.now() - start}ms`
-      );
-      await registerTab(source, tabId);
-      return;
-    }
-
-    if (logMessage && !logged) {
-      console.warn(
-        LOG_PREFIX,
-        `[ensureContentScriptReadyOnTab] ${source} tab=${tabId} still not ready after ${Date.now() - start}ms`
-      );
-      await addLog(logMessage, 'warn');
-      logged = true;
-    }
-
-    await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-  }
-
-  throw lastError || new Error(`${getSourceLabel(source)} 内容脚本长时间未就绪。`);
+  return tabRuntime.ensureContentScriptReadyOnTab(source, tabId, options);
 }
 
 // ============================================================
@@ -3683,144 +3542,31 @@ async function ensureContentScriptReadyOnTab(source, tabId, options = {}) {
 const pendingCommands = new Map(); // source -> { message, resolve, reject, timer }
 
 function getContentScriptResponseTimeoutMs(message) {
-  if (!message || typeof message !== 'object') {
-    return 30000;
-  }
-
-  if (message.type === 'EXECUTE_STEP' && Number(message.step) === 6) {
-    return 75000;
-  }
-
-  if (message.type === 'POLL_EMAIL') {
-    const maxAttempts = Math.max(1, Number(message.payload?.maxAttempts) || 1);
-    const intervalMs = Math.max(0, Number(message.payload?.intervalMs) || 0);
-    return Math.max(45000, maxAttempts * intervalMs + 25000);
-  }
-
-  if (message.type === 'FILL_CODE') {
-    return Number(message.step) === 7 ? 45000 : 30000;
-  }
-
-  if (message.type === 'PREPARE_SIGNUP_VERIFICATION') {
-    return 45000;
-  }
-
-  return 30000;
+  return tabRuntime.getContentScriptResponseTimeoutMs(message);
 }
 
 function getMessageDebugLabel(source, message, tabId = null) {
-  const parts = [source || 'unknown', message?.type || 'UNKNOWN'];
-  if (Number.isInteger(message?.step)) {
-    parts.push(`step=${message.step}`);
-  }
-  if (Number.isInteger(tabId)) {
-    parts.push(`tab=${tabId}`);
-  }
-  return parts.join(' ');
+  return tabRuntime.getMessageDebugLabel(source, message, tabId);
 }
 
 function summarizeMessageResultForDebug(result) {
-  if (result === undefined) return 'undefined';
-  if (result === null) return 'null';
-  if (typeof result !== 'object') return JSON.stringify(result);
-
-  const summary = {};
-  for (const key of ['ok', 'error', 'stopped', 'source', 'step']) {
-    if (key in result) summary[key] = result[key];
-  }
-  if (result.payload && typeof result.payload === 'object') {
-    summary.payloadKeys = Object.keys(result.payload);
-  }
-  return JSON.stringify(summary);
+  return tabRuntime.summarizeMessageResultForDebug(result);
 }
 
 function sendTabMessageWithTimeout(tabId, source, message, responseTimeoutMs = getContentScriptResponseTimeoutMs(message)) {
-  return new Promise((resolve, reject) => {
-    let settled = false;
-    const startedAt = Date.now();
-    const debugLabel = getMessageDebugLabel(source, message, tabId);
-
-    console.log(LOG_PREFIX, `[sendTabMessageWithTimeout] dispatch ${debugLabel}, timeout=${responseTimeoutMs}ms`);
-
-    const timer = setTimeout(() => {
-      if (settled) return;
-      settled = true;
-      const seconds = Math.ceil(responseTimeoutMs / 1000);
-      console.warn(LOG_PREFIX, `[sendTabMessageWithTimeout] timeout ${debugLabel} after ${Date.now() - startedAt}ms`);
-      reject(new Error(`Content script on ${source} did not respond in ${seconds}s. Try refreshing the tab and retry.`));
-    }, responseTimeoutMs);
-
-    chrome.tabs.sendMessage(tabId, message)
-      .then((value) => {
-        const elapsed = Date.now() - startedAt;
-        if (settled) {
-          console.warn(
-            LOG_PREFIX,
-            `[sendTabMessageWithTimeout] late response ignored for ${debugLabel} after ${elapsed}ms: ${summarizeMessageResultForDebug(value)}`
-          );
-          return;
-        }
-
-        settled = true;
-        clearTimeout(timer);
-        console.log(
-          LOG_PREFIX,
-          `[sendTabMessageWithTimeout] response ${debugLabel} after ${elapsed}ms: ${summarizeMessageResultForDebug(value)}`
-        );
-        resolve(value);
-      })
-      .catch((error) => {
-        const elapsed = Date.now() - startedAt;
-        const errorMessage = error?.message || String(error);
-        if (settled) {
-          console.warn(
-            LOG_PREFIX,
-            `[sendTabMessageWithTimeout] late rejection ignored for ${debugLabel} after ${elapsed}ms: ${errorMessage}`
-          );
-          return;
-        }
-
-        settled = true;
-        clearTimeout(timer);
-        console.warn(
-          LOG_PREFIX,
-          `[sendTabMessageWithTimeout] rejection ${debugLabel} after ${elapsed}ms: ${errorMessage}`
-        );
-        reject(error);
-      });
-  });
+  return tabRuntime.sendTabMessageWithTimeout(tabId, source, message, responseTimeoutMs);
 }
 
 function queueCommand(source, message, timeout = 15000) {
-  return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
-      pendingCommands.delete(source);
-      const err = `Content script on ${source} did not respond in ${timeout / 1000}s. Try refreshing the tab and retry.`;
-      console.error(LOG_PREFIX, err);
-      reject(new Error(err));
-    }, timeout);
-    pendingCommands.set(source, { message, resolve, reject, timer });
-    console.log(LOG_PREFIX, `Command queued for ${source} (waiting for ready)`);
-  });
+  return tabRuntime.queueCommand(source, message, timeout);
 }
 
 function flushCommand(source, tabId) {
-  const pending = pendingCommands.get(source);
-  if (pending) {
-    clearTimeout(pending.timer);
-    pendingCommands.delete(source);
-    sendTabMessageWithTimeout(tabId, source, pending.message).then(pending.resolve).catch(pending.reject);
-    console.log(LOG_PREFIX, `Flushed queued command to ${source} (tab ${tabId})`);
-  }
+  return tabRuntime.flushCommand(source, tabId);
 }
 
 function cancelPendingCommands(reason = STOP_ERROR_MESSAGE) {
-  for (const [source, pending] of pendingCommands.entries()) {
-    clearTimeout(pending.timer);
-    pending.reject(new Error(reason));
-    pendingCommands.delete(source);
-    console.log(LOG_PREFIX, `Cancelled queued command for ${source}`);
-  }
+  return tabRuntime.cancelPendingCommands(reason);
 }
 
 // ============================================================
@@ -3828,141 +3574,7 @@ function cancelPendingCommands(reason = STOP_ERROR_MESSAGE) {
 // ============================================================
 
 async function reuseOrCreateTab(source, url, options = {}) {
-  const alive = await isTabAlive(source);
-  if (alive) {
-    const tabId = await getTabId(source);
-    await closeConflictingTabsForSource(source, url, { excludeTabIds: [tabId] });
-    const currentTab = await chrome.tabs.get(tabId);
-    const sameUrl = currentTab.url === url;
-    const shouldReloadOnReuse = sameUrl && options.reloadIfSameUrl;
-
-    const registry = await getTabRegistry();
-    if (sameUrl) {
-      await chrome.tabs.update(tabId, { active: true });
-      console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}) on same URL`);
-
-      if (shouldReloadOnReuse) {
-        if (registry[source]) registry[source].ready = false;
-        await setState({ tabRegistry: registry });
-        await chrome.tabs.reload(tabId);
-
-        await new Promise((resolve) => {
-          const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 30000);
-          const listener = (tid, info) => {
-            if (tid === tabId && info.status === 'complete') {
-              chrome.tabs.onUpdated.removeListener(listener);
-              clearTimeout(timer);
-              resolve();
-            }
-          };
-          chrome.tabs.onUpdated.addListener(listener);
-        });
-      }
-
-      // For dynamically injected pages like the VPS panel, re-inject immediately.
-      if (options.inject) {
-        if (registry[source]) registry[source].ready = false;
-        await setState({ tabRegistry: registry });
-        if (options.injectSource) {
-          await chrome.scripting.executeScript({
-            target: { tabId },
-            func: (injectedSource) => {
-              window.__MULTIPAGE_SOURCE = injectedSource;
-            },
-            args: [options.injectSource],
-          });
-        }
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          files: options.inject,
-        });
-        await new Promise(r => setTimeout(r, 500));
-      }
-
-      await rememberSourceLastUrl(source, url);
-      return tabId;
-    }
-
-    // Mark as not ready BEFORE navigating — so READY signal from new page is captured correctly
-    if (registry[source]) registry[source].ready = false;
-    await setState({ tabRegistry: registry });
-
-    // Navigate existing tab to new URL
-    await chrome.tabs.update(tabId, { url, active: true });
-    console.log(LOG_PREFIX, `Reused tab ${source} (${tabId}), navigated to ${url.slice(0, 60)}`);
-
-    // Wait for page load complete (with 30s timeout)
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 30000);
-      const listener = (tid, info) => {
-        if (tid === tabId && info.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          clearTimeout(timer);
-          resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-    });
-
-    // If dynamic injection needed (VPS panel), re-inject after navigation
-    if (options.inject) {
-      if (options.injectSource) {
-        await chrome.scripting.executeScript({
-          target: { tabId },
-          func: (injectedSource) => {
-            window.__MULTIPAGE_SOURCE = injectedSource;
-          },
-          args: [options.injectSource],
-        });
-      }
-      await chrome.scripting.executeScript({
-        target: { tabId },
-        files: options.inject,
-      });
-    }
-
-    // Wait a bit for content script to inject and send READY
-    await new Promise(r => setTimeout(r, 500));
-
-    await rememberSourceLastUrl(source, url);
-    return tabId;
-  }
-
-  // Create new tab
-  await closeConflictingTabsForSource(source, url);
-  const tab = await chrome.tabs.create({ url, active: true });
-  console.log(LOG_PREFIX, `Created new tab ${source} (${tab.id})`);
-
-  // If dynamic injection needed (VPS panel), inject scripts after load
-  if (options.inject) {
-    await new Promise((resolve) => {
-      const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 30000);
-      const listener = (tabId, info) => {
-        if (tabId === tab.id && info.status === 'complete') {
-          chrome.tabs.onUpdated.removeListener(listener);
-          clearTimeout(timer);
-          resolve();
-        }
-      };
-      chrome.tabs.onUpdated.addListener(listener);
-    });
-    if (options.injectSource) {
-      await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func: (injectedSource) => {
-          window.__MULTIPAGE_SOURCE = injectedSource;
-        },
-        args: [options.injectSource],
-      });
-    }
-    await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      files: options.inject,
-    });
-  }
-
-  await rememberSourceLastUrl(source, url);
-  return tab.id;
+  return tabRuntime.reuseOrCreateTab(source, url, options);
 }
 
 // ============================================================
@@ -3970,120 +3582,15 @@ async function reuseOrCreateTab(source, url, options = {}) {
 // ============================================================
 
 async function sendToContentScript(source, message, options = {}) {
-  throwIfStopped();
-  const { responseTimeoutMs = getContentScriptResponseTimeoutMs(message) } = options;
-  const registry = await getTabRegistry();
-  const entry = registry[source];
-
-  if (!entry || !entry.ready) {
-    throwIfStopped();
-    console.log(LOG_PREFIX, `${source} not ready, queuing command`);
-    return queueCommand(source, message);
-  }
-
-  // Verify tab is still alive
-  const alive = await isTabAlive(source);
-  throwIfStopped();
-  if (!alive) {
-    // Tab was closed — queue the command, it will be sent when tab is reopened
-    console.log(LOG_PREFIX, `${source} tab was closed, queuing command`);
-    return queueCommand(source, message);
-  }
-
-  throwIfStopped();
-  console.log(LOG_PREFIX, `Sending to ${source} (tab ${entry.tabId}):`, message.type);
-  return sendTabMessageWithTimeout(entry.tabId, source, message, responseTimeoutMs);
+  return tabRuntime.sendToContentScript(source, message, options);
 }
 
 async function sendToContentScriptResilient(source, message, options = {}) {
-  const { timeoutMs = 30000, retryDelayMs = 600, logMessage = '' } = options;
-  const start = Date.now();
-  let lastError = null;
-  let logged = false;
-  let attempt = 0;
-  const debugLabel = getMessageDebugLabel(source, message);
-
-  console.log(
-    LOG_PREFIX,
-    `[sendToContentScriptResilient] start ${debugLabel}, totalTimeout=${timeoutMs}ms, retryDelay=${retryDelayMs}ms`
-  );
-
-  while (Date.now() - start < timeoutMs) {
-    throwIfStopped();
-    attempt += 1;
-
-    try {
-      console.log(
-        LOG_PREFIX,
-        `[sendToContentScriptResilient] attempt ${attempt} -> ${debugLabel}, elapsed=${Date.now() - start}ms`
-      );
-      const result = await sendToContentScript(source, message);
-      console.log(
-        LOG_PREFIX,
-        `[sendToContentScriptResilient] success ${debugLabel} on attempt ${attempt} after ${Date.now() - start}ms`
-      );
-      return result;
-    } catch (err) {
-      const retryable = isRetryableContentScriptTransportError(err);
-      console.warn(
-        LOG_PREFIX,
-        `[sendToContentScriptResilient] attempt ${attempt} failed for ${debugLabel}, retryable=${retryable}, elapsed=${Date.now() - start}ms: ${err?.message || err}`
-      );
-      if (!retryable) {
-        throw err;
-      }
-
-      lastError = err;
-      if (logMessage && !logged) {
-        await addLog(logMessage, 'warn');
-        logged = true;
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-    }
-  }
-
-  throw lastError || new Error(`等待 ${getSourceLabel(source)} 重新就绪超时。`);
+  return tabRuntime.sendToContentScriptResilient(source, message, options);
 }
 
 async function sendToMailContentScriptResilient(mail, message, options = {}) {
-  const { timeoutMs = 45000, maxRecoveryAttempts = 2 } = options;
-  const start = Date.now();
-  let lastError = null;
-  let recoveries = 0;
-  let logged = false;
-
-  while (Date.now() - start < timeoutMs) {
-    throwIfStopped();
-
-    try {
-      return await sendToContentScript(mail.source, message);
-    } catch (err) {
-      if (!isRetryableContentScriptTransportError(err)) {
-        throw err;
-      }
-
-      lastError = err;
-      if (!logged) {
-        await addLog(`步骤 ${message.step}：${mail.label} 页面通信异常，正在尝试让邮箱页重新就绪...`, 'warn');
-        logged = true;
-      }
-
-      if (recoveries >= maxRecoveryAttempts) {
-        break;
-      }
-
-      recoveries += 1;
-      await reuseOrCreateTab(mail.source, mail.url, {
-        inject: mail.inject,
-        injectSource: mail.injectSource,
-        reloadIfSameUrl: true,
-      });
-      await new Promise((resolve) => setTimeout(resolve, 800));
-    }
-  }
-
-  throw lastError || new Error(`${mail.label} 页面未能重新就绪。`);
+  return tabRuntime.sendToMailContentScriptResilient(mail, message, options);
 }
 
 // ============================================================
@@ -4091,18 +3598,22 @@ async function sendToMailContentScriptResilient(mail, message, options = {}) {
 // ============================================================
 
 async function addLog(message, level = 'info') {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.addLog) {
+    return loggingStatus.addLog(message, level);
+  }
   const state = await getState();
   const logs = state.logs || [];
   const entry = { message, level, timestamp: Date.now() };
   logs.push(entry);
-  // Keep last 500 logs
   if (logs.length > 500) logs.splice(0, logs.length - 500);
   await setState({ logs });
-  // Broadcast to side panel
   chrome.runtime.sendMessage({ type: 'LOG_ENTRY', payload: entry }).catch(() => { });
 }
 
 function getStep8CallbackUrlFromNavigation(details, signupTabId) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.getStep8CallbackUrlFromNavigation) {
+    return navigationUtils.getStep8CallbackUrlFromNavigation(details, signupTabId);
+  }
   if (!Number.isInteger(signupTabId) || !details) return '';
   if (details.tabId !== signupTabId) return '';
   if (details.frameId !== 0) return '';
@@ -4110,19 +3621,21 @@ function getStep8CallbackUrlFromNavigation(details, signupTabId) {
 }
 
 function getStep8CallbackUrlFromTabUpdate(tabId, changeInfo, tab, signupTabId) {
+  if (typeof navigationUtils !== 'undefined' && navigationUtils?.getStep8CallbackUrlFromTabUpdate) {
+    return navigationUtils.getStep8CallbackUrlFromTabUpdate(tabId, changeInfo, tab, signupTabId);
+  }
   if (!Number.isInteger(signupTabId) || tabId !== signupTabId) return '';
-
   const candidates = [changeInfo?.url, tab?.url];
   for (const candidate of candidates) {
-    if (isLocalhostOAuthCallbackUrl(candidate)) {
-      return candidate;
-    }
+    if (isLocalhostOAuthCallbackUrl(candidate)) return candidate;
   }
-
   return '';
 }
 
 function getSourceLabel(source) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.getSourceLabel) {
+    return loggingStatus.getSourceLabel(source);
+  }
   const labels = {
     'gmail-mail': 'Gmail 邮箱',
     'sidepanel': '侧边栏',
@@ -4146,11 +3659,13 @@ function getSourceLabel(source) {
 // ============================================================
 
 async function setStepStatus(step, status) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.setStepStatus) {
+    return loggingStatus.setStepStatus(step, status);
+  }
   const state = await getState();
   const statuses = { ...state.stepStatuses };
   statuses[step] = status;
   await setState({ stepStatuses: statuses, currentStep: step });
-  // Broadcast to side panel
   chrome.runtime.sendMessage({
     type: 'STEP_STATUS_CHANGED',
     payload: { step, status },
@@ -4167,35 +3682,71 @@ function isRetryableContentScriptTransportError(error) {
   return /back\/forward cache|message channel is closed|Receiving end does not exist|port closed before a response was received|A listener indicated an asynchronous response|did not respond in \d+s/i.test(message);
 }
 
+const navigationUtils = self.MultiPageBackgroundNavigationUtils?.createNavigationUtils({
+  DEFAULT_SUB2API_URL,
+  normalizeCpaCallbackMode,
+  normalizeLocalCpaStep9Mode,
+});
+
+const loggingStatus = self.MultiPageBackgroundLoggingStatus?.createLoggingStatus({
+  chrome,
+  DEFAULT_STATE,
+  getState,
+  isRecoverableStep9AuthFailure,
+  LOG_PREFIX,
+  setState,
+  STOP_ERROR_MESSAGE,
+});
+
+const tabRuntime = self.MultiPageBackgroundTabRuntime?.createTabRuntime({
+  addLog,
+  chrome,
+  getSourceLabel,
+  getState,
+  isLocalhostOAuthCallbackUrl,
+  isRetryableContentScriptTransportError,
+  LOG_PREFIX,
+  matchesSourceUrlFamily,
+  setState,
+  STOP_ERROR_MESSAGE,
+  throwIfStopped,
+});
+
 function getErrorMessage(error) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.getErrorMessage) {
+    return loggingStatus.getErrorMessage(error);
+  }
   return String(typeof error === 'string' ? error : error?.message || '');
 }
 
 function isVerificationMailPollingError(error) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.isVerificationMailPollingError) {
+    return loggingStatus.isVerificationMailPollingError(error);
+  }
   const message = getErrorMessage(error);
   return /未在 .*邮箱中找到新的匹配邮件|未在 Hotmail 收件箱中找到新的匹配验证码|邮箱轮询结束，但未获取到验证码|无法获取新的(?:注册|登录)验证码|页面未能重新就绪|页面通信异常|did not respond in \d+s/i.test(message);
 }
 
 function getLoginAuthStateLabel(state) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.getLoginAuthStateLabel) {
+    return loggingStatus.getLoginAuthStateLabel(state);
+  }
+  state = state === 'oauth_consent_page' ? 'unknown' : state;
   switch (state) {
-    case 'verification_page':
-      return '登录验证码页';
-    case 'password_page':
-      return '密码页';
-    case 'email_page':
-      return '邮箱输入页';
-    case 'login_timeout_error_page':
-      return '登录超时报错页';
-    case 'oauth_consent_page':
-      return 'OAuth 授权页';
-    case 'add_phone_page':
-      return '手机号页';
-    default:
-      return '未知页面';
+    case 'verification_page': return '登录验证码页';
+    case 'password_page': return '密码页';
+    case 'email_page': return '邮箱输入页';
+    case 'login_timeout_error_page': return '登录超时报错页';
+    case 'oauth_consent_page': return 'OAuth 授权页';
+    case 'add_phone_page': return '手机号页';
+    default: return '未知页面';
   }
 }
 
 function isRestartCurrentAttemptError(error) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.isRestartCurrentAttemptError) {
+    return loggingStatus.isRestartCurrentAttemptError(error);
+  }
   const message = String(typeof error === 'string' ? error : error?.message || '');
   return /当前邮箱已存在，需要重新开始新一轮/.test(message);
 }
@@ -4208,7 +3759,7 @@ function isStep9RecoverableAuthError(error) {
 
 function isLegacyStep9RecoverableAuthError(error) {
   const message = String(typeof error === 'string' ? error : error?.message || '');
-  return /STEP9_OAUTH_TIMEOUT::|认证失败:\s*Timeout waiting for OAuth callback/i.test(message);
+  return /STEP9_OAUTH_TIMEOUT::|认证失败:\s*(?:Timeout waiting for OAuth callback|timeout of \d+ms exceeded)/i.test(message);
 }
 
 function isStepDoneStatus(status) {
@@ -4216,15 +3767,19 @@ function isStepDoneStatus(status) {
 }
 
 function getFirstUnfinishedStep(statuses = {}) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.getFirstUnfinishedStep) {
+    return loggingStatus.getFirstUnfinishedStep(statuses);
+  }
   for (let step = 1; step <= 9; step++) {
-    if (!isStepDoneStatus(statuses[step] || 'pending')) {
-      return step;
-    }
+    if (!isStepDoneStatus(statuses[step] || 'pending')) return step;
   }
   return null;
 }
 
 function hasSavedProgress(statuses = {}) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.hasSavedProgress) {
+    return loggingStatus.hasSavedProgress(statuses);
+  }
   return Object.values({ ...DEFAULT_STATE.stepStatuses, ...statuses }).some((status) => status !== 'pending');
 }
 
@@ -4318,6 +3873,9 @@ function clearStopRequest() {
 }
 
 function getRunningSteps(statuses = {}) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.getRunningSteps) {
+    return loggingStatus.getRunningSteps(statuses);
+  }
   return Object.entries({ ...DEFAULT_STATE.stepStatuses, ...statuses })
     .filter(([, status]) => status === 'running')
     .map(([step]) => Number(step))
@@ -4325,38 +3883,30 @@ function getRunningSteps(statuses = {}) {
 }
 
 function getAutoRunStatusPayload(phase, payload = {}) {
-  const currentRun = payload.currentRun ?? autoRunCurrentRun;
-  const totalRuns = payload.totalRuns ?? autoRunTotalRuns;
-  const attemptRun = payload.attemptRun ?? autoRunAttemptRun;
-  const rawScheduledAt = phase === 'scheduled'
-    ? (payload.scheduledAt ?? payload.scheduledAutoRunAt ?? null)
-    : null;
-  const scheduledAt = rawScheduledAt === null ? null : Number(rawScheduledAt);
-  const rawCountdownAt = payload.countdownAt ?? payload.autoRunCountdownAt ?? null;
-  const countdownAt = rawCountdownAt === null ? null : Number(rawCountdownAt);
-  const countdownTitle = payload.countdownTitle === undefined
-    ? ''
-    : String(payload.countdownTitle || '');
-  const countdownNote = payload.countdownNote === undefined
-    ? ''
-    : String(payload.countdownNote || '');
-  const autoRunning = phase === 'scheduled'
-    || phase === 'running'
-    || phase === 'waiting_step'
-    || phase === 'waiting_email'
-    || phase === 'retrying'
-    || phase === 'waiting_interval';
-
+  const normalizedPayload = {
+    ...payload,
+    currentRun: payload.currentRun ?? autoRunCurrentRun,
+    totalRuns: payload.totalRuns ?? autoRunTotalRuns,
+    attemptRun: payload.attemptRun ?? autoRunAttemptRun,
+  };
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.getAutoRunStatusPayload) {
+    return loggingStatus.getAutoRunStatusPayload(phase, normalizedPayload);
+  }
   return {
-    autoRunning,
+    autoRunning: phase === 'scheduled'
+      || phase === 'running'
+      || phase === 'waiting_step'
+      || phase === 'waiting_email'
+      || phase === 'retrying'
+      || phase === 'waiting_interval',
     autoRunPhase: phase,
-    autoRunCurrentRun: currentRun,
-    autoRunTotalRuns: totalRuns,
-    autoRunAttemptRun: attemptRun,
-    scheduledAutoRunAt: Number.isFinite(scheduledAt) ? scheduledAt : null,
-    autoRunCountdownAt: Number.isFinite(countdownAt) ? countdownAt : null,
-    autoRunCountdownTitle: countdownTitle,
-    autoRunCountdownNote: countdownNote,
+    autoRunCurrentRun: normalizedPayload.currentRun ?? 0,
+    autoRunTotalRuns: normalizedPayload.totalRuns ?? 1,
+    autoRunAttemptRun: normalizedPayload.attemptRun ?? 0,
+    scheduledAutoRunAt: Number.isFinite(Number(normalizedPayload.scheduledAt)) ? Number(normalizedPayload.scheduledAt) : null,
+    autoRunCountdownAt: Number.isFinite(Number(normalizedPayload.countdownAt)) ? Number(normalizedPayload.countdownAt) : null,
+    autoRunCountdownTitle: normalizedPayload.countdownTitle === undefined ? '' : String(normalizedPayload.countdownTitle || ''),
+    autoRunCountdownNote: normalizedPayload.countdownNote === undefined ? '' : String(normalizedPayload.countdownNote || ''),
   };
 }
 
@@ -4866,363 +4416,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 });
 
 async function handleMessage(message, sender) {
-  switch (message.type) {
-    case 'CONTENT_SCRIPT_READY': {
-      const tabId = sender.tab?.id;
-      if (tabId && message.source) {
-        await registerTab(message.source, tabId);
-        flushCommand(message.source, tabId);
-        await addLog(`内容脚本已就绪：${getSourceLabel(message.source)}（标签页 ${tabId}）`);
-      }
-      return { ok: true };
-    }
-
-    case 'LOG': {
-      const { message: msg, level } = message.payload;
-      await addLog(`[${getSourceLabel(message.source)}] ${msg}`, level);
-      return { ok: true };
-    }
-
-    case 'STEP_COMPLETE': {
-      if (stopRequested) {
-        await setStepStatus(message.step, 'stopped');
-        notifyStepError(message.step, STOP_ERROR_MESSAGE);
-        return { ok: true };
-      }
-      await setStepStatus(message.step, 'completed');
-      await addLog(`步骤 ${message.step} 已完成`, 'ok');
-      await handleStepData(message.step, message.payload);
-      notifyStepComplete(message.step, message.payload);
-      return { ok: true };
-    }
-
-    case 'STEP_ERROR': {
-      if (isStopError(message.error)) {
-        await setStepStatus(message.step, 'stopped');
-        await addLog(`步骤 ${message.step} 已被用户停止`, 'warn');
-        await appendAccountRunRecord(`step${message.step}_stopped`, null, getErrorMessage(message.error));
-        notifyStepError(message.step, message.error);
-      } else {
-        await setStepStatus(message.step, 'failed');
-        await addLog(`步骤 ${message.step} 失败：${message.error}`, 'error');
-        await appendAccountRunRecord(`step${message.step}_failed`, null, getErrorMessage(message.error));
-        notifyStepError(message.step, message.error);
-      }
-      return { ok: true };
-    }
-
-    case 'GET_STATE': {
-      return await getState();
-    }
-
-    case 'RESET': {
-      clearStopRequest();
-      await clearAutoRunTimerAlarm();
-      await resetState();
-      await addLog('流程已重置', 'info');
-      return { ok: true };
-    }
-
-    case 'EXECUTE_STEP': {
-      clearStopRequest();
-      if (message.source === 'sidepanel') {
-        await ensureManualInteractionAllowed('手动执行步骤');
-      }
-      const step = message.payload.step;
-      if (message.source === 'sidepanel') {
-        await invalidateDownstreamAfterStepRestart(step, { logLabel: `步骤 ${step} 重新执行` });
-      }
-      // Save email if provided (from side panel step 3)
-      if (message.payload.email) {
-        await setEmailState(message.payload.email);
-      }
-      if (message.payload.emailPrefix !== undefined) {
-        await setPersistentSettings({ emailPrefix: message.payload.emailPrefix });
-        await setState({ emailPrefix: message.payload.emailPrefix });
-      }
-      if (doesStepUseCompletionSignal(step)) {
-        await executeStepViaCompletionSignal(step);
-      } else {
-        await executeStep(step);
-      }
-      return { ok: true };
-    }
-
-    case 'AUTO_RUN': {
-      clearStopRequest();
-      const state = await getState();
-      if (getPendingAutoRunTimerPlan(state)) {
-        throw new Error('已有自动运行倒计时计划，请先取消或立即开始。');
-      }
-      const totalRuns = normalizeRunCount(message.payload?.totalRuns || 1);
-      const autoRunSkipFailures = Boolean(message.payload?.autoRunSkipFailures);
-      const mode = message.payload?.mode === 'continue' ? 'continue' : 'restart';
-      await setState({ autoRunSkipFailures });
-      startAutoRunLoop(totalRuns, { autoRunSkipFailures, mode });
-      return { ok: true };
-    }
-
-    case 'SCHEDULE_AUTO_RUN': {
-      clearStopRequest();
-      const totalRuns = normalizeRunCount(message.payload?.totalRuns || 1);
-      return await scheduleAutoRun(totalRuns, {
-        delayMinutes: message.payload?.delayMinutes,
-        autoRunSkipFailures: Boolean(message.payload?.autoRunSkipFailures),
-        mode: message.payload?.mode,
-      });
-    }
-
-    case 'START_SCHEDULED_AUTO_RUN_NOW': {
-      clearStopRequest();
-      const started = await launchAutoRunTimerPlan('manual', {
-        expectedKinds: [AUTO_RUN_TIMER_KIND_SCHEDULED_START],
-      });
-      if (!started) {
-        throw new Error('当前没有可立即开始的倒计时计划。');
-      }
-      return { ok: true };
-    }
-
-    case 'CANCEL_SCHEDULED_AUTO_RUN': {
-      const cancelled = await cancelScheduledAutoRun();
-      if (!cancelled) {
-        throw new Error('当前没有可取消的倒计时计划。');
-      }
-      return { ok: true };
-    }
-
-    case 'SKIP_AUTO_RUN_COUNTDOWN': {
-      clearStopRequest();
-      const skipped = await skipAutoRunCountdown();
-      if (!skipped) {
-        throw new Error('当前没有可立即开始的倒计时。');
-      }
-      return { ok: true };
-    }
-
-    case 'RESUME_AUTO_RUN': {
-      clearStopRequest();
-      if (message.payload.email) {
-        await setEmailState(message.payload.email);
-      }
-      resumeAutoRun().catch((error) => {
-        handleAutoRunLoopUnhandledError(error).catch((handlerError) => {
-          console.error(LOG_PREFIX, 'Failed to finalize resume error:', handlerError);
-        });
-      });
-      return { ok: true };
-    }
-
-    case 'TAKEOVER_AUTO_RUN': {
-      await requestStop({ logMessage: '已确认手动接管，正在停止自动流程并切换为手动控制...' });
-      await addLog('自动流程已切换为手动控制。', 'warn');
-      return { ok: true };
-    }
-
-    case 'SKIP_STEP': {
-      const step = Number(message.payload?.step);
-      return await skipStep(step);
-    }
-
-    case 'SAVE_SETTING': {
-      const updates = buildPersistentSettingsPayload(message.payload || {});
-      const sessionUpdates = buildLuckmailSessionSettingsPayload(message.payload || {});
-      await setPersistentSettings(updates);
-      await setState({
-        ...updates,
-        ...sessionUpdates,
-      });
-      return { ok: true, state: await getState() };
-    }
-
-    case 'EXPORT_SETTINGS': {
-      return { ok: true, ...(await exportSettingsBundle()) };
-    }
-
-    case 'IMPORT_SETTINGS': {
-      const state = await importSettingsBundle(message.payload?.config || null);
-      return { ok: true, state };
-    }
-
-    case 'UPSERT_HOTMAIL_ACCOUNT': {
-      const account = await upsertHotmailAccount(message.payload || {});
-      return { ok: true, account };
-    }
-
-    case 'DELETE_HOTMAIL_ACCOUNT': {
-      await deleteHotmailAccount(String(message.payload?.accountId || ''));
-      return { ok: true };
-    }
-
-    case 'DELETE_HOTMAIL_ACCOUNTS': {
-      const result = await deleteHotmailAccounts(String(message.payload?.mode || 'all'));
-      return { ok: true, ...result };
-    }
-
-    case 'SELECT_HOTMAIL_ACCOUNT': {
-      const account = await setCurrentHotmailAccount(String(message.payload?.accountId || ''), {
-        markUsed: false,
-        syncEmail: true,
-      });
-      return { ok: true, account };
-    }
-
-    case 'PATCH_HOTMAIL_ACCOUNT': {
-      const account = await patchHotmailAccount(
-        String(message.payload?.accountId || ''),
-        message.payload?.updates || {}
-      );
-      return { ok: true, account };
-    }
-
-    case 'VERIFY_HOTMAIL_ACCOUNT':
-    case 'AUTHORIZE_HOTMAIL_ACCOUNT': {
-      const accountId = String(message.payload?.accountId || '');
-      try {
-        const result = await verifyHotmailAccount(accountId);
-        await setCurrentHotmailAccount(result.account.id, { markUsed: false, syncEmail: true });
-        await addLog(`Hotmail 账号 ${result.account.email} 校验通过，可直接用于收信。`, 'ok');
-        return { ok: true, account: result.account, messageCount: result.messageCount };
-      } catch (err) {
-        const state = await getState();
-        const accounts = normalizeHotmailAccounts(state.hotmailAccounts);
-        const target = findHotmailAccount(accounts, accountId);
-        if (target) {
-          target.status = 'error';
-          target.lastError = err.message;
-          await syncHotmailAccounts(accounts.map((item) => (item.id === target.id ? target : item)));
-        }
-        throw err;
-      }
-    }
-
-    case 'TEST_HOTMAIL_ACCOUNT': {
-      const result = await testHotmailAccountMailAccess(String(message.payload?.accountId || ''));
-      return { ok: true, ...result };
-    }
-
-    case 'LIST_LUCKMAIL_PURCHASES': {
-      const purchases = await listLuckmailPurchasesForManagement();
-      return { ok: true, purchases };
-    }
-
-    case 'SELECT_LUCKMAIL_PURCHASE': {
-      const purchase = await selectLuckmailPurchase(message.payload?.purchaseId);
-      return { ok: true, purchase };
-    }
-
-    case 'SET_LUCKMAIL_PURCHASE_USED_STATE': {
-      const result = await setLuckmailPurchaseUsedState(message.payload?.purchaseId, Boolean(message.payload?.used));
-      return { ok: true, ...result };
-    }
-
-    case 'SET_LUCKMAIL_PURCHASE_PRESERVED_STATE': {
-      const purchase = await setLuckmailPurchasePreservedState(message.payload?.purchaseId, Boolean(message.payload?.preserved));
-      return { ok: true, purchase };
-    }
-
-    case 'SET_LUCKMAIL_PURCHASE_DISABLED_STATE': {
-      const purchase = await setLuckmailPurchaseDisabledState(message.payload?.purchaseId, Boolean(message.payload?.disabled));
-      return { ok: true, purchase };
-    }
-
-    case 'BATCH_UPDATE_LUCKMAIL_PURCHASES': {
-      const result = await batchUpdateLuckmailPurchases(message.payload || {});
-      return { ok: true, ...result };
-    }
-
-    case 'DISABLE_USED_LUCKMAIL_PURCHASES': {
-      const result = await disableUsedLuckmailPurchases();
-      return { ok: true, ...result };
-    }
-
-    // Side panel data updates
-    case 'SET_EMAIL_STATE': {
-      const state = await getState();
-      if (isAutoRunLockedState(state)) {
-        throw new Error('自动流程运行中，当前不能手动修改邮箱。');
-      }
-      const email = String(message.payload?.email || '').trim() || null;
-      await setEmailStateSilently(email);
-      return { ok: true, email };
-    }
-
-    case 'SAVE_EMAIL': {
-      const state = await getState();
-      if (isAutoRunLockedState(state)) {
-        throw new Error('自动流程运行中，当前不能手动修改邮箱。');
-      }
-      await setEmailState(message.payload.email);
-      await resumeAutoRun();
-      return { ok: true, email: message.payload.email };
-    }
-
-    case 'FETCH_GENERATED_EMAIL': {
-      clearStopRequest();
-      const state = await getState();
-      if (isAutoRunLockedState(state)) {
-        throw new Error('自动流程运行中，当前不能手动获取邮箱。');
-      }
-      const email = await fetchGeneratedEmail(state, message.payload || {});
-      await resumeAutoRun();
-      return { ok: true, email };
-    }
-
-    case 'FETCH_DUCK_EMAIL': {
-      clearStopRequest();
-      const state = await getState();
-      if (isAutoRunLockedState(state)) {
-        throw new Error('自动流程运行中，当前不能手动获取邮箱。');
-      }
-      const email = await fetchGeneratedEmail(state, { ...(message.payload || {}), generator: 'duck' });
-      await resumeAutoRun();
-      return { ok: true, email };
-    }
-
-    case 'CHECK_ICLOUD_SESSION': {
-      clearStopRequest();
-      return await checkIcloudSession();
-    }
-
-    case 'LIST_ICLOUD_ALIASES': {
-      clearStopRequest();
-      const aliases = await listIcloudAliases();
-      return { ok: true, aliases };
-    }
-
-    case 'SET_ICLOUD_ALIAS_USED_STATE': {
-      clearStopRequest();
-      const result = await setIcloudAliasUsedState(message.payload || {});
-      return { ok: true, ...result };
-    }
-
-    case 'SET_ICLOUD_ALIAS_PRESERVED_STATE': {
-      clearStopRequest();
-      const result = await setIcloudAliasPreservedState(message.payload || {});
-      return { ok: true, ...result };
-    }
-
-    case 'DELETE_ICLOUD_ALIAS': {
-      clearStopRequest();
-      const result = await deleteIcloudAlias(message.payload || {});
-      return { ok: true, ...result };
-    }
-
-    case 'DELETE_USED_ICLOUD_ALIASES': {
-      clearStopRequest();
-      const result = await deleteUsedIcloudAliases();
-      return { ok: true, ...result };
-    }
-
-    case 'STOP_FLOW': {
-      await requestStop();
-      return { ok: true };
-    }
-
-    default:
-      console.warn(LOG_PREFIX, `Unknown message type: ${message.type}`);
-      return { error: `Unknown message type: ${message.type}` };
-  }
+  return messageRouter.handleMessage(message, sender);
 }
 
 // ============================================================
@@ -5230,6 +4424,10 @@ async function handleMessage(message, sender) {
 // ============================================================
 
 async function handleStepData(step, payload) {
+  if (typeof messageRouter !== 'undefined' && messageRouter?.handleStepData) {
+    return messageRouter.handleStepData(step, payload);
+  }
+
   switch (step) {
     case 1: {
       const updates = {};
@@ -5246,6 +4444,17 @@ async function handleStepData(step, payload) {
       }
       break;
     }
+    case 2:
+      if (payload.email) await setEmailState(payload.email);
+      if (payload.skippedPasswordStep) {
+        const latestState = await getState();
+        const step3Status = latestState.stepStatuses?.[3];
+        if (step3Status !== 'running' && step3Status !== 'completed' && step3Status !== 'manual_completed') {
+          await setStepStatus(3, 'skipped');
+          await addLog('步骤 2：提交邮箱后页面直接进入邮箱验证码页，已自动跳过步骤 3。', 'warn');
+        }
+      }
+      break;
     case 3:
       if (payload.email) await setEmailState(payload.email);
       if (payload.signupVerificationRequestedAt) {
@@ -5368,14 +4577,32 @@ function notifyStepError(step, error) {
 async function completeStepFromBackground(step, payload = {}) {
   if (stopRequested) {
     await setStepStatus(step, 'stopped');
+    await appendManualAccountRunRecordIfNeeded(`step${step}_stopped`, null, STOP_ERROR_MESSAGE);
     notifyStepError(step, STOP_ERROR_MESSAGE);
     return;
   }
 
+  const completionState = step === 9 ? await getState() : null;
   await setStepStatus(step, 'completed');
   await addLog(`步骤 ${step} 已完成`, 'ok');
   await handleStepData(step, payload);
+  if (step === 9) {
+    await appendAndBroadcastAccountRunRecord('success', completionState);
+  }
   notifyStepComplete(step, payload);
+}
+
+async function appendManualAccountRunRecordIfNeeded(status, stateOverride = null, reason = '') {
+  if (!accountRunHistoryHelpers?.appendAccountRunRecord) {
+    return null;
+  }
+
+  const state = stateOverride || await getState();
+  if (isAutoRunLockedState(state)) {
+    return null;
+  }
+
+  return appendAndBroadcastAccountRunRecord(status, state, reason);
 }
 
 async function finalizeDeferredStepExecutionError(step, error) {
@@ -5388,11 +4615,13 @@ async function finalizeDeferredStepExecutionError(step, error) {
   if (isStopError(error)) {
     await setStepStatus(step, 'stopped');
     await addLog(`步骤 ${step} 已被用户停止`, 'warn');
+    await appendManualAccountRunRecordIfNeeded(`step${step}_stopped`, latestState, getErrorMessage(error));
     return;
   }
 
   await setStepStatus(step, 'failed');
   await addLog(`步骤 ${step} 失败：${getErrorMessage(error)}`, 'error');
+  await appendManualAccountRunRecordIfNeeded(`step${step}_failed`, latestState, getErrorMessage(error));
 }
 
 async function executeStepViaCompletionSignal(step, timeoutMs = AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS) {
@@ -5555,30 +4784,18 @@ async function executeStep(step, options = {}) {
   }
 
   try {
-    switch (step) {
-      case 1: await executeStep1(state); break;
-      case 2: await executeStep2(state); break;
-      case 3: await executeStep3(state); break;
-      case 4: await executeStep4(state); break;
-      case 5: await executeStep5(state); break;
-      case 6: await executeStep6(state); break;
-      case 7: await executeStep7(state); break;
-      case 8: await executeStep8(state); break;
-      case 9: await executeStep9(state); break;
-      default:
-        throw new Error(`未知步骤：${step}`);
-    }
+    await stepRegistry.executeStep(step, state);
   } catch (err) {
     if (isStopError(err)) {
       await setStepStatus(step, 'stopped');
       await addLog(`步骤 ${step} 已被用户停止`, 'warn');
-      await appendAccountRunRecord(`step${step}_stopped`, null, getErrorMessage(err));
+      await appendManualAccountRunRecordIfNeeded(`step${step}_stopped`, state, getErrorMessage(err));
       throw err;
     }
     if (!(deferRetryableTransportError && doesStepUseCompletionSignal(step) && isRetryableContentScriptTransportError(err))) {
       await setStepStatus(step, 'failed');
       await addLog(`步骤 ${step} 失败：${err.message}`, 'error');
-      await appendAccountRunRecord(`step${step}_failed`, null, getErrorMessage(err));
+      await appendManualAccountRunRecordIfNeeded(`step${step}_failed`, state, getErrorMessage(err));
     } else {
       console.warn(
         LOG_PREFIX,
@@ -5619,6 +4836,17 @@ async function executeStepAndWait(step, delayAfter = 2000) {
     await executeStep(step);
   }
 
+  if (step === 5) {
+    const signupTabId = await getTabId('signup-page');
+    if (signupTabId) {
+      await addLog('自动运行：步骤 5 已收到完成信号，正在等待当前页面完成加载...', 'info');
+      await waitForTabComplete(signupTabId, {
+        timeoutMs: 15000,
+        retryDelayMs: 300,
+      });
+    }
+  }
+
   // Extra delay for page transitions / DOM updates
   if (delayAfter > 0) {
     await sleepWithStop(delayAfter + Math.floor(Math.random() * 1200));
@@ -5636,186 +4864,52 @@ function getEmailGeneratorLabel(generator) {
   if (generator === CLOUDFLARE_TEMP_EMAIL_GENERATOR) return 'Cloudflare Temp Email';
   return 'Duck 邮箱';
 }
+const generatedEmailHelpers = self.MultiPageGeneratedEmailHelpers?.createGeneratedEmailHelpers({
+  addLog,
+  buildCloudflareTempEmailHeaders,
+  CLOUDFLARE_TEMP_EMAIL_GENERATOR,
+  DUCK_AUTOFILL_URL,
+  fetch,
+  fetchIcloudHideMyEmail,
+  getCloudflareTempEmailAddressFromResponse,
+  getCloudflareTempEmailConfig,
+  getState,
+  joinCloudflareTempEmailUrl,
+  normalizeCloudflareDomain,
+  normalizeCloudflareTempEmailAddress,
+  normalizeEmailGenerator,
+  reuseOrCreateTab,
+  sendToContentScript,
+  setEmailState,
+  throwIfStopped,
+});
 
 function generateCloudflareAliasLocalPart() {
-  const letters = 'abcdefghijklmnopqrstuvwxyz';
-  const digits = '0123456789';
-  const chars = [];
-
-  for (let i = 0; i < 6; i++) {
-    chars.push(letters[Math.floor(Math.random() * letters.length)]);
-  }
-
-  for (let i = 0; i < 4; i++) {
-    chars.push(digits[Math.floor(Math.random() * digits.length)]);
-  }
-
-  for (let i = chars.length - 1; i > 0; i--) {
-    const j = Math.floor(Math.random() * (i + 1));
-    [chars[i], chars[j]] = [chars[j], chars[i]];
-  }
-
-  return chars.join('');
+  return generatedEmailHelpers.generateCloudflareAliasLocalPart();
 }
 
 async function fetchCloudflareEmail(state, options = {}) {
-  throwIfStopped();
-  const latestState = state || await getState();
-  const domain = normalizeCloudflareDomain(latestState.cloudflareDomain);
-  if (!domain) {
-    throw new Error('Cloudflare 域名为空或格式无效。');
-  }
-
-  const localPart = String(options.localPart || '').trim().toLowerCase() || generateCloudflareAliasLocalPart();
-  const aliasEmail = `${localPart}@${domain}`;
-
-  await setEmailState(aliasEmail);
-  await addLog(`Cloudflare 邮箱：已生成 ${aliasEmail}`, 'ok');
-  return aliasEmail;
+  return generatedEmailHelpers.fetchCloudflareEmail(state, options);
 }
 
 function ensureCloudflareTempEmailConfig(state, options = {}) {
-  const {
-    requireAdminAuth = false,
-    requireDomain = false,
-  } = options;
-  const config = getCloudflareTempEmailConfig(state);
-  if (!config.baseUrl) {
-    throw new Error('Cloudflare Temp Email 服务地址为空或格式无效。');
-  }
-  if (requireAdminAuth && !config.adminAuth) {
-    throw new Error('Cloudflare Temp Email 缺少 Admin Auth。');
-  }
-  if (requireDomain && !config.domain) {
-    throw new Error('Cloudflare Temp Email 域名为空或格式无效。');
-  }
-  return config;
+  return generatedEmailHelpers.ensureCloudflareTempEmailConfig(state, options);
 }
 
 async function requestCloudflareTempEmailJson(config, path, options = {}) {
-  const {
-    method = 'GET',
-    payload,
-    searchParams,
-    timeoutMs = 20000,
-  } = options;
-
-  const url = new URL(joinCloudflareTempEmailUrl(config.baseUrl, path));
-  if (searchParams && typeof searchParams === 'object') {
-    for (const [key, value] of Object.entries(searchParams)) {
-      if (value === undefined || value === null || value === '') continue;
-      url.searchParams.set(key, String(value));
-    }
-  }
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(new Error('timeout')), timeoutMs);
-
-  let response;
-  try {
-    response = await fetch(url.toString(), {
-      method,
-      headers: buildCloudflareTempEmailHeaders(config, {
-        json: payload !== undefined,
-      }),
-      body: payload !== undefined ? JSON.stringify(payload) : undefined,
-      signal: controller.signal,
-    });
-  } catch (err) {
-    const errorMessage = err?.name === 'AbortError'
-      ? `Cloudflare Temp Email 请求超时（>${Math.round(timeoutMs / 1000)} 秒）`
-      : `Cloudflare Temp Email 请求失败：${err.message}`;
-    throw new Error(errorMessage);
-  } finally {
-    clearTimeout(timeoutId);
-  }
-
-  const text = await response.text();
-  let parsed;
-  try {
-    parsed = text ? JSON.parse(text) : {};
-  } catch {
-    parsed = text;
-  }
-
-  if (!response.ok) {
-    const payloadError = typeof parsed === 'object' && parsed
-      ? (parsed.message || parsed.error || parsed.msg)
-      : '';
-    throw new Error(`Cloudflare Temp Email 请求失败：${payloadError || text || `HTTP ${response.status}`}`);
-  }
-
-  return parsed;
+  return generatedEmailHelpers.requestCloudflareTempEmailJson(config, path, options);
 }
 
 async function fetchCloudflareTempEmailAddress(state, options = {}) {
-  throwIfStopped();
-  const latestState = state || await getState();
-  const config = ensureCloudflareTempEmailConfig(latestState, {
-    requireAdminAuth: true,
-    requireDomain: true,
-  });
-  const requestedName = String(options.localPart || options.name || '').trim().toLowerCase() || generateCloudflareAliasLocalPart();
-  const payload = {
-    enablePrefix: true,
-    name: requestedName,
-    domain: config.domain,
-  };
-  const result = await requestCloudflareTempEmailJson(config, '/admin/new_address', {
-    method: 'POST',
-    payload,
-  });
-  const address = normalizeCloudflareTempEmailAddress(getCloudflareTempEmailAddressFromResponse(result));
-  if (!address) {
-    throw new Error('Cloudflare Temp Email 未返回可用邮箱地址。');
-  }
-
-  await setEmailState(address);
-  await addLog(`Cloudflare Temp Email：已生成 ${address}`, 'ok');
-  return address;
+  return generatedEmailHelpers.fetchCloudflareTempEmailAddress(state, options);
 }
 
 async function fetchDuckEmail(options = {}) {
-  throwIfStopped();
-  const { generateNew = true } = options;
-
-  await addLog(`Duck 邮箱：正在打开自动填充设置（${generateNew ? '生成新地址' : '复用当前地址'}）...`);
-  await reuseOrCreateTab('duck-mail', DUCK_AUTOFILL_URL);
-
-  const result = await sendToContentScript('duck-mail', {
-    type: 'FETCH_DUCK_EMAIL',
-    source: 'background',
-    payload: { generateNew },
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-  if (!result?.email) {
-    throw new Error('未返回 Duck 邮箱地址。');
-  }
-
-  await setEmailState(result.email);
-  await addLog(`Duck 邮箱：${result.generated ? '已生成' : '已读取'} ${result.email}`, 'ok');
-  return result.email;
+  return generatedEmailHelpers.fetchDuckEmail(options);
 }
 
 async function fetchGeneratedEmail(state, options = {}) {
-  const currentState = state || await getState();
-  const generator = normalizeEmailGenerator(options.generator ?? currentState.emailGenerator);
-  if (generator === 'custom') {
-    throw new Error('当前邮箱生成方式为自定义邮箱，请直接填写注册邮箱。');
-  }
-  if (generator === 'icloud') {
-    return fetchIcloudHideMyEmail();
-  }
-  if (generator === 'cloudflare') {
-    return fetchCloudflareEmail(currentState, options);
-  }
-  if (generator === CLOUDFLARE_TEMP_EMAIL_GENERATOR) {
-    return fetchCloudflareTempEmailAddress(currentState, options);
-  }
-  return fetchDuckEmail(options);
+  return generatedEmailHelpers.fetchGeneratedEmail(state, options);
 }
 
 // ============================================================
@@ -5836,12 +4930,92 @@ const AUTO_STEP_DELAYS = {
   2: 2000,
   3: 3000,
   4: 2000,
-  5: 3000,
+  5: 0,
   6: 3000,
   7: 2000,
   8: 2000,
   9: 1000,
 };
+const accountRunHistoryHelpers = self.MultiPageBackgroundAccountRunHistory?.createAccountRunHistoryHelpers({
+  ACCOUNT_RUN_HISTORY_STORAGE_KEY,
+  addLog,
+  buildLocalHelperEndpoint: (baseUrl, path) => buildHotmailLocalEndpoint(baseUrl, path),
+  chrome,
+  getErrorMessage,
+  getState,
+  normalizeAccountRunHistoryHelperBaseUrl,
+});
+
+async function broadcastAccountRunHistoryUpdate() {
+  if (!accountRunHistoryHelpers?.getPersistedAccountRunHistory) {
+    return [];
+  }
+
+  const history = await accountRunHistoryHelpers.getPersistedAccountRunHistory();
+  broadcastDataUpdate({ accountRunHistory: history });
+  return history;
+}
+
+async function appendAndBroadcastAccountRunRecord(status, stateOverride = null, reason = '') {
+  if (!accountRunHistoryHelpers?.appendAccountRunRecord) {
+    return null;
+  }
+
+  const record = await accountRunHistoryHelpers.appendAccountRunRecord(status, stateOverride, reason);
+  if (!record) {
+    return null;
+  }
+
+  await broadcastAccountRunHistoryUpdate();
+  return record;
+}
+
+const autoRunController = self.MultiPageBackgroundAutoRunController?.createAutoRunController({
+  addLog,
+  appendAccountRunRecord: (...args) => appendAndBroadcastAccountRunRecord(...args),
+  AUTO_RUN_MAX_RETRIES_PER_ROUND,
+  AUTO_RUN_RETRY_DELAY_MS,
+  AUTO_RUN_TIMER_KIND_BEFORE_RETRY,
+  AUTO_RUN_TIMER_KIND_BETWEEN_ROUNDS,
+  broadcastAutoRunStatus,
+  broadcastStopToContentScripts,
+  cancelPendingCommands,
+  clearStopRequest: () => clearStopRequest(),
+  getAutoRunStatusPayload,
+  getErrorMessage,
+  getFirstUnfinishedStep,
+  getPendingAutoRunTimerPlan,
+  getRunningSteps,
+  getState,
+  getStopRequested: () => stopRequested,
+  hasSavedProgress,
+  isRestartCurrentAttemptError,
+  isStopError,
+  launchAutoRunTimerPlan,
+  normalizeAutoRunFallbackThreadIntervalMinutes,
+  persistAutoRunTimerPlan,
+  resetState,
+  runAutoSequenceFromStep: (...args) => runAutoSequenceFromStep(...args),
+  runtime: {
+    get: () => ({
+      autoRunActive,
+      autoRunCurrentRun,
+      autoRunTotalRuns,
+      autoRunAttemptRun,
+    }),
+    set: (updates = {}) => {
+      if (updates.autoRunActive !== undefined) autoRunActive = Boolean(updates.autoRunActive);
+      if (updates.autoRunCurrentRun !== undefined) autoRunCurrentRun = Number(updates.autoRunCurrentRun) || 0;
+      if (updates.autoRunTotalRuns !== undefined) autoRunTotalRuns = Number(updates.autoRunTotalRuns) || 0;
+      if (updates.autoRunAttemptRun !== undefined) autoRunAttemptRun = Number(updates.autoRunAttemptRun) || 0;
+    },
+  },
+  setState,
+  sleepWithStop,
+  waitForRunningStepsToFinish,
+  throwIfStopped: () => throwIfStopped(),
+  chrome,
+});
 
 async function resumeAutoRunIfWaitingForEmail(options = {}) {
   const { silent = false } = options;
@@ -5961,8 +5135,7 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
 
 async function runAutoSequenceFromStep(startStep, context = {}) {
   const { targetRun, totalRuns, attemptRuns, continued = false } = context;
-  const maxStep9RestartAttempts = 5;
-  let step9RestartAttempts = 0;
+  let postStep6RestartCount = 0;
 
   if (continued) {
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
@@ -5980,13 +5153,19 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
   }
 
   if (startStep <= 3) {
+    const latestState = await getState();
+    const step3Status = latestState.stepStatuses?.[3] || 'pending';
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，填写密码、验证、登录并完成授权（第 ${attemptRuns} 次尝试）===`, 'info');
     await broadcastAutoRunStatus('running', {
       currentRun: targetRun,
       totalRuns,
       attemptRun: attemptRuns,
     });
-    await executeStepAndWait(3, AUTO_STEP_DELAYS[3]);
+    if (isStepDoneStatus(step3Status)) {
+      await addLog(`自动运行：步骤 3 当前状态为 ${step3Status}，将直接继续后续流程。`, 'info');
+    } else {
+      await executeStepAndWait(3, AUTO_STEP_DELAYS[3]);
+    }
   } else {
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续执行剩余流程（第 ${attemptRuns} 次尝试）===`, 'info');
   }
@@ -6007,26 +5186,30 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
       }
       step += 1;
     } catch (err) {
-      const latestState = await getState();
-      const currentMail = getMailConfig(latestState);
-      const shouldRetryStep9 = step === 9
-        && (
-          isLegacyStep9RecoverableAuthError(err)
-          || (currentMail.provider === HOTMAIL_PROVIDER && isStep9RecoverableAuthError(err))
-        )
-        && step9RestartAttempts < maxStep9RestartAttempts;
-
-      if (shouldRetryStep9) {
-        step9RestartAttempts += 1;
+      const restartDecision = await getPostStep6AutoRestartDecision(step, err);
+      if (restartDecision.shouldRestart) {
+        postStep6RestartCount += 1;
+        const authState = restartDecision.authState;
+        const authStateLabel = authState?.state ? getLoginAuthStateLabel(authState.state) : '未知页面';
+        const authStateSuffix = authState?.url
+          ? `当前认证页：${authStateLabel}（${authState.url}）`
+          : authState?.state
+            ? `当前认证页：${authStateLabel}`
+            : '未获取到认证页状态';
         await addLog(
-          `步骤 9：检测到 CPA 认证失败，正在回到步骤 6 重新开始授权流程（${step9RestartAttempts}/${maxStep9RestartAttempts}）...`,
+          `步骤 ${step}：检测到报错且当前未进入 add-phone，正在回到步骤 6 重新开始授权流程（第 ${postStep6RestartCount} 次重开）。${authStateSuffix}；原因：${restartDecision.errorMessage || '未知错误'}`,
           'warn'
         );
-        await invalidateDownstreamAfterStepRestart(6, {
-          logLabel: `步骤 9 认证失败后准备回到步骤 6 重试（${step9RestartAttempts}/${maxStep9RestartAttempts}）`,
+        await invalidateDownstreamAfterStepRestart(5, {
+          logLabel: `步骤 ${step} 报错后准备回到步骤 6 重试（第 ${postStep6RestartCount} 次重开）`,
         });
         step = 6;
         continue;
+      }
+
+      if (restartDecision.blockedByAddPhone) {
+        const addPhoneUrl = restartDecision.authState?.url || 'https://auth.openai.com/add-phone';
+        await addLog(`步骤 ${step}：检测到认证流程进入 add-phone（${addPhoneUrl}），停止自动回到步骤 6 重开。`, 'warn');
       }
       throw err;
     }
@@ -6047,570 +5230,55 @@ async function waitForResume() {
 }
 
 function createAutoRunRoundSummary(round) {
-  return {
-    round,
-    status: 'pending',
-    attempts: 0,
-    failureReasons: [],
-    finalFailureReason: '',
-  };
+  return autoRunController.createAutoRunRoundSummary(round);
 }
 
 function normalizeAutoRunRoundSummary(summary, round) {
-  const base = createAutoRunRoundSummary(round);
-  if (!summary || typeof summary !== 'object') {
-    return base;
-  }
-
-  const status = String(summary.status || '').trim().toLowerCase();
-  return {
-    round,
-    status: ['pending', 'success', 'failed'].includes(status) ? status : base.status,
-    attempts: Math.max(0, Math.floor(Number(summary.attempts) || 0)),
-    failureReasons: Array.isArray(summary.failureReasons)
-      ? summary.failureReasons.map((item) => String(item || '').trim()).filter(Boolean)
-      : [],
-    finalFailureReason: String(summary.finalFailureReason || '').trim(),
-  };
+  return autoRunController.normalizeAutoRunRoundSummary(summary, round);
 }
 
 function buildAutoRunRoundSummaries(totalRuns, rawSummaries = []) {
-  return Array.from({ length: totalRuns }, (_, index) => {
-    return normalizeAutoRunRoundSummary(rawSummaries[index], index + 1);
-  });
+  return autoRunController.buildAutoRunRoundSummaries(totalRuns, rawSummaries);
 }
 
 function serializeAutoRunRoundSummaries(totalRuns, roundSummaries = []) {
-  return buildAutoRunRoundSummaries(totalRuns, roundSummaries).map((summary) => ({
-    ...summary,
-    failureReasons: [...summary.failureReasons],
-  }));
+  return autoRunController.serializeAutoRunRoundSummaries(totalRuns, roundSummaries);
 }
 
 function getAutoRunRoundRetryCount(summary) {
-  return Math.max(0, Number(summary?.attempts || 0) - 1);
+  return autoRunController.getAutoRunRoundRetryCount(summary);
 }
 
 function formatAutoRunFailureReasons(reasons = []) {
-  if (!Array.isArray(reasons) || !reasons.length) {
-    return '未知错误';
-  }
-
-  const counts = new Map();
-  for (const reason of reasons) {
-    const normalized = String(reason || '').trim() || '未知错误';
-    counts.set(normalized, (counts.get(normalized) || 0) + 1);
-  }
-
-  return Array.from(counts.entries())
-    .map(([reason, count]) => (count > 1 ? `${reason}（${count}次）` : reason))
-    .join('；');
+  return autoRunController.formatAutoRunFailureReasons(reasons);
 }
 
 async function logAutoRunFinalSummary(totalRuns, roundSummaries = []) {
-  const summaries = buildAutoRunRoundSummaries(totalRuns, roundSummaries);
-  const successRounds = summaries.filter((item) => item.status === 'success');
-  const failedRounds = summaries.filter((item) => item.status === 'failed');
-  const pendingRounds = summaries.filter((item) => item.status === 'pending');
-
-  await addLog('=== 自动运行汇总 ===', failedRounds.length ? 'warn' : 'ok');
-  await addLog(
-    `总轮数：${totalRuns}；成功：${successRounds.length}；失败：${failedRounds.length}；未完成：${pendingRounds.length}`,
-    failedRounds.length ? 'warn' : 'ok'
-  );
-
-  if (successRounds.length) {
-    await addLog(
-      `成功轮次：${successRounds
-        .map((item) => `第 ${item.round} 轮（重试 ${getAutoRunRoundRetryCount(item)} 次）`)
-        .join('；')}`,
-      'ok'
-    );
-  }
-
-  if (failedRounds.length) {
-    await addLog(
-      `失败轮次：${failedRounds
-        .map((item) => {
-          const retryCount = getAutoRunRoundRetryCount(item);
-          const finalReason = item.finalFailureReason || item.failureReasons[item.failureReasons.length - 1] || '未知错误';
-          const reasonSummary = formatAutoRunFailureReasons(item.failureReasons);
-          return `第 ${item.round} 轮（重试 ${retryCount} 次，最终原因：${finalReason}；失败记录：${reasonSummary}）`;
-        })
-        .join('；')}`,
-      'error'
-    );
-  }
-
-  if (pendingRounds.length) {
-    await addLog(
-      `未完成轮次：${pendingRounds.map((item) => `第 ${item.round} 轮`).join('；')}`,
-      'warn'
-    );
-  }
+  return autoRunController.logAutoRunFinalSummary(totalRuns, roundSummaries);
 }
 
 async function skipAutoRunCountdown() {
-  const state = await getState();
-  const plan = getPendingAutoRunTimerPlan(state);
-  if (!plan || state.autoRunPhase !== 'waiting_interval') {
-    return false;
-  }
-
-  return launchAutoRunTimerPlan('manual', {
-    expectedKinds: [
-      AUTO_RUN_TIMER_KIND_BETWEEN_ROUNDS,
-      AUTO_RUN_TIMER_KIND_BEFORE_RETRY,
-    ],
-  });
+  return autoRunController.skipAutoRunCountdown();
 }
 
 async function waitBetweenAutoRunRounds(targetRun, totalRuns, roundSummary, options = {}) {
-  const { autoRunSkipFailures = false, roundSummaries = [] } = options;
-  if (totalRuns <= 1 || targetRun >= totalRuns) {
-    return false;
-  }
-
-  const fallbackThreadIntervalMinutes = normalizeAutoRunFallbackThreadIntervalMinutes(
-    (await getState()).autoRunFallbackThreadIntervalMinutes
-  );
-  if (fallbackThreadIntervalMinutes <= 0) {
-    return false;
-  }
-
-  const statusLabel = roundSummary?.status === 'failed' ? '失败' : '完成';
-  await addLog(
-    `线程间隔：第 ${targetRun}/${totalRuns} 轮已${statusLabel}，等待 ${fallbackThreadIntervalMinutes} 分钟后开始下一轮。`,
-    'info'
-  );
-  await persistAutoRunTimerPlan({
-    kind: AUTO_RUN_TIMER_KIND_BETWEEN_ROUNDS,
-    fireAt: Date.now() + fallbackThreadIntervalMinutes * 60 * 1000,
-    currentRun: targetRun,
-    totalRuns,
-    attemptRun: autoRunAttemptRun,
-    autoRunSkipFailures,
-    roundSummaries,
-    countdownTitle: '线程间隔中',
-    countdownNote: `第 ${Math.min(targetRun + 1, totalRuns)}/${totalRuns} 轮即将开始`,
-  }, {
-    autoRunSkipFailures,
-    autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-  });
-  autoRunActive = false;
-  return true;
+  return autoRunController.waitBetweenAutoRunRounds(targetRun, totalRuns, roundSummary, options);
 }
 
 async function waitBeforeAutoRunRetry(targetRun, totalRuns, nextAttemptRun, options = {}) {
-  const { autoRunSkipFailures = false, roundSummaries = [] } = options;
-  const fallbackThreadIntervalMinutes = normalizeAutoRunFallbackThreadIntervalMinutes(
-    (await getState()).autoRunFallbackThreadIntervalMinutes
-  );
-  if (fallbackThreadIntervalMinutes <= 0) {
-    return false;
-  }
-
-  await addLog(
-    `线程间隔：等待 ${fallbackThreadIntervalMinutes} 分钟后开始第 ${targetRun}/${totalRuns} 轮第 ${nextAttemptRun} 次尝试。`,
-    'info'
-  );
-  await persistAutoRunTimerPlan({
-    kind: AUTO_RUN_TIMER_KIND_BEFORE_RETRY,
-    fireAt: Date.now() + fallbackThreadIntervalMinutes * 60 * 1000,
-    currentRun: targetRun,
-    totalRuns,
-    attemptRun: nextAttemptRun,
-    autoRunSkipFailures,
-    roundSummaries,
-    countdownTitle: '线程间隔中',
-    countdownNote: `第 ${targetRun}/${totalRuns} 轮第 ${nextAttemptRun} 次尝试即将开始`,
-  }, {
-    autoRunSkipFailures,
-    autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-  });
-  autoRunActive = false;
-  return true;
+  return autoRunController.waitBeforeAutoRunRetry(targetRun, totalRuns, nextAttemptRun, options);
 }
 
 async function handleAutoRunLoopUnhandledError(error) {
-  console.error(LOG_PREFIX, 'Auto run loop crashed:', error);
-  if (!isStopError(error)) {
-    await addLog(`自动运行异常终止：${getErrorMessage(error) || '未知错误'}`, 'error');
-  }
-
-  autoRunActive = false;
-  await broadcastAutoRunStatus('stopped', {
-    currentRun: autoRunCurrentRun,
-    totalRuns: autoRunTotalRuns,
-    attemptRun: autoRunAttemptRun,
-  }, {
-    autoRunTimerPlan: null,
-    scheduledAutoRunPlan: null,
-  });
-  clearStopRequest();
+  return autoRunController.handleAutoRunLoopUnhandledError(error);
 }
 
 function startAutoRunLoop(totalRuns, options = {}) {
-  autoRunLoop(totalRuns, options).catch((error) => {
-    handleAutoRunLoopUnhandledError(error).catch((handlerError) => {
-      console.error(LOG_PREFIX, 'Failed to finalize auto run error:', handlerError);
-    });
-  });
+  return autoRunController.startAutoRunLoop(totalRuns, options);
 }
 
 async function autoRunLoop(totalRuns, options = {}) {
-  if (autoRunActive) {
-    await addLog('自动运行已在进行中', 'warn');
-    return;
-  }
-
-  clearStopRequest();
-  autoRunActive = true;
-  autoRunTotalRuns = totalRuns;
-  autoRunCurrentRun = 0;
-  autoRunAttemptRun = 0;
-  const autoRunSkipFailures = Boolean(options.autoRunSkipFailures);
-  const initialMode = options.mode === 'continue' ? 'continue' : 'restart';
-  const resumeCurrentRun = Number.isInteger(options.resumeCurrentRun) && options.resumeCurrentRun > 0
-    ? Math.min(totalRuns, options.resumeCurrentRun)
-    : 1;
-  const resumeAttemptRun = Number.isInteger(options.resumeAttemptRun) && options.resumeAttemptRun > 0
-    ? Math.min(AUTO_RUN_MAX_RETRIES_PER_ROUND + 1, options.resumeAttemptRun)
-    : 1;
-  let continueCurrentOnFirstAttempt = initialMode === 'continue';
-  let forceFreshTabsNextRun = false;
-  let stoppedEarly = false;
-  let parkedByTimer = false;
-  const roundSummaries = buildAutoRunRoundSummaries(totalRuns, options.resumeRoundSummaries);
-
-  if (continueCurrentOnFirstAttempt && resumeCurrentRun > 1) {
-    for (let round = 1; round < resumeCurrentRun; round += 1) {
-      const summary = roundSummaries[round - 1];
-      if (summary.status === 'pending') {
-        summary.status = 'success';
-        if (!summary.attempts) {
-          summary.attempts = 1;
-        }
-      }
-    }
-  }
-
-  let successfulRuns = roundSummaries.filter((item) => item.status === 'success').length;
-  const initialState = await getState();
-  const initialPhase = continueCurrentOnFirstAttempt && getRunningSteps(initialState.stepStatuses).length
-    ? 'waiting_step'
-    : 'running';
-  const showResumePosition = continueCurrentOnFirstAttempt || resumeCurrentRun > 1 || resumeAttemptRun > 1;
-
-  await setState({
-    autoRunSkipFailures,
-    autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-    ...getAutoRunStatusPayload(initialPhase, {
-      currentRun: showResumePosition ? resumeCurrentRun : 0,
-      totalRuns,
-      attemptRun: showResumePosition ? resumeAttemptRun : 0,
-    }),
-  });
-
-  for (let targetRun = resumeCurrentRun; targetRun <= totalRuns; targetRun += 1) {
-    const roundSummary = roundSummaries[targetRun - 1];
-    let roundRecordAppended = false;
-    const resumingCurrentRound = continueCurrentOnFirstAttempt && targetRun === resumeCurrentRun;
-    let attemptRun = resumingCurrentRound ? resumeAttemptRun : 1;
-    let reuseExistingProgress = resumingCurrentRound;
-    const maxAttemptsForRound = autoRunSkipFailures
-      ? AUTO_RUN_MAX_RETRIES_PER_ROUND + 1
-      : Math.max(1, attemptRun);
-
-    while (attemptRun <= maxAttemptsForRound) {
-      autoRunCurrentRun = targetRun;
-      autoRunAttemptRun = attemptRun;
-      roundSummary.attempts = attemptRun;
-      let startStep = 1;
-      let useExistingProgress = false;
-
-      if (reuseExistingProgress) {
-        let currentState = await getState();
-        if (getRunningSteps(currentState.stepStatuses).length) {
-          currentState = await waitForRunningStepsToFinish({
-            currentRun: targetRun,
-            totalRuns,
-            attemptRun,
-          });
-        }
-        const resumeStep = getFirstUnfinishedStep(currentState.stepStatuses);
-        if (resumeStep && hasSavedProgress(currentState.stepStatuses)) {
-          startStep = resumeStep;
-          useExistingProgress = true;
-        } else if (hasSavedProgress(currentState.stepStatuses)) {
-          await addLog('检测到当前流程已处理完成，本轮将改为从步骤 1 重新开始。', 'info');
-        }
-      }
-
-      if (!useExistingProgress) {
-        const prevState = await getState();
-        const keepSettings = {
-          vpsUrl: prevState.vpsUrl,
-          vpsPassword: prevState.vpsPassword,
-          customPassword: prevState.customPassword,
-          autoRunSkipFailures: prevState.autoRunSkipFailures,
-          autoRunFallbackThreadIntervalMinutes: prevState.autoRunFallbackThreadIntervalMinutes,
-          autoRunDelayEnabled: prevState.autoRunDelayEnabled,
-          autoRunDelayMinutes: prevState.autoRunDelayMinutes,
-          autoStepDelaySeconds: prevState.autoStepDelaySeconds,
-          mailProvider: prevState.mailProvider,
-          emailGenerator: prevState.emailGenerator,
-          emailPrefix: prevState.emailPrefix,
-          inbucketHost: prevState.inbucketHost,
-          inbucketMailbox: prevState.inbucketMailbox,
-          cloudflareDomain: prevState.cloudflareDomain,
-          cloudflareDomains: prevState.cloudflareDomains,
-          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-          tabRegistry: {},
-          sourceLastUrls: {},
-          ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun }),
-        };
-        await resetState();
-        await setState(keepSettings);
-        chrome.runtime.sendMessage({ type: 'AUTO_RUN_RESET' }).catch(() => { });
-        await sleepWithStop(500);
-      } else {
-        await setState({
-          autoRunSkipFailures,
-          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-          ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun }),
-        });
-      }
-
-        if (forceFreshTabsNextRun) {
-          await addLog(`上一轮尝试已放弃，当前开始第 ${targetRun}/${totalRuns} 轮第 ${attemptRun} 次尝试。`, 'warn');
-          forceFreshTabsNextRun = false;
-        }
-
-        const appendRoundRecordIfNeeded = async (status, reason = '') => {
-          if (roundRecordAppended) {
-            return;
-          }
-          if (typeof appendAccountRunRecord !== 'function') {
-            return;
-          }
-          const record = await appendAccountRunRecord(status, null, reason);
-          if (record) {
-            roundRecordAppended = true;
-          }
-        };
-
-      try {
-        throwIfStopped();
-        await broadcastAutoRunStatus('running', {
-          currentRun: targetRun,
-          totalRuns,
-          attemptRun,
-        });
-
-        await runAutoSequenceFromStep(startStep, {
-          targetRun,
-          totalRuns,
-          attemptRuns: attemptRun,
-          continued: useExistingProgress,
-        });
-
-        roundSummary.status = 'success';
-        roundSummary.finalFailureReason = '';
-        successfulRuns += 1;
-        await setState({
-          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-        });
-        await appendRoundRecordIfNeeded('success');
-        await addLog(`=== 第 ${targetRun}/${totalRuns} 轮完成（第 ${attemptRun} 次尝试成功）===`, 'ok');
-        break;
-      } catch (err) {
-        if (isStopError(err)) {
-          stoppedEarly = true;
-          await appendRoundRecordIfNeeded('stopped', getErrorMessage(err));
-          await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
-          await broadcastAutoRunStatus('stopped', {
-            currentRun: targetRun,
-            totalRuns,
-            attemptRun,
-          });
-          break;
-        }
-
-        const reason = typeof getErrorMessage === 'function'
-          ? getErrorMessage(err)
-          : String(err?.message || err || '');
-        roundSummary.failureReasons.push(reason);
-        const canRetry = autoRunSkipFailures && attemptRun < maxAttemptsForRound;
-
-        await setState({
-          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-        });
-
-        if (canRetry) {
-          const retryIndex = attemptRun;
-          if (isRestartCurrentAttemptError(err)) {
-            await addLog(`第 ${targetRun}/${totalRuns} 轮第 ${attemptRun} 次尝试需要整轮重开：${reason}`, 'warn');
-          } else {
-            await addLog(`第 ${targetRun}/${totalRuns} 轮第 ${attemptRun} 次尝试失败：${reason}`, 'error');
-          }
-          cancelPendingCommands('当前尝试已放弃。');
-          await broadcastStopToContentScripts();
-          await broadcastAutoRunStatus('retrying', {
-            currentRun: targetRun,
-            totalRuns,
-            attemptRun,
-          });
-          forceFreshTabsNextRun = true;
-          await addLog(
-            `自动重试：${Math.round(AUTO_RUN_RETRY_DELAY_MS / 1000)} 秒后开始第 ${targetRun}/${totalRuns} 轮第 ${attemptRun + 1} 次尝试（第 ${retryIndex}/${AUTO_RUN_MAX_RETRIES_PER_ROUND} 次重试）。`,
-            'warn'
-          );
-          try {
-            await sleepWithStop(AUTO_RUN_RETRY_DELAY_MS);
-          } catch (sleepError) {
-            if (isStopError(sleepError)) {
-              stoppedEarly = true;
-              await appendRoundRecordIfNeeded('stopped', getErrorMessage(sleepError));
-              await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
-              await broadcastAutoRunStatus('stopped', {
-                currentRun: targetRun,
-                totalRuns,
-                attemptRun,
-              });
-              break;
-            }
-            throw sleepError;
-          }
-          try {
-            const parkedForRetry = await waitBeforeAutoRunRetry(targetRun, totalRuns, attemptRun + 1, {
-              autoRunSkipFailures,
-              roundSummaries,
-            });
-            if (parkedForRetry) {
-              parkedByTimer = true;
-              break;
-            }
-          } catch (sleepError) {
-            if (isStopError(sleepError)) {
-              stoppedEarly = true;
-              await appendRoundRecordIfNeeded('stopped', getErrorMessage(sleepError));
-              await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
-              await broadcastAutoRunStatus('stopped', {
-                currentRun: targetRun,
-                totalRuns,
-                attemptRun,
-              });
-              break;
-            }
-            throw sleepError;
-          }
-          attemptRun += 1;
-          reuseExistingProgress = false;
-          continue;
-        }
-
-        roundSummary.status = 'failed';
-        roundSummary.finalFailureReason = reason;
-        await setState({
-          autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-        });
-        await appendRoundRecordIfNeeded('failed', reason);
-        if (!autoRunSkipFailures) {
-          cancelPendingCommands('当前轮执行失败。');
-          await broadcastStopToContentScripts();
-          await addLog('自动重试未开启，自动运行将在当前失败后停止。', 'warn');
-          stoppedEarly = true;
-          await broadcastAutoRunStatus('stopped', {
-            currentRun: targetRun,
-            totalRuns,
-            attemptRun,
-          });
-          break;
-        }
-        await addLog(`第 ${targetRun}/${totalRuns} 轮最终失败：${reason}`, 'error');
-        await addLog(
-          targetRun < totalRuns
-            ? `第 ${targetRun}/${totalRuns} 轮已达到 ${AUTO_RUN_MAX_RETRIES_PER_ROUND} 次重试上限，继续下一轮。`
-            : `第 ${targetRun}/${totalRuns} 轮已达到 ${AUTO_RUN_MAX_RETRIES_PER_ROUND} 次重试上限，本次自动运行结束。`,
-          'warn'
-        );
-        cancelPendingCommands('当前轮已达到重试上限。');
-        await broadcastStopToContentScripts();
-        forceFreshTabsNextRun = true;
-        break;
-      } finally {
-        reuseExistingProgress = false;
-        continueCurrentOnFirstAttempt = false;
-      }
-    }
-
-    if (stoppedEarly || parkedByTimer) {
-      break;
-    }
-
-    try {
-      const parkedForNextRound = await waitBetweenAutoRunRounds(targetRun, totalRuns, roundSummary, {
-        autoRunSkipFailures,
-        roundSummaries,
-      });
-      if (parkedForNextRound) {
-        parkedByTimer = true;
-        break;
-      }
-    } catch (sleepError) {
-      if (isStopError(sleepError)) {
-        stoppedEarly = true;
-        await addLog(`第 ${targetRun}/${totalRuns} 轮已被用户停止`, 'warn');
-        await broadcastAutoRunStatus('stopped', {
-          currentRun: targetRun,
-          totalRuns,
-          attemptRun: autoRunAttemptRun,
-        });
-        break;
-      }
-      throw sleepError;
-    }
-  }
-
-  if (parkedByTimer) {
-    autoRunActive = false;
-    clearStopRequest();
-    return;
-  }
-
-  await setState({
-    autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-  });
-  await logAutoRunFinalSummary(totalRuns, roundSummaries);
-
-  if (stopRequested || stoppedEarly) {
-    await addLog(`=== 已停止，完成 ${successfulRuns}/${autoRunTotalRuns} 轮 ===`, 'warn');
-    await broadcastAutoRunStatus('stopped', {
-      currentRun: autoRunCurrentRun,
-      totalRuns: autoRunTotalRuns,
-      attemptRun: autoRunAttemptRun,
-    });
-  } else {
-    await addLog(`=== 全部 ${autoRunTotalRuns} 轮已执行完成，成功 ${successfulRuns} 轮 ===`, 'ok');
-    await broadcastAutoRunStatus('complete', {
-      currentRun: autoRunTotalRuns,
-      totalRuns: autoRunTotalRuns,
-      attemptRun: autoRunAttemptRun,
-    });
-  }
-  autoRunActive = false;
-  await setState({
-    autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-    autoRunTimerPlan: null,
-    scheduledAutoRunPlan: null,
-    ...getAutoRunStatusPayload(stopRequested || stoppedEarly ? 'stopped' : 'complete', {
-      currentRun: stopRequested || stoppedEarly ? autoRunCurrentRun : autoRunTotalRuns,
-      totalRuns: autoRunTotalRuns,
-      attemptRun: autoRunAttemptRun,
-    }),
-  });
-  clearStopRequest();
+  return autoRunController.autoRunLoop(totalRuns, options);
 }
 
 async function resumeAutoRun() {
@@ -6655,219 +5323,310 @@ async function resumeAutoRun() {
 
 const SIGNUP_ENTRY_URL = 'https://chatgpt.com/';
 const SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/signup-page.js'];
+const panelBridge = self.MultiPageBackgroundPanelBridge?.createPanelBridge({
+  chrome,
+  addLog,
+  closeConflictingTabsForSource,
+  ensureContentScriptReadyOnTab,
+  getPanelMode,
+  normalizeSub2ApiUrl,
+  rememberSourceLastUrl,
+  sendToContentScript,
+  sendToContentScriptResilient,
+  waitForTabUrlFamily,
+  DEFAULT_SUB2API_GROUP_NAME,
+  SUB2API_STEP1_RESPONSE_TIMEOUT_MS,
+});
+const signupFlowHelpers = self.MultiPageSignupFlowHelpers?.createSignupFlowHelpers({
+  addLog,
+  buildGeneratedAliasEmail,
+  chrome,
+  ensureContentScriptReadyOnTab,
+  ensureHotmailAccountForFlow,
+  ensureLuckmailPurchaseForFlow,
+  getTabId,
+  isGeneratedAliasProvider,
+  isSignupEmailVerificationPageUrl,
+  isHotmailProvider,
+  isLuckmailProvider,
+  isSignupPasswordPageUrl,
+  isTabAlive,
+  reuseOrCreateTab,
+  sendToContentScriptResilient,
+  setEmailState,
+  SIGNUP_ENTRY_URL,
+  SIGNUP_PAGE_INJECT_FILES,
+  waitForTabUrlMatch,
+});
+const verificationFlowHelpers = self.MultiPageBackgroundVerificationFlow?.createVerificationFlowHelpers({
+  addLog,
+  chrome,
+  CLOUDFLARE_TEMP_EMAIL_PROVIDER,
+  completeStepFromBackground,
+  confirmCustomVerificationStepBypassRequest: (step) => chrome.runtime.sendMessage({
+    type: 'REQUEST_CUSTOM_VERIFICATION_BYPASS_CONFIRMATION',
+    payload: { step },
+  }),
+  getHotmailVerificationPollConfig,
+  getHotmailVerificationRequestTimestamp,
+  getState,
+  getTabId,
+  HOTMAIL_PROVIDER,
+  isStopError,
+  LUCKMAIL_PROVIDER,
+  MAIL_2925_VERIFICATION_INTERVAL_MS,
+  MAIL_2925_VERIFICATION_MAX_ATTEMPTS,
+  pollCloudflareTempEmailVerificationCode,
+  pollHotmailVerificationCode,
+  pollLuckmailVerificationCode,
+  sendToContentScript,
+  sendToMailContentScriptResilient,
+  setState,
+  setStepStatus,
+  sleepWithStop,
+  throwIfStopped,
+  VERIFICATION_POLL_MAX_ROUNDS,
+});
+const step1Executor = self.MultiPageBackgroundStep1?.createStep1Executor({
+  addLog,
+  completeStepFromBackground,
+  ensureSignupEntryPageReady,
+});
+const step2Executor = self.MultiPageBackgroundStep2?.createStep2Executor({
+  addLog,
+  chrome,
+  completeStepFromBackground,
+  ensureContentScriptReadyOnTab,
+  ensureSignupEntryPageReady,
+  ensureSignupPostEmailPageReadyInTab,
+  getTabId,
+  isTabAlive,
+  resolveSignupEmailForFlow,
+  sendToContentScriptResilient,
+  SIGNUP_PAGE_INJECT_FILES,
+});
+const step3Executor = self.MultiPageBackgroundStep3?.createStep3Executor({
+  addLog,
+  chrome,
+  ensureContentScriptReadyOnTab,
+  generatePassword,
+  getTabId,
+  isTabAlive,
+  sendToContentScript,
+  setPasswordState,
+  setState,
+  SIGNUP_PAGE_INJECT_FILES,
+});
+const step4Executor = self.MultiPageBackgroundStep4?.createStep4Executor({
+  addLog,
+  chrome,
+  completeStepFromBackground,
+  confirmCustomVerificationStepBypass: verificationFlowHelpers.confirmCustomVerificationStepBypass,
+  getMailConfig,
+  getTabId,
+  HOTMAIL_PROVIDER,
+  isTabAlive,
+  LUCKMAIL_PROVIDER,
+  CLOUDFLARE_TEMP_EMAIL_PROVIDER,
+  resolveVerificationStep: verificationFlowHelpers.resolveVerificationStep,
+  reuseOrCreateTab,
+  sendToContentScriptResilient,
+  shouldUseCustomRegistrationEmail,
+  STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS,
+  throwIfStopped,
+});
+const step5Executor = self.MultiPageBackgroundStep5?.createStep5Executor({
+  addLog,
+  generateRandomBirthday,
+  generateRandomName,
+  sendToContentScript,
+});
+const step6Executor = self.MultiPageBackgroundStep6?.createStep6Executor({
+  addLog,
+  completeStepFromBackground,
+  getErrorMessage,
+  getLoginAuthStateLabel,
+  getState,
+  isStep6RecoverableResult,
+  isStep6SuccessResult,
+  refreshOAuthUrlBeforeStep6,
+  reuseOrCreateTab,
+  runPreStep6CookieCleanup,
+  sendToContentScriptResilient,
+  shouldSkipLoginVerificationForCpaCallback,
+  skipLoginVerificationStepsForCpaCallback,
+  STEP6_MAX_ATTEMPTS,
+  throwIfStopped,
+});
+const step7Executor = self.MultiPageBackgroundStep7?.createStep7Executor({
+  addLog,
+  chrome,
+  CLOUDFLARE_TEMP_EMAIL_PROVIDER,
+  confirmCustomVerificationStepBypass: verificationFlowHelpers.confirmCustomVerificationStepBypass,
+  ensureStep7VerificationPageReady,
+  executeStep6: (...args) => executeStep6(...args),
+  getPanelMode,
+  getMailConfig,
+  getState,
+  getTabId,
+  HOTMAIL_PROVIDER,
+  isTabAlive,
+  isVerificationMailPollingError,
+  LUCKMAIL_PROVIDER,
+  resolveVerificationStep: verificationFlowHelpers.resolveVerificationStep,
+  reuseOrCreateTab,
+  setState,
+  setStepStatus,
+  shouldSkipLoginVerificationForCpaCallback,
+  shouldUseCustomRegistrationEmail,
+  sleepWithStop,
+  STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS,
+  STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS,
+  throwIfStopped,
+});
+const step9Executor = self.MultiPageBackgroundStep9?.createStep9Executor({
+  addLog,
+  chrome,
+  closeConflictingTabsForSource,
+  completeStepFromBackground,
+  ensureContentScriptReadyOnTab,
+  getPanelMode,
+  getTabId,
+  isLocalhostOAuthCallbackUrl,
+  isTabAlive,
+  normalizeSub2ApiUrl,
+  rememberSourceLastUrl,
+  reuseOrCreateTab,
+  sendToContentScript,
+  sendToContentScriptResilient,
+  shouldBypassStep9ForLocalCpa,
+  SUB2API_STEP9_RESPONSE_TIMEOUT_MS,
+});
+const stepDefinitions = self.MultiPageStepDefinitions?.getSteps?.() || [];
+const stepExecutorsByKey = {
+  'open-chatgpt': () => step1Executor.executeStep1(),
+  'submit-signup-email': (state) => step2Executor.executeStep2(state),
+  'fill-password': (state) => step3Executor.executeStep3(state),
+  'fetch-signup-code': (state) => step4Executor.executeStep4(state),
+  'fill-profile': (state) => step5Executor.executeStep5(state),
+  'oauth-login': (state) => step6Executor.executeStep6(state),
+  'fetch-login-code': (state) => step7Executor.executeStep7(state),
+  'confirm-oauth': (state) => step8Executor.executeStep8(state),
+  'platform-verify': (state) => step9Executor.executeStep9(state),
+};
+const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter({
+  addLog,
+  appendAccountRunRecord: (...args) => appendAndBroadcastAccountRunRecord(...args),
+  batchUpdateLuckmailPurchases,
+  buildLocalhostCleanupPrefix,
+  buildLuckmailSessionSettingsPayload,
+  buildPersistentSettingsPayload,
+  broadcastDataUpdate,
+  cancelScheduledAutoRun,
+  checkIcloudSession,
+  clearAutoRunTimerAlarm,
+  clearLuckmailRuntimeState,
+  clearStopRequest,
+  closeLocalhostCallbackTabs,
+  closeTabsByUrlPrefix,
+  deleteHotmailAccount,
+  deleteHotmailAccounts,
+  deleteIcloudAlias,
+  deleteUsedIcloudAliases,
+  disableUsedLuckmailPurchases,
+  doesStepUseCompletionSignal,
+  ensureManualInteractionAllowed,
+  executeStep,
+  executeStepViaCompletionSignal,
+  exportSettingsBundle,
+  fetchGeneratedEmail,
+  finalizeIcloudAliasAfterSuccessfulFlow,
+  findHotmailAccount,
+  flushCommand,
+  getCurrentLuckmailPurchase,
+  getPendingAutoRunTimerPlan,
+  getSourceLabel,
+  getState,
+  getStopRequested: () => stopRequested,
+  handleAutoRunLoopUnhandledError,
+  importSettingsBundle,
+  invalidateDownstreamAfterStepRestart,
+  isAutoRunLockedState,
+  isHotmailProvider,
+  isLocalhostOAuthCallbackUrl,
+  isLuckmailProvider,
+  isStopError,
+  launchAutoRunTimerPlan,
+  listIcloudAliases,
+  listLuckmailPurchasesForManagement,
+  normalizeHotmailAccounts,
+  normalizeRunCount,
+  AUTO_RUN_TIMER_KIND_SCHEDULED_START,
+  notifyStepComplete,
+  notifyStepError,
+  patchHotmailAccount,
+  registerTab,
+  requestStop,
+  resetState,
+  resumeAutoRun,
+  scheduleAutoRun,
+  selectLuckmailPurchase,
+  setCurrentHotmailAccount,
+  setEmailState,
+  setEmailStateSilently,
+  setIcloudAliasPreservedState,
+  setIcloudAliasUsedState,
+  setLuckmailPurchaseDisabledState,
+  setLuckmailPurchasePreservedState,
+  setLuckmailPurchaseUsedState,
+  setPersistentSettings,
+  setState,
+  setStepStatus,
+  skipAutoRunCountdown,
+  skipStep,
+  startAutoRunLoop,
+  syncHotmailAccounts,
+  testHotmailAccountMailAccess,
+  upsertHotmailAccount,
+  verifyHotmailAccount,
+});
+const stepRegistry = self.MultiPageBackgroundStepRegistry?.createStepRegistry(
+  stepDefinitions.map((definition) => ({
+    ...definition,
+    execute: stepExecutorsByKey[definition.key],
+  }))
+);
 
 async function requestOAuthUrlFromPanel(state, options = {}) {
-  if (getPanelMode(state) === 'sub2api') {
-    return requestSub2ApiOAuthUrl(state, options);
-  }
-  return requestCpaOAuthUrl(state, options);
+  return panelBridge.requestOAuthUrlFromPanel(state, options);
 }
 
 async function requestCpaOAuthUrl(state, options = {}) {
-  const { logLabel = 'OAuth 刷新' } = options;
-  if (!state.vpsUrl) {
-    throw new Error('尚未配置 CPA 地址，请先在侧边栏填写。');
-  }
-
-  await addLog(`${logLabel}：正在打开 CPA 面板...`);
-
-  const injectFiles = ['content/activation-utils.js', 'content/utils.js', 'content/vps-panel.js'];
-  await closeConflictingTabsForSource('vps-panel', state.vpsUrl);
-
-  const tab = await chrome.tabs.create({ url: state.vpsUrl, active: true });
-  const tabId = tab.id;
-  await rememberSourceLastUrl('vps-panel', state.vpsUrl);
-
-  await addLog(`${logLabel}：CPA 面板已打开，正在等待页面进入目标地址...`);
-  const matchedTab = await waitForTabUrlFamily('vps-panel', tabId, state.vpsUrl, {
-    timeoutMs: 15000,
-    retryDelayMs: 400,
-  });
-  if (!matchedTab) {
-    await addLog(`${logLabel}：CPA 页面尚未完全进入目标地址，继续尝试连接内容脚本...`, 'warn');
-  }
-
-  await ensureContentScriptReadyOnTab('vps-panel', tabId, {
-    inject: injectFiles,
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `${logLabel}：CPA 面板仍在加载，正在重试连接内容脚本...`,
-  });
-
-  const result = await sendToContentScriptResilient('vps-panel', {
-    type: 'REQUEST_OAUTH_URL',
-    source: 'background',
-    payload: {
-      vpsPassword: state.vpsPassword,
-      logStep: 6,
-    },
-  }, {
-    timeoutMs: 30000,
-    retryDelayMs: 700,
-    logMessage: `${logLabel}：CPA 面板通信未就绪，正在等待页面恢复...`,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-  return result || {};
+  return panelBridge.requestCpaOAuthUrl(state, options);
 }
 
 async function requestSub2ApiOAuthUrl(state, options = {}) {
-  const { logLabel = 'OAuth 刷新' } = options;
-  const sub2apiUrl = normalizeSub2ApiUrl(state.sub2apiUrl);
-  const groupName = (state.sub2apiGroupName || DEFAULT_SUB2API_GROUP_NAME).trim() || DEFAULT_SUB2API_GROUP_NAME;
-
-  if (!state.sub2apiEmail) {
-    throw new Error('尚未配置 SUB2API 登录邮箱，请先在侧边栏填写。');
-  }
-  if (!state.sub2apiPassword) {
-    throw new Error('尚未配置 SUB2API 登录密码，请先在侧边栏填写。');
-  }
-
-  await addLog(`${logLabel}：正在打开 SUB2API 后台...`);
-
-  const injectFiles = ['content/utils.js', 'content/sub2api-panel.js'];
-  await closeConflictingTabsForSource('sub2api-panel', sub2apiUrl);
-
-  const tab = await chrome.tabs.create({ url: sub2apiUrl, active: true });
-  const tabId = tab.id;
-  await rememberSourceLastUrl('sub2api-panel', sub2apiUrl);
-
-  await addLog(`${logLabel}：SUB2API 页面已打开，正在等待页面进入目标地址...`);
-  const matchedTab = await waitForTabUrlFamily('sub2api-panel', tabId, sub2apiUrl, {
-    timeoutMs: 15000,
-    retryDelayMs: 400,
-  });
-  if (!matchedTab) {
-    await addLog(`${logLabel}：SUB2API 页面尚未稳定，继续尝试连接内容脚本...`, 'warn');
-  }
-
-  await ensureContentScriptReadyOnTab('sub2api-panel', tabId, {
-    inject: injectFiles,
-    injectSource: 'sub2api-panel',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `${logLabel}：SUB2API 页面仍在加载，正在重试连接内容脚本...`,
-  });
-
-  const result = await sendToContentScript('sub2api-panel', {
-    type: 'REQUEST_OAUTH_URL',
-    source: 'background',
-    payload: {
-      sub2apiUrl,
-      sub2apiEmail: state.sub2apiEmail,
-      sub2apiPassword: state.sub2apiPassword,
-      sub2apiGroupName: groupName,
-      logStep: 6,
-    },
-  }, {
-    responseTimeoutMs: SUB2API_STEP1_RESPONSE_TIMEOUT_MS,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-  return result || {};
+  return panelBridge.requestSub2ApiOAuthUrl(state, options);
 }
 
 async function openSignupEntryTab(step = 1) {
-  const tabId = await reuseOrCreateTab('signup-page', SIGNUP_ENTRY_URL, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-  });
-
-  await ensureContentScriptReadyOnTab('signup-page', tabId, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `步骤 ${step}：ChatGPT 官网仍在加载，正在重试连接内容脚本...`,
-  });
-
-  return tabId;
+  return signupFlowHelpers.openSignupEntryTab(step);
 }
 
 async function ensureSignupEntryPageReady(step = 1) {
-  const tabId = await openSignupEntryTab(step);
-  const result = await sendToContentScriptResilient('signup-page', {
-    type: 'ENSURE_SIGNUP_ENTRY_READY',
-    step,
-    source: 'background',
-    payload: {},
-  }, {
-    timeoutMs: 20000,
-    retryDelayMs: 700,
-    logMessage: `步骤 ${step}：官网注册入口正在切换，等待页面恢复...`,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-
-  return { tabId, result: result || {} };
+  return signupFlowHelpers.ensureSignupEntryPageReady(step);
 }
 
 async function ensureSignupPasswordPageReadyInTab(tabId, step = 2, options = {}) {
-  const { skipUrlWait = false } = options;
+  return signupFlowHelpers.ensureSignupPasswordPageReadyInTab(tabId, step, options);
+}
 
-  if (!skipUrlWait) {
-    const matchedTab = await waitForTabUrlMatch(tabId, (url) => isSignupPasswordPageUrl(url), {
-      timeoutMs: 45000,
-      retryDelayMs: 300,
-    });
-    if (!matchedTab) {
-      throw new Error('等待进入密码页超时，请检查邮箱提交后页面是否仍停留在官网或邮箱页。');
-    }
-  }
-
-  await ensureContentScriptReadyOnTab('signup-page', tabId, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `步骤 ${step}：密码页仍在加载，正在重试连接内容脚本...`,
-  });
-
-  const result = await sendToContentScriptResilient('signup-page', {
-    type: 'ENSURE_SIGNUP_PASSWORD_PAGE_READY',
-    step,
-    source: 'background',
-    payload: {},
-  }, {
-    timeoutMs: 20000,
-    retryDelayMs: 700,
-    logMessage: `步骤 ${step}：认证页正在切换，等待密码页重新就绪...`,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-
-  return result || {};
+async function ensureSignupPostEmailPageReadyInTab(tabId, step = 2, options = {}) {
+  return signupFlowHelpers.ensureSignupPostEmailPageReadyInTab(tabId, step, options);
 }
 
 async function resolveSignupEmailForFlow(state) {
-  let resolvedEmail = state.email;
-  if (isHotmailProvider(state)) {
-    const account = await ensureHotmailAccountForFlow({
-      allowAllocate: true,
-      markUsed: true,
-      preferredAccountId: state.currentHotmailAccountId || null,
-    });
-    resolvedEmail = account.email;
-  } else if (isLuckmailProvider(state)) {
-    const purchase = await ensureLuckmailPurchaseForFlow({ allowReuse: true });
-    resolvedEmail = purchase.email_address;
-  } else if (isGeneratedAliasProvider(state)) {
-    resolvedEmail = buildGeneratedAliasEmail(state);
-  }
-
-  if (!resolvedEmail) {
-    throw new Error('缺少邮箱地址，请先在侧边栏粘贴邮箱。');
-  }
-
-  return resolvedEmail;
+  return signupFlowHelpers.resolveSignupEmailForFlow(state);
 }
 
 // ============================================================
@@ -6875,9 +5634,7 @@ async function resolveSignupEmailForFlow(state) {
 // ============================================================
 
 async function executeStep1() {
-  await addLog('步骤 1：正在打开 ChatGPT 官网...');
-  await ensureSignupEntryPageReady(1);
-  await completeStepFromBackground(1, {});
+  return step1Executor.executeStep1();
 }
 
 // ============================================================
@@ -6885,49 +5642,7 @@ async function executeStep1() {
 // ============================================================
 
 async function executeStep2(state) {
-  const resolvedEmail = await resolveSignupEmailForFlow(state);
-  if (resolvedEmail !== state.email) {
-    await setEmailState(resolvedEmail);
-  }
-
-  let signupTabId = await getTabId('signup-page');
-  if (!signupTabId || !(await isTabAlive('signup-page'))) {
-    await addLog('步骤 2：未发现可用的注册页标签，正在重新打开 ChatGPT 官网...', 'warn');
-    signupTabId = (await ensureSignupEntryPageReady(2)).tabId;
-  } else {
-    await chrome.tabs.update(signupTabId, { active: true });
-    await ensureContentScriptReadyOnTab('signup-page', signupTabId, {
-      inject: SIGNUP_PAGE_INJECT_FILES,
-      injectSource: 'signup-page',
-      timeoutMs: 45000,
-      retryDelayMs: 900,
-      logMessage: '步骤 2：注册入口页内容脚本未就绪，正在等待页面恢复...',
-    });
-  }
-
-  const step2Result = await sendToContentScriptResilient('signup-page', {
-    type: 'EXECUTE_STEP',
-    step: 2,
-    source: 'background',
-    payload: { email: resolvedEmail },
-  }, {
-    timeoutMs: 20000,
-    retryDelayMs: 700,
-    logMessage: '步骤 2：官网注册入口正在切换，等待页面恢复后继续输入邮箱...',
-  });
-
-  if (step2Result?.error) {
-    throw new Error(step2Result.error);
-  }
-
-  if (!step2Result?.alreadyOnPasswordPage) {
-    await addLog(`步骤 2：邮箱 ${resolvedEmail} 已提交，正在等待进入密码页...`);
-  }
-
-  await ensureSignupPasswordPageReadyInTab(signupTabId, 2, {
-    skipUrlWait: Boolean(step2Result?.alreadyOnPasswordPage),
-  });
-  await completeStepFromBackground(2, {});
+  return step2Executor.executeStep2(state);
 }
 
 // ============================================================
@@ -6935,41 +5650,7 @@ async function executeStep2(state) {
 // ============================================================
 
 async function executeStep3(state) {
-  const resolvedEmail = state.email;
-  if (!resolvedEmail) {
-    throw new Error('缺少邮箱地址，请先完成步骤 2。');
-  }
-
-  const signupTabId = await getTabId('signup-page');
-  if (!signupTabId || !(await isTabAlive('signup-page'))) {
-    throw new Error('认证页面标签页已关闭，请先重新完成步骤 2。');
-  }
-
-  const password = state.customPassword || generatePassword();
-  await setPasswordState(password);
-
-  const accounts = state.accounts || [];
-  accounts.push({ email: resolvedEmail, password, createdAt: new Date().toISOString() });
-  await setState({ accounts });
-
-  await chrome.tabs.update(signupTabId, { active: true });
-  await ensureContentScriptReadyOnTab('signup-page', signupTabId, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: '步骤 3：密码页内容脚本未就绪，正在等待页面恢复...',
-  });
-
-  await addLog(
-    `步骤 3：正在填写密码，邮箱为 ${resolvedEmail}，密码为${state.customPassword ? '自定义' : '自动生成'}（${password.length} 位）`
-  );
-  await sendToContentScript('signup-page', {
-    type: 'EXECUTE_STEP',
-    step: 3,
-    source: 'background',
-    payload: { email: resolvedEmail, password },
-  });
+  return step3Executor.executeStep3(state);
 }
 
 // ============================================================
@@ -7063,344 +5744,35 @@ function normalizeInbucketOrigin(rawValue) {
 }
 
 function getVerificationCodeStateKey(step) {
-  return step === 4 ? 'lastSignupCode' : 'lastLoginCode';
+  return verificationFlowHelpers.getVerificationCodeStateKey(step);
 }
 
 function getVerificationCodeLabel(step) {
-  return step === 4 ? '注册' : '登录';
+  return verificationFlowHelpers.getVerificationCodeLabel(step);
 }
 
 async function confirmCustomVerificationStepBypass(step) {
-  const verificationLabel = getVerificationCodeLabel(step);
-  await addLog(`步骤 ${step}：当前为自定义邮箱模式，请手动在页面中输入${verificationLabel}验证码并进入下一页面。`, 'warn');
-
-  let response = null;
-  try {
-    response = await chrome.runtime.sendMessage({
-      type: 'REQUEST_CUSTOM_VERIFICATION_BYPASS_CONFIRMATION',
-      payload: { step },
-    });
-  } catch {
-    throw new Error(`步骤 ${step}：无法打开确认弹窗，请先保持侧边栏打开后重试。`);
-  }
-
-  if (response?.error) {
-    throw new Error(response.error);
-  }
-  if (!response?.confirmed) {
-    throw new Error(`步骤 ${step}：已取消手动${verificationLabel}验证码确认。`);
-  }
-
-  await setState({
-    lastEmailTimestamp: null,
-    signupVerificationRequestedAt: null,
-    loginVerificationRequestedAt: null,
-  });
-  await setStepStatus(step, 'skipped');
-  await addLog(`步骤 ${step}：已确认手动完成${verificationLabel}验证码输入，当前步骤已跳过。`, 'warn');
+  return verificationFlowHelpers.confirmCustomVerificationStepBypass(step);
 }
 
 function getVerificationPollPayload(step, state, overrides = {}) {
-  const is2925Provider = state?.mailProvider === '2925';
-  if (step === 4) {
-    return {
-      filterAfterTimestamp: getHotmailVerificationRequestTimestamp(4, state),
-      senderFilters: ['openai', 'noreply', 'verify', 'auth', 'duckduckgo', 'forward'],
-      subjectFilters: ['verify', 'verification', 'code', '楠岃瘉', 'confirm'],
-      targetEmail: state.email,
-      maxAttempts: is2925Provider ? MAIL_2925_VERIFICATION_MAX_ATTEMPTS : 5,
-      intervalMs: is2925Provider ? MAIL_2925_VERIFICATION_INTERVAL_MS : 3000,
-      ...overrides,
-    };
-  }
-
-  return {
-    filterAfterTimestamp: getHotmailVerificationRequestTimestamp(7, state),
-    senderFilters: ['openai', 'noreply', 'verify', 'auth', 'chatgpt', 'duckduckgo', 'forward'],
-    subjectFilters: ['verify', 'verification', 'code', '楠岃瘉', 'confirm', 'login'],
-    targetEmail: state.email,
-    maxAttempts: is2925Provider ? MAIL_2925_VERIFICATION_MAX_ATTEMPTS : 5,
-    intervalMs: is2925Provider ? MAIL_2925_VERIFICATION_INTERVAL_MS : 3000,
-    ...overrides,
-  };
+  return verificationFlowHelpers.getVerificationPollPayload(step, state, overrides);
 }
 
 async function requestVerificationCodeResend(step) {
-  throwIfStopped();
-  const signupTabId = await getTabId('signup-page');
-  if (!signupTabId) {
-    throw new Error('认证页面标签页已关闭，无法重新请求验证码。');
-  }
-
-  throwIfStopped();
-  await chrome.tabs.update(signupTabId, { active: true });
-  await recoverSignupPageFromMethodNotAllowed(4);
-  throwIfStopped();
-  await addLog(`步骤 ${step}：正在请求新的${getVerificationCodeLabel(step)}验证码...`, 'warn');
-  throwIfStopped();
-
-  const result = await sendToContentScript('signup-page', {
-    type: 'RESEND_VERIFICATION_CODE',
-    step,
-    source: 'background',
-    payload: {},
-  });
-
-  if (result && result.error) {
-    throw new Error(result.error);
-  }
-
-  const requestedAt = Date.now();
-  if (step === 7) {
-    await setState({ loginVerificationRequestedAt: requestedAt });
-  }
-
-  const currentState = await getState();
-  if (currentState.mailProvider === '2925') {
-    const mailTabId = await getTabId('mail-2925');
-    if (mailTabId) {
-      await chrome.tabs.update(mailTabId, { active: true });
-      await addLog(`步骤 ${step}：已切换到 2925 邮箱标签页等待新邮件。`, 'info');
-    }
-  }
-
-  return requestedAt;
+  return verificationFlowHelpers.requestVerificationCodeResend(step);
 }
 
 async function pollFreshVerificationCode(step, state, mail, pollOverrides = {}) {
-  const { onResendRequestedAt, ...cleanPollOverrides } = pollOverrides;
-
-  if (mail.provider === HOTMAIL_PROVIDER) {
-    const hotmailPollConfig = getHotmailVerificationPollConfig(step);
-    return pollHotmailVerificationCode(step, state, {
-      ...getVerificationPollPayload(step, state),
-      ...hotmailPollConfig,
-      ...cleanPollOverrides,
-    });
-  }
-  if (mail.provider === LUCKMAIL_PROVIDER) {
-    return pollLuckmailVerificationCode(step, state, {
-      ...getVerificationPollPayload(step, state),
-      ...pollOverrides,
-    });
-  }
-  if (mail.provider === CLOUDFLARE_TEMP_EMAIL_PROVIDER) {
-    return pollCloudflareTempEmailVerificationCode(step, state, {
-      ...getVerificationPollPayload(step, state),
-      ...pollOverrides,
-    });
-  }
-
-  if (Number(pollOverrides.resendIntervalMs) > 0) {
-    return pollFreshVerificationCodeWithResendInterval(step, state, mail, pollOverrides);
-  }
-
-  const stateKey = getVerificationCodeStateKey(step);
-  const rejectedCodes = new Set();
-  if (state[stateKey]) {
-    rejectedCodes.add(state[stateKey]);
-  }
-  for (const code of (pollOverrides.excludeCodes || [])) {
-    if (code) rejectedCodes.add(code);
-  }
-
-  let lastError = null;
-  let filterAfterTimestamp = cleanPollOverrides.filterAfterTimestamp ?? getVerificationPollPayload(step, state).filterAfterTimestamp;
-  const maxRounds = pollOverrides.maxRounds || VERIFICATION_POLL_MAX_ROUNDS;
-
-  for (let round = 1; round <= maxRounds; round++) {
-    throwIfStopped();
-    if (round > 1) {
-      const requestedAt = await requestVerificationCodeResend(step);
-      if (typeof onResendRequestedAt === 'function') {
-        const nextFilterAfterTimestamp = await onResendRequestedAt(requestedAt);
-        if (nextFilterAfterTimestamp !== undefined) {
-          filterAfterTimestamp = nextFilterAfterTimestamp;
-        }
-      }
-    }
-
-    const payload = getVerificationPollPayload(step, state, {
-      ...cleanPollOverrides,
-      filterAfterTimestamp,
-      excludeCodes: [...rejectedCodes],
-    });
-
-    try {
-      const result = await sendToMailContentScriptResilient(
-        mail,
-        {
-          type: 'POLL_EMAIL',
-          step,
-          source: 'background',
-          payload,
-        },
-        {
-          timeoutMs: 45000,
-          maxRecoveryAttempts: 2,
-        }
-      );
-
-      if (result && result.error) {
-        throw new Error(result.error);
-      }
-
-      if (!result || !result.code) {
-        throw new Error(`步骤 ${step}：邮箱轮询结束，但未获取到验证码。`);
-      }
-
-      if (rejectedCodes.has(result.code)) {
-        throw new Error(`步骤 ${step}：再次收到了相同的${getVerificationCodeLabel(step)}验证码：${result.code}`);
-      }
-
-      return result;
-    } catch (err) {
-      if (isStopError(err)) {
-        throw err;
-      }
-      lastError = err;
-      await addLog(`步骤 ${step}：${err.message}`, 'warn');
-      if (round < maxRounds) {
-        await addLog(`步骤 ${step}：将重新发送验证码后重试（${round + 1}/${maxRounds}）...`, 'warn');
-      }
-    }
-  }
-
-  throw lastError || new Error(`步骤 ${step}：无法获取新的${getVerificationCodeLabel(step)}验证码。`);
+  return verificationFlowHelpers.pollFreshVerificationCode(step, state, mail, pollOverrides);
 }
 
 async function pollFreshVerificationCodeWithResendInterval(step, state, mail, pollOverrides = {}) {
-  const stateKey = getVerificationCodeStateKey(step);
-  const rejectedCodes = new Set();
-  if (state[stateKey]) {
-    rejectedCodes.add(state[stateKey]);
-  }
-  for (const code of (pollOverrides.excludeCodes || [])) {
-    if (code) rejectedCodes.add(code);
-  }
-
-  const {
-    maxRounds: _ignoredMaxRounds,
-    resendIntervalMs: _ignoredResendIntervalMs,
-    lastResendAt: _ignoredLastResendAt,
-    onResendRequestedAt: _ignoredOnResendRequestedAt,
-    ...payloadOverrides
-  } = pollOverrides;
-  const onResendRequestedAt = typeof pollOverrides.onResendRequestedAt === 'function'
-    ? pollOverrides.onResendRequestedAt
-    : null;
-  let lastError = null;
-  let filterAfterTimestamp = payloadOverrides.filterAfterTimestamp ?? getVerificationPollPayload(step, state).filterAfterTimestamp;
-  const maxRounds = pollOverrides.maxRounds || VERIFICATION_POLL_MAX_ROUNDS;
-  const resendIntervalMs = Math.max(0, Number(pollOverrides.resendIntervalMs) || 0);
-  let lastResendAt = Number(pollOverrides.lastResendAt) || 0;
-
-  for (let round = 1; round <= maxRounds; round++) {
-    throwIfStopped();
-    if (round > 1) {
-      lastResendAt = await requestVerificationCodeResend(step);
-      if (onResendRequestedAt) {
-        const nextFilterAfterTimestamp = await onResendRequestedAt(lastResendAt);
-        if (nextFilterAfterTimestamp !== undefined) {
-          filterAfterTimestamp = nextFilterAfterTimestamp;
-        }
-      }
-    }
-
-    while (true) {
-      throwIfStopped();
-      const payload = getVerificationPollPayload(step, state, {
-        ...payloadOverrides,
-        filterAfterTimestamp,
-        excludeCodes: [...rejectedCodes],
-      });
-
-      if (lastResendAt > 0) {
-        const remainingBeforeResendMs = Math.max(0, resendIntervalMs - (Date.now() - lastResendAt));
-        const baseMaxAttempts = Math.max(1, Number(payload.maxAttempts) || 5);
-        const intervalMs = Math.max(1, Number(payload.intervalMs) || 3000);
-        payload.maxAttempts = Math.max(1, Math.min(baseMaxAttempts, Math.floor(remainingBeforeResendMs / intervalMs) + 1));
-      }
-
-      try {
-        const result = await sendToMailContentScriptResilient(
-          mail,
-          {
-            type: 'POLL_EMAIL',
-            step,
-            source: 'background',
-            payload,
-          },
-          {
-            timeoutMs: 45000,
-            maxRecoveryAttempts: 2,
-          }
-        );
-
-        if (result && result.error) {
-          throw new Error(result.error);
-        }
-
-        if (!result || !result.code) {
-          throw new Error(`步骤 ${step}：邮箱轮询结束，但未获取到验证码。`);
-        }
-
-        if (rejectedCodes.has(result.code)) {
-          throw new Error(`步骤 ${step}：再次收到了相同的${getVerificationCodeLabel(step)}验证码：${result.code}`);
-        }
-
-        return {
-          ...result,
-          lastResendAt,
-        };
-      } catch (err) {
-        if (isStopError(err)) {
-          throw err;
-        }
-        lastError = err;
-        await addLog(`步骤 ${step}：${err.message}`, 'warn');
-      }
-
-      const remainingBeforeResendMs = lastResendAt > 0
-        ? Math.max(0, resendIntervalMs - (Date.now() - lastResendAt))
-        : 0;
-      if (remainingBeforeResendMs > 0) {
-        await addLog(
-          `步骤 ${step}：距离下次重新发送验证码还差 ${Math.ceil(remainingBeforeResendMs / 1000)} 秒，继续刷新邮箱（第 ${round}/${maxRounds} 轮）...`,
-          'info'
-        );
-        continue;
-      }
-
-      if (round < maxRounds) {
-        await addLog(`步骤 ${step}：已到 25 秒重发间隔，准备重新发送验证码（第 ${round + 1}/${maxRounds} 轮）...`, 'warn');
-      }
-      break;
-    }
-  }
-
-  throw lastError || new Error(`步骤 ${step}：无法获取新的${getVerificationCodeLabel(step)}验证码。`);
+  return verificationFlowHelpers.pollFreshVerificationCodeWithResendInterval(step, state, mail, pollOverrides);
 }
 
 async function submitVerificationCode(step, code) {
-  const signupTabId = await getTabId('signup-page');
-  if (!signupTabId) {
-    throw new Error('认证页面标签页已关闭，无法填写验证码。');
-  }
-
-  await chrome.tabs.update(signupTabId, { active: true });
-  const result = await sendToContentScript('signup-page', {
-    type: 'FILL_CODE',
-    step,
-    source: 'background',
-    payload: { code },
-  });
-
-  if (result && result.error) {
-    throw new Error(result.error);
-  }
-
-  return result || {};
+  return verificationFlowHelpers.submitVerificationCode(step, code);
 }
 
 async function submitVerificationCodeWithPageRecovery(step, code, options = {}) {
@@ -7481,188 +5853,11 @@ async function prepareStep4VerificationPageWithRecovery(state, options = {}) {
 }
 
 async function resolveVerificationStep(step, state, mail, options = {}) {
-  const stateKey = getVerificationCodeStateKey(step);
-  const rejectedCodes = new Set();
-  const hotmailPollConfig = mail.provider === HOTMAIL_PROVIDER
-    ? getHotmailVerificationPollConfig(step)
-    : null;
-  const beforeSubmit = typeof options.beforeSubmit === 'function'
-    ? options.beforeSubmit
-    : null;
-  const ignorePersistedLastCode = Boolean(hotmailPollConfig?.ignorePersistedLastCode);
-  if (state[stateKey] && !ignorePersistedLastCode) {
-    rejectedCodes.add(state[stateKey]);
-  }
-
-  let nextFilterAfterTimestamp = options.filterAfterTimestamp ?? null;
-  const requestFreshCodeFirst = options.requestFreshCodeFirst !== undefined
-    ? Boolean(options.requestFreshCodeFirst)
-    : (hotmailPollConfig?.requestFreshCodeFirst ?? false);
-  const maxSubmitAttempts = 3;
-  const resendIntervalMs = Math.max(0, Number(options.resendIntervalMs) || 0);
-  let lastResendAt = Number(options.lastResendAt) || 0;
-
-  const updateFilterAfterTimestampForStep7 = async (requestedAt) => {
-    if (step !== 7 || !requestedAt) {
-      return nextFilterAfterTimestamp;
-    }
-
-    if (mail.provider === HOTMAIL_PROVIDER) {
-      nextFilterAfterTimestamp = getHotmailVerificationRequestTimestamp(7, {
-        ...state,
-        loginVerificationRequestedAt: requestedAt,
-      });
-    } else {
-      nextFilterAfterTimestamp = Math.max(0, Number(requestedAt) - 60000);
-    }
-
-    return nextFilterAfterTimestamp;
-  };
-
-  if (requestFreshCodeFirst) {
-    try {
-      lastResendAt = await requestVerificationCodeResend(step);
-      await updateFilterAfterTimestampForStep7(lastResendAt);
-      await addLog(`步骤 ${step}：已先请求一封新的${getVerificationCodeLabel(step)}验证码，再开始轮询邮箱。`, 'warn');
-    } catch (err) {
-      if (isStopError(err)) {
-        throw err;
-      }
-      await addLog(`步骤 ${step}：首次重新获取验证码失败：${err.message}，将继续使用当前时间窗口轮询。`, 'warn');
-    }
-  }
-
-  if (mail.provider === HOTMAIL_PROVIDER) {
-    const initialDelayMs = Number(options.initialDelayMs ?? hotmailPollConfig.initialDelayMs) || 0;
-    if (initialDelayMs > 0) {
-      await addLog(`步骤 ${step}：等待 ${Math.round(initialDelayMs / 1000)} 秒，让 Hotmail 验证码邮件先到达...`, 'info');
-      await sleepWithStop(initialDelayMs);
-    }
-  }
-
-  for (let attempt = 1; attempt <= maxSubmitAttempts; attempt++) {
-    if (step === 4) {
-      await recoverSignupPageFromMethodNotAllowed(4);
-    }
-    const result = await pollFreshVerificationCode(step, state, mail, {
-      excludeCodes: [...rejectedCodes],
-      filterAfterTimestamp: nextFilterAfterTimestamp ?? undefined,
-      resendIntervalMs,
-      lastResendAt,
-      onResendRequestedAt: updateFilterAfterTimestampForStep7,
-    });
-    lastResendAt = Number(result?.lastResendAt) || lastResendAt;
-
-    throwIfStopped();
-    await addLog(`步骤 ${step}：已获取${getVerificationCodeLabel(step)}验证码：${result.code}`);
-    if (beforeSubmit) {
-      await beforeSubmit(result, {
-        attempt,
-        rejectedCodes: new Set(rejectedCodes),
-        filterAfterTimestamp: nextFilterAfterTimestamp ?? undefined,
-        lastResendAt,
-      });
-    }
-    throwIfStopped();
-    const submitResult = await submitVerificationCodeWithPageRecovery(step, result.code);
-
-    if (submitResult.invalidCode) {
-      rejectedCodes.add(result.code);
-      await addLog(`步骤 ${step}：验证码被页面拒绝：${submitResult.errorText || result.code}`, 'warn');
-
-      if (attempt >= maxSubmitAttempts) {
-        throw new Error(`步骤 ${step}：验证码连续失败，已达到 ${maxSubmitAttempts} 次重试上限。`);
-      }
-
-      const remainingBeforeResendMs = resendIntervalMs > 0 && lastResendAt > 0
-        ? Math.max(0, resendIntervalMs - (Date.now() - lastResendAt))
-        : 0;
-      if (remainingBeforeResendMs > 0) {
-        await addLog(
-          `步骤 ${step}：提交失败后距离下次重新发送验证码还差 ${Math.ceil(remainingBeforeResendMs / 1000)} 秒，先继续刷新邮箱（${attempt + 1}/${maxSubmitAttempts}）...`,
-          'warn'
-        );
-        continue;
-      }
-
-      lastResendAt = await requestVerificationCodeResend(step);
-      await updateFilterAfterTimestampForStep7(lastResendAt);
-      await addLog(`步骤 ${step}：提交失败后已请求新验证码（${attempt + 1}/${maxSubmitAttempts}）...`, 'warn');
-      continue;
-    }
-
-    await setState({
-      lastEmailTimestamp: result.emailTimestamp,
-      [stateKey]: result.code,
-    });
-
-    await completeStepFromBackground(step, {
-      emailTimestamp: result.emailTimestamp,
-      code: result.code,
-    });
-    return;
-  }
+  return verificationFlowHelpers.resolveVerificationStep(step, state, mail, options);
 }
 
 async function executeStep4(state) {
-  const mail = getMailConfig(state);
-  if (mail.error) throw new Error(mail.error);
-  const stepStartedAt = Date.now();
-  const signupTabId = await getTabId('signup-page');
-  if (!signupTabId) {
-    throw new Error('认证页面标签页已关闭，无法继续步骤 4。');
-  }
-
-  await chrome.tabs.update(signupTabId, { active: true });
-  await recoverSignupPageFromMethodNotAllowed(4);
-  throwIfStopped();
-  await addLog('步骤 4：正在确认注册验证码页面是否就绪，必要时自动恢复密码页超时报错...');
-  const prepareResult = await prepareStep4VerificationPageWithRecovery(state);
-  if (prepareResult?.alreadyVerified) {
-    await completeStepFromBackground(4, {});
-    return;
-  }
-
-  if (shouldUseCustomRegistrationEmail(state)) {
-    await confirmCustomVerificationStepBypass(4);
-    return;
-  }
-
-  throwIfStopped();
-  if (mail.provider === HOTMAIL_PROVIDER || mail.provider === LUCKMAIL_PROVIDER || mail.provider === CLOUDFLARE_TEMP_EMAIL_PROVIDER) {
-    await addLog(`步骤 4：正在通过 ${mail.label} 轮询验证码...`);
-  } else {
-    await addLog(`步骤 4：正在打开${mail.label}...`);
-
-    // For mail tabs, only create if not alive — don't navigate (preserves login session)
-    const alive = await isTabAlive(mail.source);
-    if (alive) {
-      if (mail.navigateOnReuse) {
-        await reuseOrCreateTab(mail.source, mail.url, {
-          inject: mail.inject,
-          injectSource: mail.injectSource,
-        });
-      } else {
-        const tabId = await getTabId(mail.source);
-        await chrome.tabs.update(tabId, { active: true });
-      }
-    } else {
-      await reuseOrCreateTab(mail.source, mail.url, {
-        inject: mail.inject,
-        injectSource: mail.injectSource,
-      });
-    }
-  }
-
-  await recoverSignupPageFromMethodNotAllowed(4);
-  await resolveVerificationStep(4, state, mail, {
-    filterAfterTimestamp: mail.provider === HOTMAIL_PROVIDER ? undefined : stepStartedAt,
-    requestFreshCodeFirst: mail.provider === HOTMAIL_PROVIDER ? false : true,
-    resendIntervalMs: (mail.provider === HOTMAIL_PROVIDER || mail.provider === '2925')
-      ? 0
-      : STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS,
-  });
-  return;
+  return step4Executor.executeStep4(state);
 }
 
 // ============================================================
@@ -7670,41 +5865,7 @@ async function executeStep4(state) {
 // ============================================================
 
 async function executeStep5(state) {
-  const { firstName, lastName } = generateRandomName();
-  const { year, month, day } = generateRandomBirthday();
-
-  await addLog(`步骤 5：已生成姓名 ${firstName} ${lastName}，生日 ${year}-${month}-${day}`);
-
-  const result = await sendToContentScript('signup-page', {
-    type: 'EXECUTE_STEP',
-    step: 5,
-    source: 'background',
-    payload: { firstName, lastName, year, month, day },
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-
-  if (result?.skipToStep6) {
-    await addLog('步骤 5：检测到已进入 ChatGPT 欢迎页，跳过资料填写并直接继续步骤 6。', 'warn');
-    await completeStepFromBackground(5, {
-      skipped: true,
-      skipToStep6: true,
-      reason: result.reason || 'welcome_page_after_signup',
-      url: result.url || '',
-    });
-    return;
-  }
-
-  if (result?.assumed) {
-    await addLog('步骤 5：提交资料后页面已离开生日表单，按成功继续进入步骤 6。', 'warn');
-    await completeStepFromBackground(5, {
-      assumed: true,
-      reason: result.reason || 'step5_form_disappeared_after_submit',
-      url: result.url || '',
-    });
-  }
+  return step5Executor.executeStep5(state);
 }
 
 // ============================================================
@@ -7851,7 +6012,69 @@ function isStep6RecoverableResult(result) {
   return result?.step6Outcome === 'recoverable';
 }
 
-async function getLoginAuthStateFromContent() {
+function isAddPhoneAuthUrl(url) {
+  return /https:\/\/auth\.openai\.com\/add-phone(?:[/?#]|$)/i.test(String(url || '').trim());
+}
+
+function isAddPhoneAuthState(authState = {}) {
+  return authState?.state === 'add_phone_page'
+    || Boolean(authState?.addPhonePage)
+    || isAddPhoneAuthUrl(authState?.url);
+}
+
+async function getPostStep6AutoRestartDecision(step, error) {
+  const normalizedStep = Number(step);
+  const errorMessage = getErrorMessage(error);
+  if (!Number.isFinite(normalizedStep) || normalizedStep < 6 || normalizedStep > 9) {
+    return {
+      shouldRestart: false,
+      blockedByAddPhone: false,
+      errorMessage,
+      authState: null,
+    };
+  }
+
+  if (isAddPhoneAuthUrl(errorMessage)) {
+    return {
+      shouldRestart: false,
+      blockedByAddPhone: true,
+      errorMessage,
+      authState: null,
+    };
+  }
+
+  let authState = null;
+  try {
+    authState = await getLoginAuthStateFromContent({
+      logMessage: `步骤 ${normalizedStep}：正在确认当前认证页状态，以决定是否回到步骤 6 重开...`,
+    });
+  } catch (inspectError) {
+    console.warn(LOG_PREFIX, '[AutoRun] failed to inspect login auth state after post-step6 error', {
+      step: normalizedStep,
+      sourceError: errorMessage,
+      inspectError: inspectError?.message || inspectError,
+    });
+  }
+
+  if (isAddPhoneAuthState(authState)) {
+    return {
+      shouldRestart: false,
+      blockedByAddPhone: true,
+      errorMessage,
+      authState,
+    };
+  }
+
+  return {
+    shouldRestart: true,
+    blockedByAddPhone: false,
+    errorMessage,
+    authState,
+  };
+}
+
+async function getLoginAuthStateFromContent(options = {}) {
+  const { logMessage = '步骤 7：认证页正在切换，等待页面重新就绪后继续确认验证码页状态...' } = options;
   const result = await sendToContentScriptResilient(
     'signup-page',
     {
@@ -7862,7 +6085,7 @@ async function getLoginAuthStateFromContent() {
     {
       timeoutMs: 15000,
       retryDelayMs: 600,
-      logMessage: '步骤 7：认证页正在切换，等待页面重新就绪后继续确认验证码页状态...',
+      logMessage,
     }
   );
 
@@ -7956,231 +6179,15 @@ async function skipLoginVerificationStepsForCpaCallback() {
 }
 
 async function executeStep6(state, options = {}) {
-  const { skipPreLoginCleanup = false } = options;
-  if (shouldSkipLoginVerificationForCpaCallback(state)) {
-    await skipLoginVerificationStepsForCpaCallback();
-    return;
-  }
-  if (!state.email) {
-    throw new Error('缺少邮箱地址，请先完成步骤 3。');
-  }
-
-  if (!skipPreLoginCleanup) {
-    await runPreStep6CookieCleanup();
-  }
-
-  let attempt = 0;
-  let lastError = null;
-
-  while (attempt < STEP6_MAX_ATTEMPTS) {
-    throwIfStopped();
-    attempt += 1;
-
-    try {
-      const currentState = attempt === 1 ? state : await getState();
-      const password = currentState.password || currentState.customPassword || '';
-      const oauthUrl = await refreshOAuthUrlBeforeStep6(currentState);
-
-      if (attempt === 1) {
-        await addLog('步骤 6：正在打开最新 OAuth 链接并登录...');
-      } else {
-        await addLog(`步骤 6：上一轮失败后，正在进行第 ${attempt} 次尝试（最多 ${STEP6_MAX_ATTEMPTS} 次）...`, 'warn');
-      }
-
-      await reuseOrCreateTab('signup-page', oauthUrl);
-
-      const result = await sendToContentScriptResilient(
-        'signup-page',
-        {
-          type: 'EXECUTE_STEP',
-          step: 6,
-          source: 'background',
-          payload: {
-            email: currentState.email,
-            password,
-          },
-        },
-        {
-          timeoutMs: 180000,
-          retryDelayMs: 700,
-          logMessage: '步骤 6：认证页正在切换，等待页面重新就绪后继续登录...',
-        }
-      );
-
-      if (result?.error) {
-        throw new Error(result.error);
-      }
-
-      if (isStep6SuccessResult(result)) {
-        await completeStepFromBackground(6, {
-          loginVerificationRequestedAt: result.loginVerificationRequestedAt || null,
-        });
-        return;
-      }
-
-      if (isStep6RecoverableResult(result)) {
-        const reasonMessage = result.message
-          || `当前停留在${getLoginAuthStateLabel(result.state)}，准备重新执行步骤 6。`;
-        throw new Error(reasonMessage);
-      }
-
-      throw new Error('步骤 6：认证页未返回可识别的登录结果。');
-    } catch (err) {
-      throwIfStopped(err);
-      lastError = err;
-      const errorMessage = getErrorMessage(err);
-
-      if (attempt >= STEP6_MAX_ATTEMPTS) {
-        break;
-      }
-
-      await addLog(`步骤 6：第 ${attempt} 次尝试失败，原因：${errorMessage}；准备重试...`, 'warn');
-    }
-  }
-
-  throw new Error(`步骤 6：判断失败后已重试 2 次，仍未成功。最后原因：${getErrorMessage(lastError)}`);
+  return step6Executor.executeStep6(state, options);
 }
 
 // ============================================================
 // Step 7: Poll login verification mail and submit the login code
 // ============================================================
 
-async function runStep7Attempt(state) {
-  const mail = getMailConfig(state);
-  if (mail.error) throw new Error(mail.error);
-  const stepStartedAt = Date.now();
-  const authTabId = await getTabId('signup-page');
-
-  if (authTabId) {
-    await chrome.tabs.update(authTabId, { active: true });
-  } else {
-    if (!state.oauthUrl) {
-      throw new Error('缺少登录用 OAuth 链接，请先完成步骤 6。');
-    }
-    await reuseOrCreateTab('signup-page', state.oauthUrl);
-  }
-
-  throwIfStopped();
-  await ensureStep7VerificationPageReady();
-  await addLog('步骤 7：登录验证码页面已就绪，开始获取验证码。', 'info');
-
-  if (shouldUseCustomRegistrationEmail(state)) {
-    await confirmCustomVerificationStepBypass(7);
-    return;
-  }
-
-  throwIfStopped();
-  if (mail.provider === HOTMAIL_PROVIDER || mail.provider === LUCKMAIL_PROVIDER || mail.provider === CLOUDFLARE_TEMP_EMAIL_PROVIDER) {
-    await addLog(`步骤 7：正在通过 ${mail.label} 轮询验证码...`);
-  } else {
-    await addLog(`步骤 7：正在打开${mail.label}...`);
-
-    const alive = await isTabAlive(mail.source);
-    if (alive) {
-      if (mail.navigateOnReuse) {
-        await reuseOrCreateTab(mail.source, mail.url, {
-          inject: mail.inject,
-          injectSource: mail.injectSource,
-        });
-      } else {
-        const tabId = await getTabId(mail.source);
-        await chrome.tabs.update(tabId, { active: true });
-      }
-    } else {
-      await reuseOrCreateTab(mail.source, mail.url, {
-        inject: mail.inject,
-        injectSource: mail.injectSource,
-      });
-    }
-  }
-
-  const shouldRefreshOAuthBeforeSubmit = getPanelMode(state) === 'cpa';
-  let step6ReplayCompleted = false;
-
-  await resolveVerificationStep(7, state, mail, {
-    filterAfterTimestamp: mail.provider === HOTMAIL_PROVIDER ? undefined : Math.max(0, stepStartedAt - 60000),
-    requestFreshCodeFirst: false,
-    resendIntervalMs: (mail.provider === HOTMAIL_PROVIDER || mail.provider === '2925')
-      ? 0
-      : STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS,
-    beforeSubmit: shouldRefreshOAuthBeforeSubmit ? async (result) => {
-      if (step6ReplayCompleted) {
-        return;
-      }
-
-      step6ReplayCompleted = true;
-      await addLog(`步骤 7：已拿到登录验证码 ${result.code}，先刷新 CPA OAuth 链接并重走步骤 6，再回填验证码。`, 'warn');
-      await rerunStep6ForStep7Recovery({
-        logMessage: '步骤 7：正在重新获取最新 CPA OAuth 链接，并快速重走步骤 6...',
-        skipPreLoginCleanup: true,
-        postStepDelayMs: 1200,
-      });
-      await ensureStep7VerificationPageReady();
-      await addLog('步骤 7：登录验证码页面已重新就绪，开始回填刚才获取到的验证码。', 'info');
-    } : undefined,
-  });
-}
-
-async function rerunStep6ForStep7Recovery(options = {}) {
-  const {
-    logMessage = '步骤 7：正在回到步骤 6，重新发起登录验证码流程...',
-    skipPreLoginCleanup = false,
-    postStepDelayMs = 3000,
-  } = options;
-  const currentState = await getState();
-  await addLog(logMessage, 'warn');
-  await executeStep6(currentState, { skipPreLoginCleanup });
-  if (postStepDelayMs > 0) {
-    await sleepWithStop(postStepDelayMs);
-  }
-}
-
 async function executeStep7(state) {
-  if (shouldSkipLoginVerificationForCpaCallback(state)) {
-    await setState({
-      lastLoginCode: null,
-      loginVerificationRequestedAt: null,
-    });
-    await setStepStatus(7, 'skipped');
-    await addLog('步骤 7：当前已选择“第六步回调”，本轮无需获取登录验证码。', 'warn');
-    return;
-  }
-
-  let currentState = state;
-  let mailPollingAttempt = 1;
-  let lastMailPollingError = null;
-
-  while (true) {
-    try {
-      await runStep7Attempt(currentState);
-      return;
-    } catch (err) {
-      if (!isVerificationMailPollingError(err)) {
-        throw err;
-      }
-
-      lastMailPollingError = err;
-      if (mailPollingAttempt >= STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS) {
-        break;
-      }
-
-      mailPollingAttempt += 1;
-      await addLog(
-        `步骤 7：检测到邮箱轮询类失败，准备从步骤 6 重新开始（${mailPollingAttempt}/${STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS}）...`,
-        'warn'
-      );
-      await rerunStep6ForStep7Recovery();
-      currentState = await getState();
-    }
-  }
-
-  if (lastMailPollingError) {
-    throw new Error(
-      `步骤 7：登录验证码流程在 ${STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS} 轮邮箱轮询恢复后仍未成功。最后一次原因：${lastMailPollingError.message}`
-    );
-  }
-
-  throw new Error('步骤 7：登录验证码流程未成功完成。');
+  return step7Executor.executeStep7(state);
 }
 
 // ============================================================
@@ -8202,6 +6209,34 @@ const STEP8_STRATEGIES = [
   { mode: 'content', strategy: 'dispatchClick', label: 'dispatch click' },
   { mode: 'debugger', label: 'debugger click retry' },
 ];
+
+function setWebNavListener(listener) {
+  webNavListener = listener;
+}
+
+function getWebNavListener() {
+  return webNavListener;
+}
+
+function setWebNavCommittedListener(listener) {
+  webNavCommittedListener = listener;
+}
+
+function getWebNavCommittedListener() {
+  return webNavCommittedListener;
+}
+
+function setStep8TabUpdatedListener(listener) {
+  step8TabUpdatedListener = listener;
+}
+
+function getStep8TabUpdatedListener() {
+  return step8TabUpdatedListener;
+}
+
+function setStep8PendingReject(handler) {
+  step8PendingReject = handler;
+}
 
 function cleanupStep8NavigationListeners() {
   if (webNavListener) {
@@ -8431,139 +6466,41 @@ function getStep8EffectLabel(effect) {
   }
 }
 
+const step8Executor = self.MultiPageBackgroundStep8?.createStep8Executor({
+  addLog,
+  chrome,
+  cleanupStep8NavigationListeners,
+  clickWithDebugger,
+  completeStepFromBackground,
+  ensureStep8SignupPageReady,
+  getStep8CallbackUrlFromNavigation,
+  getStep8CallbackUrlFromTabUpdate,
+  getStep8EffectLabel,
+  getTabId,
+  getWebNavCommittedListener,
+  getWebNavListener,
+  getStep8TabUpdatedListener,
+  isTabAlive,
+  prepareStep8DebuggerClick,
+  reloadStep8ConsentPage,
+  reuseOrCreateTab,
+  setStep8PendingReject,
+  setStep8TabUpdatedListener,
+  setWebNavCommittedListener,
+  setWebNavListener,
+  sleepWithStop,
+  STEP8_CLICK_RETRY_DELAY_MS,
+  STEP8_MAX_ROUNDS,
+  STEP8_READY_WAIT_TIMEOUT_MS,
+  STEP8_STRATEGIES,
+  throwIfStep8SettledOrStopped,
+  triggerStep8ContentStrategy,
+  waitForStep8ClickEffect,
+  waitForStep8Ready,
+});
+
 async function executeStep8(state) {
-  if (!state.oauthUrl) {
-    throw new Error('缺少登录用 OAuth 链接，请先完成步骤 6。');
-  }
-
-  await addLog('步骤 8：正在监听 localhost 回调地址...');
-
-  return new Promise((resolve, reject) => {
-    let resolved = false;
-    let signupTabId = null;
-
-    const cleanupListener = () => {
-      cleanupStep8NavigationListeners();
-      step8PendingReject = null;
-    };
-
-    const rejectStep8 = (error) => {
-      if (resolved) return;
-      resolved = true;
-      clearTimeout(timeout);
-      cleanupListener();
-      reject(error);
-    };
-
-    const finalizeStep8Callback = (callbackUrl) => {
-      if (resolved || !callbackUrl) return;
-
-      resolved = true;
-      cleanupListener();
-      clearTimeout(timeout);
-
-      addLog(`步骤 8：已捕获 localhost 地址：${callbackUrl}`, 'ok').then(() => {
-        return completeStepFromBackground(8, { localhostUrl: callbackUrl });
-      }).then(() => {
-        resolve();
-      }).catch((err) => {
-        reject(err);
-      });
-    };
-
-    const timeout = setTimeout(() => {
-      rejectStep8(new Error('120 秒内未捕获到 localhost 回调跳转，步骤 8 的点击可能被拦截了。'));
-    }, 120000);
-
-    step8PendingReject = (error) => {
-      rejectStep8(error);
-    };
-
-    webNavListener = (details) => {
-      const callbackUrl = getStep8CallbackUrlFromNavigation(details, signupTabId);
-      finalizeStep8Callback(callbackUrl);
-    };
-
-    webNavCommittedListener = (details) => {
-      const callbackUrl = getStep8CallbackUrlFromNavigation(details, signupTabId);
-      finalizeStep8Callback(callbackUrl);
-    };
-
-    step8TabUpdatedListener = (tabId, changeInfo, tab) => {
-      const callbackUrl = getStep8CallbackUrlFromTabUpdate(tabId, changeInfo, tab, signupTabId);
-      finalizeStep8Callback(callbackUrl);
-    };
-
-    (async () => {
-      try {
-        throwIfStep8SettledOrStopped(resolved);
-        signupTabId = await getTabId('signup-page');
-        throwIfStep8SettledOrStopped(resolved);
-
-        if (signupTabId && await isTabAlive('signup-page')) {
-          await chrome.tabs.update(signupTabId, { active: true });
-          await addLog('步骤 8：已切回认证页，正在准备调试器点击...');
-        } else {
-          signupTabId = await reuseOrCreateTab('signup-page', state.oauthUrl);
-          await addLog('步骤 8：已重新打开认证页，正在准备调试器点击...');
-        }
-
-        throwIfStep8SettledOrStopped(resolved);
-        chrome.webNavigation.onBeforeNavigate.addListener(webNavListener);
-        chrome.webNavigation.onCommitted.addListener(webNavCommittedListener);
-        chrome.tabs.onUpdated.addListener(step8TabUpdatedListener);
-        await ensureStep8SignupPageReady(signupTabId, {
-          timeoutMs: 15000,
-          logMessage: '步骤 8：认证页内容脚本尚未就绪，正在等待页面恢复...',
-        });
-
-        for (let round = 1; round <= STEP8_MAX_ROUNDS && !resolved; round++) {
-          throwIfStep8SettledOrStopped(resolved);
-          const pageState = await waitForStep8Ready(signupTabId);
-          if (!pageState?.consentReady) {
-            await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
-            continue;
-          }
-
-          const strategy = STEP8_STRATEGIES[Math.min(round - 1, STEP8_STRATEGIES.length - 1)];
-
-          await addLog(`步骤 8：第 ${round}/${STEP8_MAX_ROUNDS} 轮尝试点击“继续”（${strategy.label}）...`);
-
-          if (strategy.mode === 'debugger') {
-            const clickTarget = await prepareStep8DebuggerClick(signupTabId);
-            throwIfStep8SettledOrStopped(resolved);
-            await clickWithDebugger(signupTabId, clickTarget?.rect);
-          } else {
-            await triggerStep8ContentStrategy(signupTabId, strategy.strategy);
-          }
-
-          if (resolved) {
-            return;
-          }
-
-          const effect = await waitForStep8ClickEffect(signupTabId, pageState.url);
-          if (resolved) {
-            return;
-          }
-
-          if (effect.progressed) {
-            await addLog(`步骤 8：检测到本次点击已生效，${getStep8EffectLabel(effect)}，继续等待 localhost 回调...`, 'info');
-            break;
-          }
-
-          if (round >= STEP8_MAX_ROUNDS) {
-            throw new Error(`步骤 8：连续 ${STEP8_MAX_ROUNDS} 轮点击“继续”后页面仍无反应。`);
-          }
-
-          await addLog(`步骤 8：${strategy.label} 本轮点击后页面无反应，正在刷新认证页后重试（下一轮 ${round + 1}/${STEP8_MAX_ROUNDS}）...`, 'warn');
-          await reloadStep8ConsentPage(signupTabId);
-          await sleepWithStop(STEP8_CLICK_RETRY_DELAY_MS);
-        }
-      } catch (err) {
-        rejectStep8(err);
-      }
-    })();
-  });
+  return step8Executor.executeStep8(state);
 }
 
 // ============================================================
@@ -8571,138 +6508,7 @@ async function executeStep8(state) {
 // ============================================================
 
 async function executeStep9(state) {
-  if (getPanelMode(state) === 'sub2api') {
-    return executeSub2ApiStep9(state);
-  }
-  return executeCpaStep9(state);
-}
-
-async function executeCpaStep9(state) {
-  if (state.localhostUrl && !isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    throw new Error('步骤 8 捕获到的 localhost OAuth 回调地址无效，请重新执行步骤 8。');
-  }
-  if (!state.localhostUrl) {
-    throw new Error('缺少 localhost 回调地址，请先完成步骤 8。');
-  }
-  if (!state.vpsUrl) {
-    throw new Error('尚未填写 CPA 地址，请先在侧边栏输入。');
-  }
-
-  if (shouldBypassStep9ForLocalCpa(state)) {
-    await addLog('步骤 9：检测到本地 CPA，且当前策略为“跳过第9步”，本轮不再重复提交回调地址。', 'info');
-    await completeStepFromBackground(9, {
-      localhostUrl: state.localhostUrl,
-      verifiedStatus: 'local-auto',
-    });
-    return;
-  }
-
-  await addLog('步骤 9：正在打开 CPA 面板...');
-
-  const injectFiles = ['content/activation-utils.js', 'content/utils.js', 'content/vps-panel.js'];
-  let tabId = await getTabId('vps-panel');
-  const alive = tabId && await isTabAlive('vps-panel');
-
-  if (!alive) {
-    tabId = await reuseOrCreateTab('vps-panel', state.vpsUrl, {
-      inject: injectFiles,
-      reloadIfSameUrl: true,
-    });
-  } else {
-    await closeConflictingTabsForSource('vps-panel', state.vpsUrl, { excludeTabIds: [tabId] });
-    await chrome.tabs.update(tabId, { active: true });
-    await rememberSourceLastUrl('vps-panel', state.vpsUrl);
-  }
-
-  await ensureContentScriptReadyOnTab('vps-panel', tabId, {
-    inject: injectFiles,
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: '步骤 9：CPA 面板仍在加载，正在重试连接...',
-  });
-
-  await addLog('步骤 9：正在填写回调地址...');
-  const result = await sendToContentScriptResilient('vps-panel', {
-    type: 'EXECUTE_STEP',
-    step: 9,
-    source: 'background',
-    payload: { localhostUrl: state.localhostUrl, vpsPassword: state.vpsPassword },
-  }, {
-    timeoutMs: 30000,
-    retryDelayMs: 700,
-    logMessage: '步骤 9：CPA 面板通信未就绪，正在等待页面恢复...',
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-}
-
-async function executeSub2ApiStep9(state) {
-  if (state.localhostUrl && !isLocalhostOAuthCallbackUrl(state.localhostUrl)) {
-    throw new Error('步骤 8 捕获到的 localhost OAuth 回调地址无效，请重新执行步骤 8。');
-  }
-  if (!state.localhostUrl) {
-    throw new Error('缺少 localhost 回调地址，请先完成步骤 8。');
-  }
-  if (!state.sub2apiSessionId) {
-    throw new Error('缺少 SUB2API 会话信息，请重新执行步骤 1。');
-  }
-  if (!state.sub2apiEmail) {
-    throw new Error('尚未配置 SUB2API 登录邮箱，请先在侧边栏填写。');
-  }
-  if (!state.sub2apiPassword) {
-    throw new Error('尚未配置 SUB2API 登录密码，请先在侧边栏填写。');
-  }
-
-  const sub2apiUrl = normalizeSub2ApiUrl(state.sub2apiUrl);
-  const injectFiles = ['content/utils.js', 'content/sub2api-panel.js'];
-
-  await addLog('步骤 9：正在打开 SUB2API 后台...');
-
-  let tabId = await getTabId('sub2api-panel');
-  const alive = tabId && await isTabAlive('sub2api-panel');
-
-  if (!alive) {
-    tabId = await reuseOrCreateTab('sub2api-panel', sub2apiUrl, {
-      inject: injectFiles,
-      injectSource: 'sub2api-panel',
-      reloadIfSameUrl: true,
-    });
-  } else {
-    await closeConflictingTabsForSource('sub2api-panel', sub2apiUrl, { excludeTabIds: [tabId] });
-    await chrome.tabs.update(tabId, { active: true });
-    await rememberSourceLastUrl('sub2api-panel', sub2apiUrl);
-  }
-
-  await ensureContentScriptReadyOnTab('sub2api-panel', tabId, {
-    inject: injectFiles,
-    injectSource: 'sub2api-panel',
-  });
-
-  await addLog('步骤 9：正在向 SUB2API 提交回调并创建账号...');
-  const result = await sendToContentScript('sub2api-panel', {
-    type: 'EXECUTE_STEP',
-    step: 9,
-    source: 'background',
-    payload: {
-      localhostUrl: state.localhostUrl,
-      sub2apiUrl,
-      sub2apiEmail: state.sub2apiEmail,
-      sub2apiPassword: state.sub2apiPassword,
-      sub2apiGroupName: state.sub2apiGroupName,
-      sub2apiSessionId: state.sub2apiSessionId,
-      sub2apiOAuthState: state.sub2apiOAuthState,
-      sub2apiGroupId: state.sub2apiGroupId,
-      sub2apiDraftName: state.sub2apiDraftName,
-    },
-  }, {
-    responseTimeoutMs: SUB2API_STEP9_RESPONSE_TIMEOUT_MS,
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
+  return step9Executor.executeStep9(state);
 }
 
 // ============================================================

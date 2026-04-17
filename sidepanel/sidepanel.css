@@ -1657,6 +1657,188 @@ header {
   margin-bottom: 6px;
 }
 
+.account-run-history-strip {
+  margin-bottom: 8px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  background:
+    linear-gradient(180deg,
+      color-mix(in srgb, var(--bg-base) 72%, var(--blue-soft)),
+      color-mix(in srgb, var(--bg-surface) 92%, var(--bg-base))
+    );
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+}
+
+.account-run-history-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.account-run-history-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.account-run-history-title {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--text-primary);
+}
+
+.account-run-history-meta {
+  font-size: 11px;
+  color: var(--text-secondary);
+  line-height: 1.45;
+}
+
+.account-run-history-stats {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex-shrink: 0;
+}
+
+.account-run-history-stat {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-subtle);
+  background: color-mix(in srgb, var(--bg-base) 86%, transparent);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+
+.account-run-history-stat strong {
+  font-family: 'JetBrains Mono', 'Consolas', monospace;
+  font-size: 10px;
+}
+
+.account-run-history-stat.is-success {
+  color: var(--green);
+  background: var(--green-soft);
+  border-color: color-mix(in srgb, var(--green) 16%, var(--border));
+}
+
+.account-run-history-stat.is-failed {
+  color: var(--red);
+  background: var(--red-soft);
+  border-color: color-mix(in srgb, var(--red) 16%, var(--border));
+}
+
+.account-run-history-stat.is-stopped {
+  color: var(--cyan);
+  background: color-mix(in srgb, var(--cyan) 12%, var(--bg-base));
+  border-color: color-mix(in srgb, var(--cyan) 16%, var(--border));
+}
+
+.account-run-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.account-run-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px;
+  align-items: center;
+  padding: 8px 9px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--bg-base) 90%, transparent);
+}
+
+.account-run-history-item-main {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.account-run-history-item-email {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.account-run-history-item-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.account-run-history-item-side {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.account-run-history-item-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+}
+
+.account-run-history-item-time {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.account-run-history-item.is-success {
+  border-color: color-mix(in srgb, var(--green) 14%, var(--border-subtle));
+}
+
+.account-run-history-item.is-success .account-run-history-item-status {
+  background: var(--green-soft);
+  color: var(--green);
+}
+
+.account-run-history-item.is-failed {
+  border-color: color-mix(in srgb, var(--red) 14%, var(--border-subtle));
+}
+
+.account-run-history-item.is-failed .account-run-history-item-status {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.account-run-history-item.is-stopped {
+  border-color: color-mix(in srgb, var(--cyan) 14%, var(--border-subtle));
+}
+
+.account-run-history-item.is-stopped .account-run-history-item-status {
+  background: color-mix(in srgb, var(--cyan) 12%, var(--bg-base));
+  color: var(--cyan);
+}
+
 #log-area {
   background: var(--bg-surface);
   border: 1px solid var(--border);

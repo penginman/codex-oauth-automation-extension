@@ -1,9 +1,10 @@
 const assert = require('assert');
 const fs = require('fs');
 
-const source = fs.readFileSync('background.js', 'utf8');
+const helperSource = fs.readFileSync('background.js', 'utf8');
+const step8ModuleSource = fs.readFileSync('background/steps/confirm-oauth.js', 'utf8');
 
-function extractFunction(name) {
+function extractFunction(source, name) {
   const markers = [`async function ${name}(`, `function ${name}(`];
   const start = markers
     .map(marker => source.indexOf(marker))
@@ -50,16 +51,16 @@ function extractFunction(name) {
   return source.slice(start, end);
 }
 
-const bundle = [
-  extractFunction('throwIfStopped'),
-  extractFunction('cleanupStep8NavigationListeners'),
-  extractFunction('rejectPendingStep8'),
-  extractFunction('throwIfStep8SettledOrStopped'),
-  extractFunction('requestStop'),
-  extractFunction('executeStep8'),
+const helperBundle = [
+  extractFunction(helperSource, 'throwIfStopped'),
+  extractFunction(helperSource, 'cleanupStep8NavigationListeners'),
+  extractFunction(helperSource, 'rejectPendingStep8'),
+  extractFunction(helperSource, 'throwIfStep8SettledOrStopped'),
+  extractFunction(helperSource, 'requestStop'),
 ].join('\n');
 
-const api = new Function(`
+const api = new Function('step8ModuleSource', `
+const self = {};
 let stopRequested = false;
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
 let webNavListener = null;
@@ -71,6 +72,13 @@ let autoRunCurrentRun = 2;
 let autoRunTotalRuns = 3;
 let autoRunAttemptRun = 4;
 const AUTO_RUN_TIMER_KIND_SCHEDULED_START = 'scheduled_start';
+const STEP8_CLICK_RETRY_DELAY_MS = 500;
+const STEP8_MAX_ROUNDS = 5;
+const STEP8_READY_WAIT_TIMEOUT_MS = 30000;
+const STEP8_STRATEGIES = [
+  { mode: 'content', strategy: 'requestSubmit', label: 'form.requestSubmit' },
+  { mode: 'debugger', label: 'debugger click' },
+];
 
 const added = {
   beforeNavigate: 0,
@@ -89,28 +97,28 @@ let resolveTabId = null;
 const chrome = {
   webNavigation: {
     onBeforeNavigate: {
-      addListener(listener) {
+      addListener() {
         added.beforeNavigate += 1;
       },
-      removeListener(listener) {
+      removeListener() {
         removed.beforeNavigate += 1;
       },
     },
     onCommitted: {
-      addListener(listener) {
+      addListener() {
         added.committed += 1;
       },
-      removeListener(listener) {
+      removeListener() {
         removed.committed += 1;
       },
     },
   },
   tabs: {
     onUpdated: {
-      addListener(listener) {
+      addListener() {
         added.tabUpdated += 1;
       },
-      removeListener(listener) {
+      removeListener() {
         removed.tabUpdated += 1;
       },
     },
@@ -137,6 +145,7 @@ function isAutoRunScheduledState() {
 }
 function getStep8CallbackUrlFromNavigation() { return ''; }
 function getStep8CallbackUrlFromTabUpdate() { return ''; }
+function getStep8EffectLabel() { return 'no_effect'; }
 async function completeStepFromBackground() {}
 async function getTabId() {
   return await new Promise((resolve) => {
@@ -149,18 +158,86 @@ async function reuseOrCreateTab() {
 async function isTabAlive() {
   return true;
 }
-async function sendToContentScript(source, message) {
-  sentMessages.push({ source, type: message.type });
+async function ensureStep8SignupPageReady() {}
+async function prepareStep8DebuggerClick() {
+  sentMessages.push({ source: 'signup-page', type: 'STEP8_FIND_AND_CLICK' });
   return { rect: { centerX: 10, centerY: 20 } };
 }
+async function triggerStep8ContentStrategy() {
+  sentMessages.push({ source: 'signup-page', type: 'STEP8_TRIGGER_CONTINUE' });
+}
+async function waitForStep8ClickEffect() {
+  return { progressed: false, reason: 'no_effect' };
+}
+async function waitForStep8Ready() {
+  return { consentReady: true, url: 'https://example.com/consent' };
+}
+async function reloadStep8ConsentPage() {}
+async function sleepWithStop() {}
 async function clickWithDebugger() {
   clickCount += 1;
 }
 
-${bundle}
+function setWebNavListener(listener) {
+  webNavListener = listener;
+}
+function getWebNavListener() {
+  return webNavListener;
+}
+function setWebNavCommittedListener(listener) {
+  webNavCommittedListener = listener;
+}
+function getWebNavCommittedListener() {
+  return webNavCommittedListener;
+}
+function setStep8TabUpdatedListener(listener) {
+  step8TabUpdatedListener = listener;
+}
+function getStep8TabUpdatedListener() {
+  return step8TabUpdatedListener;
+}
+function setStep8PendingReject(handler) {
+  step8PendingReject = handler;
+}
+
+${helperBundle}
+${step8ModuleSource}
+
+const executor = self.MultiPageBackgroundStep8.createStep8Executor({
+  addLog,
+  chrome,
+  cleanupStep8NavigationListeners,
+  clickWithDebugger,
+  completeStepFromBackground,
+  ensureStep8SignupPageReady,
+  getStep8CallbackUrlFromNavigation,
+  getStep8CallbackUrlFromTabUpdate,
+  getStep8EffectLabel,
+  getTabId,
+  getWebNavCommittedListener,
+  getWebNavListener,
+  getStep8TabUpdatedListener,
+  isTabAlive,
+  prepareStep8DebuggerClick,
+  reloadStep8ConsentPage,
+  reuseOrCreateTab,
+  setStep8PendingReject,
+  setStep8TabUpdatedListener,
+  setWebNavCommittedListener,
+  setWebNavListener,
+  sleepWithStop,
+  STEP8_CLICK_RETRY_DELAY_MS,
+  STEP8_MAX_ROUNDS,
+  STEP8_READY_WAIT_TIMEOUT_MS,
+  STEP8_STRATEGIES,
+  throwIfStep8SettledOrStopped,
+  triggerStep8ContentStrategy,
+  waitForStep8ClickEffect,
+  waitForStep8Ready,
+});
 
 return {
-  executeStep8,
+  executeStep8: executor.executeStep8,
   requestStop,
   resolveTabId(tabId) {
     if (!resolveTabId) {
@@ -183,7 +260,7 @@ return {
     };
   },
 };
-`)();
+`)(step8ModuleSource);
 
 (async () => {
   const step8Promise = api.executeStep8({ oauthUrl: 'https://example.com/oauth' });
@@ -205,7 +282,7 @@ return {
     { beforeNavigate: 0, committed: 0, tabUpdated: 0 },
     'Stop 先发生时，不应再注册 Step 8 监听'
   );
-  assert.strictEqual(state.sentMessages.length, 0, 'Stop 后不应再发送 STEP8_FIND_AND_CLICK 命令');
+  assert.strictEqual(state.sentMessages.length, 0, 'Stop 后不应再发送 Step 8 执行动作');
   assert.strictEqual(state.clickCount, 0, 'Stop 后不应再触发 debugger 点击');
   assert.strictEqual(state.webNavListener, null, 'Stop 后 onBeforeNavigate 引用应为空');
   assert.strictEqual(state.webNavCommittedListener, null, 'Stop 后 onCommitted 引用应为空');
