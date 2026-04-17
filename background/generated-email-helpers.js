@@ -9,6 +9,7 @@
       DUCK_AUTOFILL_URL,
       fetch,
       fetchIcloudHideMyEmail,
+      fetchIcloudStandardAliasFromPool,
       getConfiguredIcloudHostPreference,
       getCloudflareTempEmailAddressFromResponse,
       getCloudflareTempEmailConfig,
@@ -189,34 +190,7 @@
     }
 
     async function fetchIcloudStandardAlias(state, options = {}) {
-      throwIfStopped();
-      const currentState = state || await getState();
-      const configuredHost = getConfiguredIcloudHostPreference(currentState)
-        || normalizeIcloudHost(currentState?.preferredIcloudHost)
-        || 'icloud.com';
-      const mailUrl = getIcloudMailUrlForHost(configuredHost) || 'https://www.icloud.com/mail/';
-
-      await addLog(`普通 iCloud 别名邮箱：正在打开 ${new URL(mailUrl).host} 邮件页...`, 'info');
-      await reuseOrCreateTab('icloud-mail', mailUrl);
-
-      const result = await sendToContentScript('icloud-mail', {
-        type: 'CREATE_ICLOUD_STANDARD_ALIAS',
-        source: 'background',
-        payload: {
-          maxAttempts: Math.max(1, Number(options.maxAttempts) || 1),
-        },
-      });
-
-      if (result?.error) {
-        throw new Error(result.error);
-      }
-      if (!result?.email) {
-        throw new Error('普通 iCloud 别名邮箱未返回可用邮箱地址。');
-      }
-
-      await setEmailState(result.email);
-      await addLog(`普通 iCloud 别名邮箱：已创建 ${result.email}`, 'ok');
-      return result.email;
+      return fetchIcloudStandardAliasFromPool(state, options);
     }
 
     async function fetchGeneratedEmail(state, options = {}) {

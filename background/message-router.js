@@ -46,6 +46,7 @@
       isStopError,
       launchAutoRunTimerPlan,
       listIcloudAliases,
+      listStandardIcloudPool,
       listLuckmailPurchasesForManagement,
       normalizeHotmailAccounts,
       normalizeRunCount,
@@ -64,6 +65,11 @@
       setEmailStateSilently,
       setIcloudAliasPreservedState,
       setIcloudAliasUsedState,
+      setStandardIcloudEmailPreservedState,
+      setStandardIcloudEmailUsedState,
+      syncStandardIcloudPool,
+      deleteStandardIcloudEmail,
+      deleteUsedStandardIcloudEmails,
       setLuckmailPurchaseDisabledState,
       setLuckmailPurchasePreservedState,
       setLuckmailPurchaseUsedState,
@@ -540,6 +546,42 @@
         case 'DELETE_USED_ICLOUD_ALIASES': {
           clearStopRequest();
           const result = await deleteUsedIcloudAliases();
+          return { ok: true, ...result };
+        }
+
+        case 'LIST_STANDARD_ICLOUD_POOL': {
+          clearStopRequest();
+          const aliases = await listStandardIcloudPool();
+          return { ok: true, aliases };
+        }
+
+        case 'SYNC_STANDARD_ICLOUD_POOL': {
+          clearStopRequest();
+          const result = await syncStandardIcloudPool({ ...(message.payload || {}), createMissing: false });
+          return { ok: true, ...result };
+        }
+
+        case 'SET_STANDARD_ICLOUD_EMAIL_USED_STATE': {
+          clearStopRequest();
+          const result = await setStandardIcloudEmailUsedState(message.payload || {});
+          return { ok: true, ...result };
+        }
+
+        case 'SET_STANDARD_ICLOUD_EMAIL_PRESERVED_STATE': {
+          clearStopRequest();
+          const result = await setStandardIcloudEmailPreservedState(message.payload || {});
+          return { ok: true, ...result };
+        }
+
+        case 'DELETE_STANDARD_ICLOUD_EMAIL': {
+          clearStopRequest();
+          const result = await deleteStandardIcloudEmail(message.payload || {});
+          return { ok: true, ...result };
+        }
+
+        case 'DELETE_USED_STANDARD_ICLOUD_EMAILS': {
+          clearStopRequest();
+          const result = await deleteUsedStandardIcloudEmails();
           return { ok: true, ...result };
         }
 

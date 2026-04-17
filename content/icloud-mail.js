@@ -53,6 +53,26 @@ if (isTopFrame) {
       });
       return true;
     }
+
+    if (message.type === 'SYNC_ICLOUD_STANDARD_POOL') {
+      if (!isMailApplicationFrame()) {
+        sendResponse({ ok: false, reason: 'wrong-frame' });
+        return;
+      }
+      resetStopState();
+      syncIcloudStandardPool(message.payload || {}).then((result) => {
+        sendResponse(result);
+      }).catch((err) => {
+        if (isStopError(err)) {
+          log('普通 iCloud 邮箱池同步：已被用户停止。', 'warn');
+          sendResponse({ stopped: true, error: err.message });
+          return;
+        }
+        log(`普通 iCloud 邮箱池同步失败：${err.message}`, 'warn');
+        sendResponse({ error: err.message });
+      });
+      return true;
+    }
   });
 
   function normalizeText(value) {
@@ -113,8 +133,32 @@ if (isTopFrame) {
   }
 
   function findSettingsLauncher(root = document) {
-    const candidates = Array.from(root.querySelectorAll('ui-button[aria-label="设置"], ui-button[title="设置"], button[aria-label="设置"], [role="button"][aria-label="设置"]'));
-    return candidates.find((el) => /设置/.test(el.getAttribute('aria-label') || '') || /设置/.test(el.getAttribute('title') || '')) || null;
+    const settingPattern = /^(?:设置|設定|settings?)$/i;
+    const explicitCandidates = Array.from(root.querySelectorAll([
+      'ui-button[aria-label="设置"]',
+      'ui-button[aria-label="設定"]',
+      'ui-button[aria-label="Settings"]',
+      'ui-button[title="设置"]',
+      'ui-button[title="設定"]',
+      'ui-button[title="Settings"]',
+      'button[aria-label="设置"]',
+      'button[aria-label="設定"]',
+      'button[aria-label="Settings"]',
+      '[role="button"][aria-label="设置"]',
+      '[role="button"][aria-label="設定"]',
+      '[role="button"][aria-label="Settings"]',
+    ].join(', ')));
+
+    const explicitMatch = explicitCandidates.find((el) => {
+      const ariaLabel = normalizeText(el.getAttribute('aria-label') || '');
+      const title = normalizeText(el.getAttribute('title') || '');
+      return settingPattern.test(ariaLabel) || settingPattern.test(title);
+    });
+    if (explicitMatch) {
+      return explicitMatch;
+    }
+
+    return findButtonByText(root, settingPattern);
   }
 
   async function waitForSettingsMenuItem(root, options = {}) {
@@ -126,7 +170,8 @@ if (isTopFrame) {
     let previousCandidate = null;
     while (Date.now() - start < timeout) {
       throwIfStopped();
-      const candidate = findMenuItemByText(root, /^设置$/, { excludeElements });
+      const candidate = findMenuItemByText(root, /^(?:设置|設定|settings?)$/i, { excludeElements })
+        || findButtonByText(root, /^(?:设置|設定|settings?)$/i, { excludeElements, matchAriaLabel: true });
       if (candidate && candidate === previousCandidate) {
         return candidate;
       }
@@ -143,6 +188,242 @@ if (isTopFrame) {
     }
     simulateClick(button);
     return button;
+  }
+
+  function describeElement(el) {
+    if (!el) {
+      return '[null]';
+    }
+    const tag = String(el.tagName || 'UNKNOWN').toUpperCase();
+    const role = normalizeText(el.getAttribute?.('role') || '');
+    const ariaLabel = normalizeText(el.getAttribute?.('aria-label') || '');
+    const title = normalizeText(el.getAttribute?.('title') || '');
+    const textValue = normalizeText(el.textContent || '').slice(0, 60);
+    return `${tag} role=${role || '-'} aria=${ariaLabel || '-'} title=${title || '-'} text=${textValue || '-'}`;
+  }
+
+  function isElementVisible(node) {
+    if (!node || typeof node.getBoundingClientRect !== 'function') {
+      return false;
+    }
+    const style = typeof getComputedStyle === 'function' ? getComputedStyle(node) : null;
+    if (style && (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0')) {
+      return false;
+    }
+    const rect = node.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function hasVisibleMailLoading(root = document) {
+    const loadingSelectors = [
+      '[aria-busy="true"]',
+      'ui-spinner',
+      '.spinner',
+      '.loading',
+      '.activity-indicator',
+      '[role="progressbar"]',
+    ];
+    return loadingSelectors.some((selector) => {
+      const el = root.querySelector(selector);
+      return isElementVisible(el);
+    });
+  }
+
+  async function waitForMailAliasUiReady(doc, timeout = 15000) {
+    const start = Date.now();
+    let stableHits = 0;
+    while (Date.now() - start < timeout) {
+      throwIfStopped();
+      const settingsReady = Boolean(findSettingsLauncher(doc) || findButtonByText(doc, /^(?:设置|設定|settings?)$/i));
+      const listReady = Boolean(doc.querySelector('.content-container, .thread-list-item, .thread-participants'));
+      const loadingVisible = hasVisibleMailLoading(doc);
+
+      if ((settingsReady || listReady) && !loadingVisible) {
+        stableHits += 1;
+      } else {
+        stableHits = 0;
+      }
+
+      if (stableHits >= 3) {
+        log('普通 iCloud 别名邮箱：邮件页面已稳定，继续执行设置流程。', 'ok');
+        return;
+      }
+      await sleep(150);
+    }
+
+    log('普通 iCloud 别名邮箱：等待邮件页面稳定超时，继续尝试后续流程。', 'warn');
+  }
+
+  function dispatchMouseActivationSequence(target) {
+    if (!target) {
+      return;
+    }
+    const options = { bubbles: true, cancelable: true };
+    target.dispatchEvent(new MouseEvent('mousedown', options));
+    target.dispatchEvent(new MouseEvent('mouseup', options));
+    target.dispatchEvent(new MouseEvent('click', options));
+  }
+
+  function getVisibleDialogCandidates(root = document) {
+    const selectors = [
+      'ui-popup[role="dialog"]',
+      '[role="dialog"]',
+      'dialog',
+      '.regular',
+    ];
+    const seen = new Set();
+    const list = [];
+    for (const selector of selectors) {
+      const nodes = Array.from(root.querySelectorAll(selector));
+      for (const node of nodes) {
+        if (!node || seen.has(node)) {
+          continue;
+        }
+        seen.add(node);
+        if (isElementVisible(node)) {
+          list.push(node);
+        }
+      }
+    }
+    return list;
+  }
+
+  function findSettingsAccountContainer(root = document) {
+    const accountPattern = /账户|帳戶|account/i;
+    const addAliasPattern = /添加别名|加入別名|add\s+alias/i;
+    const aliasPattern = /别名|別名|alias/i;
+
+    const dialogs = getVisibleDialogCandidates(root);
+
+    // Highest confidence: account + add alias in the same visible dialog.
+    const strictDialog = dialogs.find((dialog) => {
+      const text = normalizeText(dialog.textContent || '');
+      return accountPattern.test(text) && addAliasPattern.test(text);
+    });
+    if (strictDialog) {
+      return strictDialog;
+    }
+
+    // Medium confidence: dialog contains explicit add-alias control.
+    const withAddAliasControl = dialogs.find((dialog) => {
+      const explicit = dialog.querySelector('ui-button[aria-label="添加别名"],button[aria-label="添加别名"]');
+      if (explicit && isElementVisible(explicit)) {
+        return true;
+      }
+      const byText = findButtonByText(dialog, addAliasPattern);
+      return Boolean(byText && isElementVisible(byText));
+    });
+    if (withAddAliasControl) {
+      return withAddAliasControl;
+    }
+
+    // Fallback: dialog includes account + alias context text.
+    const accountAliasDialog = dialogs.find((dialog) => {
+      const text = normalizeText(dialog.textContent || '');
+      return accountPattern.test(text) && aliasPattern.test(text);
+    });
+    if (accountAliasDialog) {
+      return accountAliasDialog;
+    }
+
+    return null;
+  }
+
+  async function waitForSettingsAccountContainer(root = document, timeout = 3000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+      throwIfStopped();
+      const container = findSettingsAccountContainer(root);
+      if (container) {
+        return container;
+      }
+      await sleep(120);
+    }
+    return null;
+  }
+
+  async function activateSettingsMenuItem(menuItem, doc = document) {
+    if (!menuItem) {
+      throw new Error('未提供可激活的设置菜单项。');
+    }
+
+    const waitForContainer = async (timeoutMs) => {
+      if (typeof waitForSettingsAccountContainer === 'function') {
+        return waitForSettingsAccountContainer(doc, timeoutMs);
+      }
+      const direct = findDialogByText(doc, [/账户|帳戶|account/i]) || findDialogByText(doc, [/添加别名|加入別名|add\s+alias/i]);
+      if (direct) {
+        return direct;
+      }
+      await sleep(timeoutMs);
+      return findDialogByText(doc, [/账户|帳戶|account/i]) || findDialogByText(doc, [/添加别名|加入別名|add\s+alias/i]);
+    };
+
+    log(`普通 iCloud 别名邮箱：准备激活设置菜单项。${describeElement(menuItem)}`, 'info');
+    simulateClick(menuItem);
+    const openedAfterClick = await waitForContainer(2200);
+    if (openedAfterClick) {
+      log('普通 iCloud 别名邮箱：菜单项 click 激活成功。', 'ok');
+      return openedAfterClick;
+    }
+
+    const innerLabelNode = menuItem.querySelector?.('p,span') || null;
+    if (innerLabelNode) {
+      log(`普通 iCloud 别名邮箱：尝试触发菜单项内部文本点击序列。${describeElement(innerLabelNode)}`, 'warn');
+      dispatchMouseActivationSequence(innerLabelNode);
+      const openedAfterInnerMouse = await waitForContainer(1800);
+      if (openedAfterInnerMouse) {
+        log('普通 iCloud 别名邮箱：内部文本鼠标序列激活成功。', 'ok');
+        return openedAfterInnerMouse;
+      }
+    }
+
+    dispatchMouseActivationSequence(menuItem);
+    const openedAfterMouseSequence = await waitForContainer(1800);
+    if (openedAfterMouseSequence) {
+      log('普通 iCloud 别名邮箱：菜单项鼠标序列激活成功。', 'ok');
+      return openedAfterMouseSequence;
+    }
+
+    const focusTarget = menuItem.querySelector?.('button,[role="button"],p,span') || menuItem;
+    focusTarget.focus?.();
+
+    if (typeof KeyboardEvent === 'function') {
+      const keyEventOptions = { bubbles: true, cancelable: true };
+      focusTarget.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ...keyEventOptions }));
+      focusTarget.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', ...keyEventOptions }));
+      focusTarget.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', ...keyEventOptions }));
+    }
+    const openedAfterEnter = await waitForContainer(1800);
+    if (openedAfterEnter) {
+      log('普通 iCloud 别名邮箱：菜单项 Enter 激活成功。', 'ok');
+      return openedAfterEnter;
+    }
+
+    if (typeof KeyboardEvent === 'function') {
+      const keyEventOptions = { bubbles: true, cancelable: true };
+      focusTarget.dispatchEvent(new KeyboardEvent('keydown', { key: ' ', code: 'Space', ...keyEventOptions }));
+      focusTarget.dispatchEvent(new KeyboardEvent('keypress', { key: ' ', code: 'Space', ...keyEventOptions }));
+      focusTarget.dispatchEvent(new KeyboardEvent('keyup', { key: ' ', code: 'Space', ...keyEventOptions }));
+    }
+    const openedAfterSpace = await waitForContainer(1800);
+    if (openedAfterSpace) {
+      log('普通 iCloud 别名邮箱：菜单项 Space 激活成功。', 'ok');
+      return openedAfterSpace;
+    }
+
+    const innerClickable = menuItem.querySelector?.('p,span,button,[role="button"]') || null;
+    if (innerClickable && innerClickable !== menuItem) {
+      log(`普通 iCloud 别名邮箱：尝试激活菜单项内部元素。${describeElement(innerClickable)}`, 'warn');
+      simulateClick(innerClickable);
+      const openedAfterInnerClick = await waitForContainer(1800);
+      if (openedAfterInnerClick) {
+        log('普通 iCloud 别名邮箱：内部元素 click 激活成功。', 'ok');
+        return openedAfterInnerClick;
+      }
+    }
+
+    throw new Error('已点击设置菜单项，但未检测到账户设置界面。');
   }
 
   function getMailAutomationDocument() {
@@ -194,36 +475,65 @@ if (isTopFrame) {
   }
 
   async function ensureSettingsAccountDialog(doc, timeout = 10000) {
-    const existingDialog = findDialogByText(doc, [/账户/, /添加别名/]);
+    const findContainer = typeof findSettingsAccountContainer === 'function'
+      ? findSettingsAccountContainer
+      : (root) => findDialogByText(root, [/账户|帳戶|account/i]);
+
+    const existingDialog = findContainer(doc);
     if (existingDialog) {
-      log('普通 iCloud 别名邮箱：已检测到账户设置弹窗，无需重新打开。', 'info');
+      log(`普通 iCloud 别名邮箱：已检测到账户设置界面。${describeElement(existingDialog)}`, 'info');
       return existingDialog;
     }
 
-    log('普通 iCloud 别名邮箱：未检测到账户设置弹窗，开始尝试自动打开设置。', 'warn');
-    const settingsLauncher = findSettingsLauncher(doc) || findButtonByText(doc, /设置/);
+    log('普通 iCloud 别名邮箱：未检测到账户设置界面，开始尝试自动打开设置。', 'warn');
+    const settingsLauncher = findSettingsLauncher(doc) || findButtonByText(doc, /^(?:设置|設定|settings?)$/i);
     if (!settingsLauncher) {
       throw new Error('未找到 iCloud Mail 的“设置”入口按钮。');
     }
 
-    log('普通 iCloud 别名邮箱：已找到“设置”入口，准备点击。', 'info');
+    const launcherDesc = typeof describeElement === 'function'
+      ? describeElement(settingsLauncher)
+      : String(settingsLauncher?.tagName || 'UNKNOWN');
+    log(`普通 iCloud 别名邮箱：已找到“设置”入口，准备点击。${launcherDesc}`, 'info');
     simulateClick(settingsLauncher);
+    await sleep(180);
 
     log('普通 iCloud 别名邮箱：等待设置菜单稳定展开。', 'info');
     const settingsMenuItem = await waitForSettingsMenuItem(doc, {
-      timeout: 4000,
+      timeout: 5000,
       excludeElements: [settingsLauncher],
-    }) || findButtonByText(doc, /^设置$/, {
+    }) || findButtonByText(doc, /^(?:设置|設定|settings?)$/i, {
       excludeElements: [settingsLauncher],
-      matchAriaLabel: false,
+      matchAriaLabel: true,
     });
     if (!settingsMenuItem) {
       throw new Error('未找到设置菜单项“设置”。');
     }
-    log(`普通 iCloud 别名邮箱：已找到设置菜单项 [${settingsMenuItem.tagName}]，准备激活。`, 'info');
-    await activateSettingsMenuItem(settingsMenuItem);
 
-    return waitForDialog(doc, [/账户/, /添加别名/], timeout);
+    const menuItemDesc = typeof describeElement === 'function'
+      ? describeElement(settingsMenuItem)
+      : String(settingsMenuItem?.tagName || 'UNKNOWN');
+    log(`普通 iCloud 别名邮箱：已找到设置菜单项，准备激活。${menuItemDesc}`, 'info');
+
+    let activatedContainer = null;
+    if (typeof activateSettingsMenuItem === 'function') {
+      activatedContainer = await activateSettingsMenuItem(settingsMenuItem, doc);
+      if (activatedContainer) {
+        return activatedContainer;
+      }
+    } else {
+      simulateClick(settingsMenuItem);
+    }
+
+    const fallbackContainer = typeof waitForSettingsAccountContainer === 'function'
+      ? await waitForSettingsAccountContainer(doc, timeout)
+      : await waitForDialog(doc, [/账户|帳戶|account/i], timeout);
+    if (fallbackContainer) {
+      log(`普通 iCloud 别名邮箱：激活后通过轮询检测到账户设置界面。${describeElement(fallbackContainer)}`, 'ok');
+      return fallbackContainer;
+    }
+
+    throw new Error('已完成设置菜单激活，但未检测到账户设置界面。');
   }
 
   function readAliasDialogError(aliasDialog) {
@@ -282,9 +592,24 @@ if (isTopFrame) {
   async function createStandardAliasFromMailIframe(doc, options = {}) {
     log('普通 iCloud 别名邮箱：开始查找“设置-账户”弹窗。', 'info');
     const settingsDialog = await ensureSettingsAccountDialog(doc, 10000);
-    const addAliasBtn = settingsDialog.querySelector('ui-button[aria-label="添加别名"],button[aria-label="添加别名"]')
-      || settingsDialog.querySelector('ui-button.actionable-row-item.ic-cbcudj')
-      || findButtonByText(settingsDialog, /添加别名/);
+
+    const addAliasBtnStart = Date.now();
+    let addAliasBtn = null;
+    while (Date.now() - addAliasBtnStart < 10000) {
+      throwIfStopped();
+      const latestSettingsDialog = typeof findSettingsAccountContainer === 'function'
+        ? (findSettingsAccountContainer(doc) || settingsDialog)
+        : settingsDialog;
+
+      addAliasBtn = latestSettingsDialog?.querySelector('ui-button[aria-label="添加别名"],button[aria-label="添加别名"]')
+        || latestSettingsDialog?.querySelector('ui-button.actionable-row-item.ic-cbcudj')
+        || findButtonByText(latestSettingsDialog || settingsDialog, /添加别名|加入別名|add\s+alias/i);
+      if (addAliasBtn) {
+        break;
+      }
+      await sleep(120);
+    }
+
     if (!addAliasBtn) {
       throw new Error('未找到“添加别名”按钮。');
     }
@@ -346,6 +671,9 @@ if (isTopFrame) {
   async function createIcloudStandardAlias(options = {}) {
     log('普通 iCloud 别名邮箱：开始准备页面文档。', 'info');
     const iframeDoc = await waitForMailAutomationDocument(10000);
+    if (typeof waitForMailAliasUiReady === 'function') {
+      await waitForMailAliasUiReady(iframeDoc, Number(options.pageReadyTimeoutMs) || 15000);
+    }
     log('普通 iCloud 别名邮箱：页面文档已就绪，开始创建流程。', 'ok');
     const maxAttempts = Math.max(1, Number(options.maxAttempts) || 1);
     let lastError = null;
@@ -366,6 +694,193 @@ if (isTopFrame) {
     }
 
     throw new Error(`普通 iCloud 别名邮箱创建失败，已尝试 ${maxAttempts} 次：${lastError?.message || '未知错误'}`);
+  }
+
+  function normalizeIcloudMailHostFromLocation(loc = location) {
+    const host = String(loc?.hostname || '').trim().toLowerCase();
+    if (host.endsWith('icloud.com.cn')) {
+      return 'icloud.com.cn';
+    }
+    return 'icloud.com';
+  }
+
+  function normalizeStandardIcloudEmail(raw, fallbackHost = 'icloud.com') {
+    const value = String(raw || '').trim().toLowerCase();
+    if (!value || !value.includes('@')) {
+      return '';
+    }
+    const parts = value.split('@');
+    if (parts.length !== 2) {
+      return '';
+    }
+    const local = parts[0].trim();
+    if (!local) {
+      return '';
+    }
+    const domain = String(parts[1] || '').trim().toLowerCase();
+    if (domain === 'icloud.com' || domain === 'icloud.com.cn') {
+      return `${local}@${domain}`;
+    }
+    if (domain === 'me.com' || domain === 'mac.com') {
+      return `${local}@${fallbackHost}`;
+    }
+    return '';
+  }
+
+  function collectStandardAliasLikeTexts(root, values = new Set()) {
+    if (!root) {
+      return values;
+    }
+
+    const pushText = (text) => {
+      const normalized = normalizeText(text).toLowerCase();
+      if (!normalized || !normalized.includes('@')) {
+        return;
+      }
+      const matches = normalized.match(/[a-z0-9._%+-]+@(?:icloud\.com|icloud\.com\.cn|me\.com|mac\.com)/g) || [];
+      for (const email of matches) {
+        values.add(email);
+      }
+    };
+
+    const nodes = root.querySelectorAll('input, textarea, [contenteditable], ui-input, label, p, span, div, li, td');
+    for (const node of nodes) {
+      pushText(node.value);
+      pushText(node.getAttribute?.('value'));
+      pushText(node.getAttribute?.('aria-label'));
+      pushText(node.getAttribute?.('title'));
+      pushText(node.textContent);
+    }
+
+    pushText(root.textContent);
+    return values;
+  }
+
+  function parseAliasEntriesFromSettingsDialog(dialog, host) {
+    if (!dialog) {
+      return [];
+    }
+
+    const aliasMap = new Map();
+    const aliasEmails = collectStandardAliasLikeTexts(dialog, new Set());
+    for (const rawEmail of aliasEmails) {
+      const normalizedEmail = normalizeStandardIcloudEmail(rawEmail, host);
+      if (!normalizedEmail) {
+        continue;
+      }
+      aliasMap.set(normalizedEmail, {
+        email: normalizedEmail,
+        label: '',
+        note: '',
+        active: true,
+        source: 'standard-alias',
+      });
+    }
+
+    return Array.from(aliasMap.values())
+      .sort((left, right) => left.email.localeCompare(right.email));
+  }
+
+  function parsePrimaryEmailFromSettingsDialog(dialog, host) {
+    if (!dialog) {
+      return '';
+    }
+
+    const titleLikeNodes = Array.from(dialog.querySelectorAll('label, p, span, div, li, td'));
+    for (const node of titleLikeNodes) {
+      const text = normalizeText(node.textContent).toLowerCase();
+      if (!text) {
+        continue;
+      }
+      if (!/(主要地址|主地址|primary\s+address|mail\s+address|账户地址|account\s+address)/i.test(text)) {
+        continue;
+      }
+
+      const neighborCandidates = [
+        node.nextElementSibling,
+        node.parentElement?.querySelector?.('input, [contenteditable], .email, [data-email]') || null,
+        node.parentElement,
+      ];
+      for (const candidate of neighborCandidates) {
+        if (!candidate) continue;
+        const emails = collectStandardAliasLikeTexts(candidate, new Set());
+        for (const email of emails) {
+          const normalized = normalizeStandardIcloudEmail(email, host);
+          if (normalized) {
+            return normalized;
+          }
+        }
+      }
+    }
+
+    const fallbackEmails = collectStandardAliasLikeTexts(dialog, new Set());
+    const aliases = parseAliasEntriesFromSettingsDialog(dialog, host).map((item) => item.email);
+    const aliasSet = new Set(aliases);
+    for (const email of fallbackEmails) {
+      const normalized = normalizeStandardIcloudEmail(email, host);
+      if (normalized && !aliasSet.has(normalized)) {
+        return normalized;
+      }
+    }
+
+    return '';
+  }
+
+  async function syncIcloudStandardPool(options = {}) {
+    const desiredMaxAliasCount = Math.max(0, Math.min(3, Number(options.maxAliasCount) || 3));
+    const createMissing = options.createMissing !== false;
+
+    log('普通 iCloud 邮箱池：开始同步设置中的主地址与别名列表。', 'info');
+
+    const iframeDoc = await waitForMailAutomationDocument(10000);
+    if (typeof waitForMailAliasUiReady === 'function') {
+      await waitForMailAliasUiReady(iframeDoc, Number(options.pageReadyTimeoutMs) || 15000);
+    }
+
+    let settingsDialog = await ensureSettingsAccountDialog(iframeDoc, 10000);
+    const host = normalizeIcloudMailHostFromLocation(location);
+
+    let primaryEmail = parsePrimaryEmailFromSettingsDialog(settingsDialog, host);
+    let aliases = parseAliasEntriesFromSettingsDialog(settingsDialog, host)
+      .filter((item) => item.email !== primaryEmail);
+
+    let createdCount = 0;
+    if (createMissing && aliases.length < desiredMaxAliasCount) {
+      const missing = desiredMaxAliasCount - aliases.length;
+      log(`普通 iCloud 邮箱池：当前别名数量 ${aliases.length}/${desiredMaxAliasCount}，将尝试补齐 ${missing} 个。`, 'info');
+      for (let index = 0; index < missing; index += 1) {
+        throwIfStopped();
+        await createStandardAliasFromMailIframe(iframeDoc, {
+          maxAttempts: Math.max(1, Number(options.maxAttemptsPerAlias) || 3),
+          submitTimeoutMs: Number(options.submitTimeoutMs) || 10000,
+        });
+        createdCount += 1;
+        await sleep(220);
+      }
+
+      settingsDialog = (typeof findSettingsAccountContainer === 'function'
+        ? (findSettingsAccountContainer(iframeDoc) || settingsDialog)
+        : settingsDialog);
+      primaryEmail = parsePrimaryEmailFromSettingsDialog(settingsDialog, host);
+      aliases = parseAliasEntriesFromSettingsDialog(settingsDialog, host)
+        .filter((item) => item.email !== primaryEmail);
+    } else {
+      log(`普通 iCloud 邮箱池：当前别名数量 ${aliases.length}，无需补齐。`, 'info');
+    }
+
+    if (!primaryEmail) {
+      log('普通 iCloud 邮箱池：未从账户设置中提取到主要地址。', 'warn');
+    }
+
+    log(`普通 iCloud 邮箱池：同步完成。主地址=${primaryEmail || '-'}，别名数=${aliases.length}，本次新增=${createdCount}`, 'ok');
+
+    return {
+      ok: true,
+      host,
+      primaryEmail: primaryEmail || '',
+      aliases,
+      createdCount,
+    };
   }
 
   function isVisibleElement(node) {
@@ -635,6 +1150,3 @@ if (isTopFrame) {
     );
   }
 }
-
-
-

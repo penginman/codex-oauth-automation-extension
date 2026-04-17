@@ -2871,6 +2871,9 @@ const icloudManager = window.SidepanelIcloudManager?.createIcloudManager({
   runtime: {
     sendMessage: (message) => chrome.runtime.sendMessage(message),
   },
+  state: {
+    getSelectedEmailGenerator,
+  },
 });
 const hideIcloudLoginHelp = icloudManager?.hideIcloudLoginHelp
   || (() => { });
@@ -3944,6 +3947,9 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
       if (isLuckmailProvider()) {
         queueLuckmailPurchaseRefresh();
       }
+      if ((getSelectedEmailGenerator() === 'icloud' || getSelectedEmailGenerator() === 'icloud-standard-alias') && icloudSection?.style.display !== 'none') {
+        queueIcloudAliasRefresh();
+      }
       break;
     }
 
@@ -4059,6 +4065,11 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     }
 
     case 'ICLOUD_ALIASES_CHANGED': {
+      queueIcloudAliasRefresh();
+      break;
+    }
+
+    case 'STANDARD_ICLOUD_POOL_CHANGED': {
       queueIcloudAliasRefresh();
       break;
     }

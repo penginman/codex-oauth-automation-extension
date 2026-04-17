@@ -156,7 +156,14 @@ const HOTMAIL_LOCAL_HELPER_TIMEOUT_MS = 45000;
 const DEFAULT_LUCKMAIL_PROJECT_CODE = 'openai';
 const DISPLAY_TIMEZONE = 'Asia/Shanghai';
 const MICROSOFT_TOKEN_DNR_RULE_ID = 1001;
-const PERSISTENT_ALIAS_STATE_KEYS = ['manualAliasUsage', 'preservedAliases'];
+const PERSISTENT_ALIAS_STATE_KEYS = [
+  'manualAliasUsage',
+  'preservedAliases',
+  'standardIcloudPool',
+  'standardIcloudUsage',
+  'standardIcloudPreserved',
+  'standardIcloudRemoved',
+];
 const ACCOUNT_RUN_HISTORY_STORAGE_KEY = 'accountRunHistory';
 
 initializeSessionStorageAccess();
@@ -266,6 +273,10 @@ const DEFAULT_STATE = {
   accountRunHistory: [], // 账号运行历史快照，实际持久化在 chrome.storage.local。
   manualAliasUsage: {},
   preservedAliases: {},
+  standardIcloudPool: [],
+  standardIcloudUsage: {},
+  standardIcloudPreserved: {},
+  standardIcloudRemoved: {},
   lastEmailTimestamp: null, // 最近一次获取到邮箱数据的运行时时间戳。
   lastSignupCode: null, // 注册验证码，运行时由程序自动读取并写入。
   lastLoginCode: null, // 登录验证码，运行时由程序自动读取并写入。
@@ -875,12 +886,20 @@ async function getPersistedAliasState() {
     return {
       manualAliasUsage: normalizeBooleanMap(stored.manualAliasUsage),
       preservedAliases: normalizeBooleanMap(stored.preservedAliases),
+      standardIcloudPool: Array.isArray(stored.standardIcloudPool) ? stored.standardIcloudPool : [],
+      standardIcloudUsage: normalizeBooleanMap(stored.standardIcloudUsage),
+      standardIcloudPreserved: normalizeBooleanMap(stored.standardIcloudPreserved),
+      standardIcloudRemoved: normalizeBooleanMap(stored.standardIcloudRemoved),
     };
   } catch (err) {
     console.warn(LOG_PREFIX, 'Failed to read persisted iCloud alias state:', err?.message || err);
     return {
       manualAliasUsage: {},
       preservedAliases: {},
+      standardIcloudPool: [],
+      standardIcloudUsage: {},
+      standardIcloudPreserved: {},
+      standardIcloudRemoved: {},
     };
   }
 }
@@ -918,6 +937,20 @@ async function setState(updates) {
     }
     if (Object.prototype.hasOwnProperty.call(updates, 'preservedAliases')) {
       persistentAliasUpdates.preservedAliases = normalizeBooleanMap(updates.preservedAliases);
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'standardIcloudPool')) {
+      persistentAliasUpdates.standardIcloudPool = Array.isArray(updates.standardIcloudPool)
+        ? updates.standardIcloudPool
+        : [];
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'standardIcloudUsage')) {
+      persistentAliasUpdates.standardIcloudUsage = normalizeBooleanMap(updates.standardIcloudUsage);
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'standardIcloudPreserved')) {
+      persistentAliasUpdates.standardIcloudPreserved = normalizeBooleanMap(updates.standardIcloudPreserved);
+    }
+    if (Object.prototype.hasOwnProperty.call(updates, 'standardIcloudRemoved')) {
+      persistentAliasUpdates.standardIcloudRemoved = normalizeBooleanMap(updates.standardIcloudRemoved);
     }
     if (Object.keys(persistentAliasUpdates).length > 0) {
       await chrome.storage.local.set(persistentAliasUpdates);
@@ -1130,6 +1163,13 @@ function broadcastIcloudAliasesChanged(payload = {}) {
   }).catch(() => { });
 }
 
+function broadcastStandardIcloudPoolChanged(payload = {}) {
+  chrome.runtime.sendMessage({
+    type: 'STANDARD_ICLOUD_POOL_CHANGED',
+    payload,
+  }).catch(() => { });
+}
+
 async function setEmailStateSilently(email) {
   await setState({ email });
   broadcastDataUpdate({ email });
@@ -1243,6 +1283,97 @@ function isAliasPreserved(state, email) {
 
 function getEffectiveUsedEmails(state) {
   return toNormalizedEmailSet(getManualAliasUsageMap(state));
+}
+
+function normalizeStandardIcloudSource(value = '') {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'standard-primary' ? 'standard-primary' : 'standard-alias';
+}
+
+function normalizeStandardIcloudPoolItem(raw, fallbackHost = 'icloud.com') {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const host = normalizeIcloudHost(raw.host) || normalizeIcloudHost(fallbackHost) || 'icloud.com';
+  const email = String(raw.email || '').trim().toLowerCase();
+  if (!email || !email.includes('@')) {
+    return null;
+  }
+  const parts = email.split('@');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    return null;
+  }
+  const normalizedDomain = parts[1] === 'me.com' || parts[1] === 'mac.com' ? host : parts[1];
+  if (normalizedDomain !== 'icloud.com' && normalizedDomain !== 'icloud.com.cn') {
+    return null;
+  }
+  return {
+    email: `${parts[0]}@${normalizedDomain}`,
+    label: String(raw.label || '').trim(),
+    note: String(raw.note || '').trim(),
+    active: raw.active !== false,
+    source: normalizeStandardIcloudSource(raw.source),
+  };
+}
+
+function normalizeStandardIcloudPool(rawList, options = {}) {
+  const host = normalizeIcloudHost(options.host) || 'icloud.com';
+  const list = Array.isArray(rawList) ? rawList : [];
+  const map = new Map();
+  for (const raw of list) {
+    const normalized = normalizeStandardIcloudPoolItem(raw, host);
+    if (!normalized) {
+      continue;
+    }
+    map.set(normalized.email, normalized);
+  }
+  return Array.from(map.values()).sort((left, right) => {
+    if (left.source !== right.source) {
+      return left.source === 'standard-primary' ? -1 : 1;
+    }
+    if (left.active !== right.active) {
+      return left.active ? -1 : 1;
+    }
+    return left.email.localeCompare(right.email);
+  });
+}
+
+function getStandardIcloudUsageMap(state) {
+  return normalizeBooleanMap(state?.standardIcloudUsage);
+}
+
+function getStandardIcloudPreservedMap(state) {
+  return normalizeBooleanMap(state?.standardIcloudPreserved);
+}
+
+function getStandardIcloudRemovedMap(state) {
+  return normalizeBooleanMap(state?.standardIcloudRemoved);
+}
+
+function getStandardIcloudPoolRaw(state) {
+  return normalizeStandardIcloudPool(state?.standardIcloudPool || []);
+}
+
+function applyStandardIcloudPoolOverlays(state, pool = []) {
+  const usageMap = getStandardIcloudUsageMap(state);
+  const preservedMap = getStandardIcloudPreservedMap(state);
+  const removedMap = getStandardIcloudRemovedMap(state);
+  return normalizeStandardIcloudPool(pool)
+    .filter((item) => !removedMap[item.email])
+    .map((item) => ({
+      ...item,
+      used: Boolean(usageMap[item.email]),
+      preserved: Boolean(preservedMap[item.email]),
+    }));
+}
+
+function pickReusableStandardIcloudEmail(pool = []) {
+  const candidates = Array.isArray(pool) ? pool : [];
+  const preferred = candidates.find((item) => item.active !== false && !item.used && !item.preserved);
+  if (preferred) {
+    return preferred;
+  }
+  return candidates.find((item) => item.active !== false && !item.used) || null;
 }
 
 async function setIcloudAliasUsedState(payload = {}, options = {}) {
@@ -2975,9 +3106,35 @@ async function getPreferredIcloudSetupUrls(state = null, error = null) {
 
 function isIcloudLoginRequiredError(error) {
   const message = getErrorMessage(error).toLowerCase();
-  return message.includes('could not validate icloud session')
-    || message.includes('hide my email service was unavailable')
-    || /\bstatus (401|403|409|421)\b/.test(message);
+  if (!message) {
+    return false;
+  }
+
+  if (
+    message.includes('请先在新打开的 icloud 页面中完成登录')
+    || message.includes('需要先登录 icloud')
+    || message.includes('not logged in')
+    || message.includes('not authenticated')
+    || message.includes('unauthorized')
+    || message.includes('forbidden')
+    || message.includes('auth token is missing')
+    || message.includes('session expired')
+  ) {
+    return true;
+  }
+
+  const statusMatches = Array.from(message.matchAll(/\bstatus\s+(\d{3})\b/g))
+    .map((match) => Number(match?.[1]))
+    .filter(Number.isFinite);
+
+  if (!statusMatches.length) {
+    return false;
+  }
+
+  // Only treat pure auth-denial status groups as login required.
+  return statusMatches.every((statusCode) => (
+    statusCode === 401 || statusCode === 403 || statusCode === 421
+  ));
 }
 
 let lastIcloudLoginPromptAt = 0;
@@ -3216,6 +3373,216 @@ async function deleteUsedIcloudAliases() {
   return { deleted, skipped };
 }
 
+function buildStandardIcloudPoolFromSyncResult(payload = {}, fallbackHost = 'icloud.com') {
+  const host = normalizeIcloudHost(payload.host) || normalizeIcloudHost(fallbackHost) || 'icloud.com';
+  const list = [];
+
+  const primaryEmail = String(payload.primaryEmail || '').trim().toLowerCase();
+  if (primaryEmail) {
+    list.push({
+      email: primaryEmail,
+      label: '主要地址',
+      note: '',
+      active: true,
+      source: 'standard-primary',
+      host,
+    });
+  }
+
+  const aliases = Array.isArray(payload.aliases) ? payload.aliases : [];
+  for (const alias of aliases) {
+    const aliasEmail = String(alias?.email || '').trim().toLowerCase();
+    if (aliasEmail && aliasEmail === primaryEmail) {
+      continue;
+    }
+    list.push({
+      email: aliasEmail,
+      label: alias?.label || '',
+      note: alias?.note || '',
+      active: alias?.active !== false,
+      source: 'standard-alias',
+      host,
+    });
+  }
+
+  return normalizeStandardIcloudPool(list, { host });
+}
+
+async function syncStandardIcloudPool(options = {}) {
+  throwIfStopped();
+  const currentState = await getState();
+  const configuredHost = getConfiguredIcloudHostPreference(currentState)
+    || normalizeIcloudHost(currentState?.preferredIcloudHost)
+    || 'icloud.com';
+  const mailUrl = getIcloudMailUrlForHost(configuredHost) || 'https://www.icloud.com/mail/';
+
+  await addLog(`普通 iCloud 邮箱池：正在打开 ${new URL(mailUrl).host} 邮件页面进行同步...`, 'info');
+  await reuseOrCreateTab('icloud-mail', mailUrl);
+
+  const result = await sendToContentScript('icloud-mail', {
+    type: 'SYNC_ICLOUD_STANDARD_POOL',
+    source: 'background',
+    payload: {
+      createMissing: options.createMissing !== false,
+      maxAliasCount: Math.max(0, Math.min(3, Number(options.maxAliasCount) || 3)),
+      maxAttemptsPerAlias: Math.max(1, Number(options.maxAttemptsPerAlias) || 3),
+      pageReadyTimeoutMs: Number(options.pageReadyTimeoutMs) || 15000,
+      submitTimeoutMs: Number(options.submitTimeoutMs) || 10000,
+    },
+  });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+  if (!result?.ok) {
+    throw new Error('普通 iCloud 邮箱池同步失败：未返回成功结果。');
+  }
+
+  const normalizedPool = buildStandardIcloudPoolFromSyncResult(result, configuredHost);
+  await setState({ standardIcloudPool: normalizedPool });
+
+  const stateAfterSync = await getState();
+  const aliases = applyStandardIcloudPoolOverlays(stateAfterSync, normalizedPool);
+  const primary = aliases.find((item) => item.source === 'standard-primary');
+
+  broadcastStandardIcloudPoolChanged({
+    reason: 'synced',
+    count: aliases.length,
+    createdCount: Number(result.createdCount) || 0,
+  });
+
+  return {
+    ok: true,
+    host: normalizeIcloudHost(result.host) || configuredHost,
+    primaryEmail: primary?.email || '',
+    aliases,
+    createdCount: Number(result.createdCount) || 0,
+  };
+}
+
+async function listStandardIcloudPool() {
+  const state = await getState();
+  return applyStandardIcloudPoolOverlays(state, getStandardIcloudPoolRaw(state));
+}
+
+async function setStandardIcloudEmailUsedState(payload = {}, options = {}) {
+  const email = String(payload.email || '').trim().toLowerCase();
+  if (!email) {
+    throw new Error('未提供普通 iCloud 邮箱地址。');
+  }
+  const used = Boolean(payload.used);
+  const state = await getState();
+  const usage = getStandardIcloudUsageMap(state);
+  usage[email] = used;
+  await setState({ standardIcloudUsage: usage });
+  if (!options.silentLog) {
+    await addLog(`普通 iCloud 邮箱池：已将 ${email} 标记为${used ? '已用' : '未用'}`, 'ok');
+  }
+  broadcastStandardIcloudPoolChanged({ reason: 'used-updated', email, used });
+  return { email, used };
+}
+
+async function setStandardIcloudEmailPreservedState(payload = {}) {
+  const email = String(payload.email || '').trim().toLowerCase();
+  if (!email) {
+    throw new Error('未提供普通 iCloud 邮箱地址。');
+  }
+  const preserved = Boolean(payload.preserved);
+  const state = await getState();
+  const preservedMap = getStandardIcloudPreservedMap(state);
+  preservedMap[email] = preserved;
+  await setState({ standardIcloudPreserved: preservedMap });
+  await addLog(`普通 iCloud 邮箱池：已将 ${email} ${preserved ? '设为保留' : '取消保留'}`, 'ok');
+  broadcastStandardIcloudPoolChanged({ reason: 'preserved-updated', email, preserved });
+  return { email, preserved };
+}
+
+async function deleteStandardIcloudEmail(payload = {}, options = {}) {
+  const email = typeof payload === 'string'
+    ? String(payload).trim().toLowerCase()
+    : String(payload?.email || '').trim().toLowerCase();
+  if (!email) {
+    throw new Error('未提供普通 iCloud 邮箱地址。');
+  }
+
+  const state = await getState();
+  const removedMap = getStandardIcloudRemovedMap(state);
+  const usageMap = getStandardIcloudUsageMap(state);
+  const preservedMap = getStandardIcloudPreservedMap(state);
+
+  removedMap[email] = true;
+  delete usageMap[email];
+  delete preservedMap[email];
+
+  await setState({
+    standardIcloudRemoved: removedMap,
+    standardIcloudUsage: usageMap,
+    standardIcloudPreserved: preservedMap,
+  });
+
+  if (!options.silentLog) {
+    await addLog(`普通 iCloud 邮箱池：已在本地移除 ${email}（不会删除 iCloud 账户中的地址）。`, 'ok');
+  }
+  broadcastStandardIcloudPoolChanged({ reason: 'deleted-local', email });
+  return { email };
+}
+
+async function deleteUsedStandardIcloudEmails() {
+  const aliases = await listStandardIcloudPool();
+  const usedAliases = aliases.filter((alias) => alias.used);
+  if (!usedAliases.length) {
+    return { deleted: [], skipped: [] };
+  }
+
+  const deleted = [];
+  const skipped = [];
+  for (const alias of usedAliases) {
+    if (alias.preserved) {
+      skipped.push({ email: alias.email, error: 'preserved' });
+      continue;
+    }
+    try {
+      await deleteStandardIcloudEmail({ email: alias.email }, { silentLog: true });
+      deleted.push(alias.email);
+    } catch (err) {
+      skipped.push({ email: alias.email, error: getErrorMessage(err) });
+    }
+  }
+
+  broadcastStandardIcloudPoolChanged({ reason: 'batch-delete-local', deleted: deleted.length });
+  return { deleted, skipped };
+}
+
+async function fetchIcloudStandardAliasFromPool(state, options = {}) {
+  throwIfStopped();
+  const currentState = state || await getState();
+  const localPool = applyStandardIcloudPoolOverlays(currentState, getStandardIcloudPoolRaw(currentState));
+  const localSelected = pickReusableStandardIcloudEmail(localPool);
+  if (localSelected) {
+    await setEmailState(localSelected.email);
+    await addLog(`普通 iCloud 邮箱池：复用本地未用邮箱 ${localSelected.email}`, 'ok');
+    broadcastStandardIcloudPoolChanged({ reason: 'selected-local', email: localSelected.email });
+    return localSelected.email;
+  }
+
+  await addLog('普通 iCloud 邮箱池：本地池没有可用邮箱，开始同步并补齐别名...', 'info');
+  await syncStandardIcloudPool({
+    ...options,
+    createMissing: options.createMissing !== false,
+    maxAliasCount: 3,
+  });
+  const pool = await listStandardIcloudPool();
+  const selected = pickReusableStandardIcloudEmail(pool);
+  if (!selected) {
+    throw new Error('普通 iCloud 邮箱池中没有可用邮箱（均已标记已用或不可用）。');
+  }
+
+  await setEmailState(selected.email);
+  await addLog(`普通 iCloud 邮箱池：已选择 ${selected.email}`, 'ok');
+  broadcastStandardIcloudPoolChanged({ reason: 'selected', email: selected.email });
+  return selected.email;
+}
+
 async function fetchIcloudHideMyEmail() {
   return withIcloudLoginHelp('获取 iCloud 隐私邮箱', async () => {
     throwIfStopped();
@@ -3272,7 +3639,23 @@ async function finalizeIcloudAliasAfterSuccessfulFlow(state) {
     return { handled: false, deleted: false };
   }
 
-  const knownIcloudAlias = normalizeEmailGenerator(state?.emailGenerator) === 'icloud'
+  const generator = normalizeEmailGenerator(state?.emailGenerator);
+  if (generator === 'icloud-standard-alias') {
+    await setStandardIcloudEmailUsedState({ email, used: true }, { silentLog: true });
+    await addLog(`普通 iCloud 邮箱池：流程成功后已标记 ${email} 为已用。`, 'ok');
+    if (state.autoDeleteUsedIcloudAlias) {
+      if (getStandardIcloudPreservedMap(state)[email]) {
+        await addLog(`普通 iCloud 邮箱池：${email} 已标记保留，跳过本地移除。`, 'info');
+        return { handled: true, deleted: false };
+      }
+      await deleteStandardIcloudEmail({ email }, { silentLog: true });
+      await addLog(`普通 iCloud 邮箱池：流程成功后已本地移除 ${email}。`, 'ok');
+      return { handled: true, deleted: true };
+    }
+    return { handled: true, deleted: false };
+  }
+
+  const knownIcloudAlias = generator === 'icloud'
     || Object.prototype.hasOwnProperty.call(getManualAliasUsageMap(state), email)
     || Object.prototype.hasOwnProperty.call(getPreservedAliasMap(state), email);
   if (!knownIcloudAlias) {
@@ -4876,6 +5259,7 @@ const generatedEmailHelpers = self.MultiPageGeneratedEmailHelpers?.createGenerat
   DUCK_AUTOFILL_URL,
   fetch,
   fetchIcloudHideMyEmail,
+  fetchIcloudStandardAliasFromPool,
   getConfiguredIcloudHostPreference,
   getCloudflareTempEmailAddressFromResponse,
   getCloudflareTempEmailConfig,
@@ -5512,7 +5896,7 @@ const step9Executor = self.MultiPageBackgroundStep9?.createStep9Executor({
 });
 const stepDefinitions = self.MultiPageStepDefinitions?.getSteps?.() || [];
 const stepExecutorsByKey = {
-  'open-chatgpt': () => step1Executor.executeStep1(),
+  'open-chatgpt': () => executeStep1(),
   'submit-signup-email': (state) => step2Executor.executeStep2(state),
   'fill-password': (state) => step3Executor.executeStep3(state),
   'fetch-signup-code': (state) => step4Executor.executeStep4(state),
@@ -5566,6 +5950,7 @@ const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter
   isStopError,
   launchAutoRunTimerPlan,
   listIcloudAliases,
+  listStandardIcloudPool,
   listLuckmailPurchasesForManagement,
   normalizeHotmailAccounts,
   normalizeRunCount,
@@ -5584,6 +5969,11 @@ const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter
   setEmailStateSilently,
   setIcloudAliasPreservedState,
   setIcloudAliasUsedState,
+  setStandardIcloudEmailPreservedState,
+  setStandardIcloudEmailUsedState,
+  syncStandardIcloudPool,
+  deleteStandardIcloudEmail,
+  deleteUsedStandardIcloudEmails,
   setLuckmailPurchaseDisabledState,
   setLuckmailPurchasePreservedState,
   setLuckmailPurchaseUsedState,
@@ -5642,6 +6032,7 @@ async function resolveSignupEmailForFlow(state) {
 // ============================================================
 
 async function executeStep1() {
+  await runPreStep1CookieCleanup();
   return step1Executor.executeStep1();
 }
 
@@ -5958,16 +6349,26 @@ async function removeCookieDirectly(cookie) {
   }
 }
 
-async function runPreStep6CookieCleanup() {
-  await addLog(
-    `步骤 6：开始前等待 ${Math.round(STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS / 1000)} 秒，然后直接删除 ChatGPT / OpenAI cookies...`,
-    'info'
-  );
+async function runPreLoginCookieCleanup(options = {}) {
+  const {
+    stepLabel = '步骤 6',
+    waitMs = STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS,
+    continueMessage = '准备继续获取链接并登录。',
+  } = options;
 
-  await sleepWithStop(STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS);
+  const normalizedWaitMs = Math.max(0, Number(waitMs) || 0);
+  if (normalizedWaitMs > 0) {
+    await addLog(
+      `${stepLabel}：开始前等待 ${Math.round(normalizedWaitMs / 1000)} 秒，然后直接删除 ChatGPT / OpenAI cookies...`,
+      'info'
+    );
+    await sleepWithStop(normalizedWaitMs);
+  } else {
+    await addLog(`${stepLabel}：开始前直接删除 ChatGPT / OpenAI cookies...`, 'info');
+  }
 
   if (!chrome.cookies?.getAll || !chrome.cookies?.remove) {
-    await addLog('步骤 6：当前浏览器不支持 cookies API，无法直接删除 cookies。', 'warn');
+    await addLog(`${stepLabel}：当前浏览器不支持 cookies API，无法直接删除 cookies。`, 'warn');
     return;
   }
 
@@ -5988,11 +6389,30 @@ async function runPreStep6CookieCleanup() {
         origins: PRE_LOGIN_COOKIE_CLEAR_ORIGINS,
       });
     } catch (err) {
-      await addLog(`步骤 6：browsingData 补扫 cookies 失败：${getErrorMessage(err)}`, 'warn');
+      await addLog(`${stepLabel}：browsingData 补扫 cookies 失败：${getErrorMessage(err)}`, 'warn');
     }
   }
 
-  await addLog(`步骤 6：已直接删除 ${removedCount} 个 ChatGPT / OpenAI cookies，准备继续获取链接并登录。`, 'ok');
+  await addLog(
+    `${stepLabel}：已直接删除 ${removedCount} 个 ChatGPT / OpenAI cookies，${continueMessage}`,
+    'ok'
+  );
+}
+
+async function runPreStep1CookieCleanup() {
+  return runPreLoginCookieCleanup({
+    stepLabel: '步骤 1',
+    waitMs: 0,
+    continueMessage: '准备继续打开 ChatGPT 首页。',
+  });
+}
+
+async function runPreStep6CookieCleanup() {
+  return runPreLoginCookieCleanup({
+    stepLabel: '步骤 6',
+    waitMs: STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS,
+    continueMessage: '准备继续获取链接并登录。',
+  });
 }
 
 // ============================================================

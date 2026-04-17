@@ -112,6 +112,9 @@
           return is163MailHost(candidate.hostname);
         case 'gmail-mail':
           return candidate.hostname === 'mail.google.com';
+        case 'icloud-mail':
+          return candidate.hostname === 'www.icloud.com'
+            || candidate.hostname === 'www.icloud.com.cn';
         case 'inbucket-mail':
           return Boolean(reference)
             && candidate.origin === reference.origin
