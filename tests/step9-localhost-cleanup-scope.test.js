@@ -192,7 +192,7 @@ return {
     },
   });
 
-  await api.handleStepData(9, { localhostUrl: codexCallbackUrl });
+  await api.handleStepData(10, { localhostUrl: codexCallbackUrl });
   let snapshot = api.snapshot();
   assert.deepStrictEqual(snapshot.removedBatches, [[1], [2]]);
   assert.strictEqual(snapshot.currentState.tabRegistry['signup-page'], null);

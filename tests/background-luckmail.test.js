@@ -496,7 +496,7 @@ test('resetState preserves LuckMail session config, used map, and preserve tag c
   assert.equal(snapshot.storedPayload.currentLuckmailMailCursor, null);
 });
 
-test('handleStepData step 9 marks current LuckMail purchase as used and clears runtime state', async () => {
+test('handleStepData step 10 marks current LuckMail purchase as used and clears runtime state', async () => {
   const bundle = extractFunction('handleStepData');
 
   const factory = new Function(`
@@ -561,7 +561,7 @@ return {
 `);
 
   const api = factory();
-  await api.handleStepData(9, {
+  await api.handleStepData(10, {
     localhostUrl: 'http://localhost:1455/auth/callback?code=abc&state=xyz',
   });
 

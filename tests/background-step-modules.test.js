@@ -2,7 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 
-test('background imports step 1~9 modules', () => {
+test('background imports step 1~10 modules', () => {
   const source = fs.readFileSync('background.js', 'utf8');
 
   [
@@ -11,6 +11,7 @@ test('background imports step 1~9 modules', () => {
     'background/steps/fill-password.js',
     'background/steps/fetch-signup-code.js',
     'background/steps/fill-profile.js',
+    'background/steps/clear-login-cookies.js',
     'background/steps/oauth-login.js',
     'background/steps/fetch-login-code.js',
     'background/steps/confirm-oauth.js',

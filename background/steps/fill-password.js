@@ -26,11 +26,11 @@
         throw new Error('认证页面标签页已关闭，请先重新完成步骤 2。');
       }
 
-      const password = state.customPassword || generatePassword();
+      const password = state.customPassword || state.password || generatePassword();
       await setPasswordState(password);
 
       const accounts = state.accounts || [];
-      accounts.push({ email: resolvedEmail, password, createdAt: new Date().toISOString() });
+      accounts.push({ email: resolvedEmail, createdAt: new Date().toISOString() });
       await setState({ accounts });
 
       await chrome.tabs.update(signupTabId, { active: true });

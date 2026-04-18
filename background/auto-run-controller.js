@@ -13,6 +13,7 @@
       broadcastStopToContentScripts,
       cancelPendingCommands,
       clearStopRequest,
+      createAutoRunSessionId,
       getAutoRunStatusPayload,
       getErrorMessage,
       getFirstUnfinishedStep,
@@ -20,6 +21,7 @@
       getRunningSteps,
       getState,
       hasSavedProgress,
+      isAddPhoneAuthFailure,
       isRestartCurrentAttemptError,
       isStopError,
       launchAutoRunTimerPlan,
@@ -30,6 +32,7 @@
       runtime,
       setState,
       sleepWithStop,
+      throwIfAutoRunSessionStopped,
       waitForRunningStepsToFinish,
     } = deps;
 
@@ -175,6 +178,7 @@
         currentRun: targetRun,
         totalRuns,
         attemptRun: currentRuntime.autoRunAttemptRun,
+        autoRunSessionId: currentRuntime.autoRunSessionId,
         autoRunSkipFailures,
         roundSummaries,
         countdownTitle: '线程间隔中',
@@ -206,6 +210,7 @@
         currentRun: targetRun,
         totalRuns,
         attemptRun: nextAttemptRun,
+        autoRunSessionId: runtime.get().autoRunSessionId,
         autoRunSkipFailures,
         roundSummaries,
         countdownTitle: '线程间隔中',
@@ -225,12 +230,14 @@
         await addLog(`自动运行异常终止：${getErrorMessage(error) || '未知错误'}`, 'error');
       }
 
-      runtime.set({ autoRunActive: false });
+      runtime.set({ autoRunActive: false, autoRunSessionId: 0 });
       await broadcastAutoRunStatus('stopped', {
         currentRun: currentRuntime.autoRunCurrentRun,
         totalRuns: currentRuntime.autoRunTotalRuns,
         attemptRun: currentRuntime.autoRunAttemptRun,
+        sessionId: 0,
       }, {
+        autoRunSessionId: 0,
         autoRunTimerPlan: null,
         scheduledAutoRunPlan: null,
       });
@@ -250,12 +257,22 @@
         return;
       }
 
+      let sessionId = Number.isInteger(options.autoRunSessionId) && options.autoRunSessionId > 0
+        ? options.autoRunSessionId
+        : 0;
+      if (sessionId) {
+        throwIfAutoRunSessionStopped(sessionId);
+      } else {
+        sessionId = createAutoRunSessionId();
+      }
+
       clearStopRequest();
       runtime.set({
         autoRunActive: true,
         autoRunTotalRuns: totalRuns,
         autoRunCurrentRun: 0,
         autoRunAttemptRun: 0,
+        autoRunSessionId: sessionId,
       });
       currentRuntime = runtime.get();
 
@@ -293,12 +310,14 @@
       const showResumePosition = continueCurrentOnFirstAttempt || resumeCurrentRun > 1 || resumeAttemptRun > 1;
 
       await setState({
+        autoRunSessionId: sessionId,
         autoRunSkipFailures,
         autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
         ...getAutoRunStatusPayload(initialPhase, {
           currentRun: showResumePosition ? resumeCurrentRun : 0,
           totalRuns,
           attemptRun: showResumePosition ? resumeAttemptRun : 0,
+          sessionId,
         }),
       });
 
@@ -352,15 +371,18 @@
               autoStepDelaySeconds: prevState.autoStepDelaySeconds,
               mailProvider: prevState.mailProvider,
               emailGenerator: prevState.emailGenerator,
+              gmailBaseEmail: prevState.gmailBaseEmail,
+              mail2925BaseEmail: prevState.mail2925BaseEmail,
               emailPrefix: prevState.emailPrefix,
               inbucketHost: prevState.inbucketHost,
               inbucketMailbox: prevState.inbucketMailbox,
               cloudflareDomain: prevState.cloudflareDomain,
               cloudflareDomains: prevState.cloudflareDomains,
               autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
+              autoRunSessionId: sessionId,
               tabRegistry: {},
               sourceLastUrls: {},
-              ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun }),
+              ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun, sessionId }),
             };
             await resetState();
             await setState(keepSettings);
@@ -368,9 +390,10 @@
             await sleepWithStop(500);
           } else {
             await setState({
+              autoRunSessionId: sessionId,
               autoRunSkipFailures,
               autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
-              ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun }),
+              ...getAutoRunStatusPayload('running', { currentRun: targetRun, totalRuns, attemptRun, sessionId }),
             });
           }
 
@@ -395,11 +418,12 @@
           };
 
           try {
-            deps.throwIfStopped();
+            throwIfAutoRunSessionStopped(sessionId);
             await broadcastAutoRunStatus('running', {
               currentRun: targetRun,
               totalRuns,
               attemptRun,
+              sessionId,
             });
 
             await runAutoSequenceFromStep(startStep, {
@@ -426,17 +450,42 @@
                 currentRun: targetRun,
                 totalRuns,
                 attemptRun,
+                sessionId: 0,
               });
               break;
             }
 
             const reason = getErrorMessage(err);
             roundSummary.failureReasons.push(reason);
-            const canRetry = autoRunSkipFailures && attemptRun < maxAttemptsForRound;
+            const blockedByAddPhone = typeof isAddPhoneAuthFailure === 'function' && isAddPhoneAuthFailure(err);
+            const canRetry = !blockedByAddPhone && autoRunSkipFailures && attemptRun < maxAttemptsForRound;
+
+            if (blockedByAddPhone) {
+              roundSummary.status = 'failed';
+              roundSummary.finalFailureReason = reason;
+            }
 
             await setState({
               autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
             });
+
+            if (blockedByAddPhone) {
+              await appendRoundRecordIfNeeded('failed', reason);
+              cancelPendingCommands('当前轮因认证流程进入 add-phone 已终止。');
+              await broadcastStopToContentScripts();
+              await addLog(
+                `第 ${targetRun}/${totalRuns} 轮触发 add-phone/手机号页，当前自动运行将立即停止，不再重试或进入下一轮。`,
+                'warn'
+              );
+              stoppedEarly = true;
+              await broadcastAutoRunStatus('stopped', {
+                currentRun: targetRun,
+                totalRuns,
+                attemptRun,
+                sessionId: 0,
+              });
+              break;
+            }
 
             if (canRetry) {
               const retryIndex = attemptRun;
@@ -451,6 +500,7 @@
                 currentRun: targetRun,
                 totalRuns,
                 attemptRun,
+                sessionId,
               });
               forceFreshTabsNextRun = true;
               await addLog(
@@ -468,6 +518,7 @@
                     currentRun: targetRun,
                     totalRuns,
                     attemptRun,
+                    sessionId: 0,
                   });
                   break;
                 }
@@ -491,6 +542,7 @@
                     currentRun: targetRun,
                     totalRuns,
                     attemptRun,
+                    sessionId: 0,
                   });
                   break;
                 }
@@ -516,6 +568,7 @@
                 currentRun: targetRun,
                 totalRuns,
                 attemptRun,
+                sessionId: 0,
               });
               break;
             }
@@ -557,6 +610,7 @@
               currentRun: targetRun,
               totalRuns,
               attemptRun: runtime.get().autoRunAttemptRun,
+              sessionId: 0,
             });
             break;
           }
@@ -582,6 +636,7 @@
           currentRun: finalRuntime.autoRunCurrentRun,
           totalRuns: finalRuntime.autoRunTotalRuns,
           attemptRun: finalRuntime.autoRunAttemptRun,
+          sessionId: 0,
         });
       } else {
         await addLog(`=== 全部 ${finalRuntime.autoRunTotalRuns} 轮已执行完成，成功 ${successfulRuns} 轮 ===`, 'ok');
@@ -589,11 +644,13 @@
           currentRun: finalRuntime.autoRunTotalRuns,
           totalRuns: finalRuntime.autoRunTotalRuns,
           attemptRun: finalRuntime.autoRunAttemptRun,
+          sessionId: 0,
         });
       }
-      runtime.set({ autoRunActive: false });
+      runtime.set({ autoRunActive: false, autoRunSessionId: 0 });
       const afterRuntime = runtime.get();
       await setState({
+        autoRunSessionId: 0,
         autoRunRoundSummaries: serializeAutoRunRoundSummaries(totalRuns, roundSummaries),
         autoRunTimerPlan: null,
         scheduledAutoRunPlan: null,
@@ -601,6 +658,7 @@
           currentRun: deps.getStopRequested() || stoppedEarly ? afterRuntime.autoRunCurrentRun : afterRuntime.autoRunTotalRuns,
           totalRuns: afterRuntime.autoRunTotalRuns,
           attemptRun: afterRuntime.autoRunAttemptRun,
+          sessionId: 0,
         }),
       });
       clearStopRequest();

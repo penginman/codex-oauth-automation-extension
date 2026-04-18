@@ -83,7 +83,7 @@ if (document.documentElement.getAttribute(VPS_PANEL_LISTENER_SENTINEL) !== '1') 
 async function handleStep(step, payload) {
   switch (step) {
     case 1: return await step1_getOAuthLink(payload);
-    case 9: return await step9_vpsVerify(payload);
+    case 10: return await step9_vpsVerify(payload);
     default:
       throw new Error(`vps-panel.js 不处理步骤 ${step}`);
   }
@@ -467,11 +467,11 @@ async function waitForExactSuccessBadge(timeout = STEP9_SUCCESS_BADGE_TIMEOUT_MS
     if (diagnostics.signature !== lastDiagnosticsSignature) {
       lastDiagnosticsSignature = diagnostics.signature;
       lastHeartbeatLoggedAt = elapsed;
-      log(`步骤 9：认证状态检测中，${diagnostics.summary}`);
+      log(`步骤 10：认证状态检测中，${diagnostics.summary}`);
       console.log(LOG_PREFIX, '[Step 9] status badge diagnostics changed', diagnostics);
     } else if (elapsed - lastHeartbeatLoggedAt >= 10000) {
       lastHeartbeatLoggedAt = elapsed;
-      log(`步骤 9：仍在等待认证成功，${diagnostics.summary}`);
+      log(`步骤 10：仍在等待认证成功，${diagnostics.summary}`);
       console.log(LOG_PREFIX, '[Step 9] still waiting for success badge', diagnostics);
     }
 
@@ -488,7 +488,7 @@ async function waitForExactSuccessBadge(timeout = STEP9_SUCCESS_BADGE_TIMEOUT_MS
           ? `；错误样式徽标：${diagnostics.errorStyledSummary}`
           : '';
         log(
-          `步骤 9：检测到“认证成功”相关徽标，但未命中精确成功条件。当前聚焦="${getInlineTextSnippet(diagnostics.selectedText || '(空)', 80)}"；成功相关徽标：${diagnostics.successLikeSummary}${errorStyledSuffix}`,
+          `步骤 10：检测到“认证成功”相关徽标，但未命中精确成功条件。当前聚焦="${getInlineTextSnippet(diagnostics.selectedText || '(空)', 80)}"；成功相关徽标：${diagnostics.successLikeSummary}${errorStyledSuffix}`,
           'warn'
         );
         console.warn(LOG_PREFIX, '[Step 9] success-like badge detected without exact match', diagnostics);
@@ -507,7 +507,7 @@ async function waitForExactSuccessBadge(timeout = STEP9_SUCCESS_BADGE_TIMEOUT_MS
           ? diagnostics.pageErrorSummary
           : diagnostics.failureSummary;
         log(
-          `步骤 9：同时检测到成功徽标和失败提示，本轮不判定成功。成功徽标：${diagnostics.exactSuccessSummary}；失败提示：${failureSummary}`,
+          `步骤 10：同时检测到成功徽标和失败提示，本轮不判定成功。成功徽标：${diagnostics.exactSuccessSummary}；失败提示：${failureSummary}`,
           'warn'
         );
         console.warn(LOG_PREFIX, '[Step 9] success badge is blocked by visible failure', diagnostics);
@@ -777,7 +777,7 @@ async function step1_getOAuthLink(payload, options = {}) {
 }
 
 // ============================================================
-// 步骤 9：CPA 回调验证——填写 localhost 回调地址并提交
+// 步骤 10：CPA 回调验证——填写 localhost 回调地址并提交
 // ============================================================
 
 async function step9_vpsVerify(payload) {
@@ -786,22 +786,22 @@ async function step9_vpsVerify(payload) {
   // 优先从 payload 读取 localhostUrl；没有时再回退到全局状态
   let localhostUrl = payload?.localhostUrl;
   if (localhostUrl && !isLocalhostOAuthCallbackUrl(localhostUrl)) {
-    throw new Error('步骤 9 只接受真实的 localhost OAuth 回调地址，请重新执行步骤 8。');
+    throw new Error('步骤 10 只接受真实的 localhost OAuth 回调地址，请重新执行步骤 9。');
   }
   if (!localhostUrl) {
-    log('步骤 9：payload 中没有 localhostUrl，正在从状态中读取...');
+    log('步骤 10：payload 中没有 localhostUrl，正在从状态中读取...');
     const state = await chrome.runtime.sendMessage({ type: 'GET_STATE' });
     localhostUrl = state.localhostUrl;
     if (localhostUrl && !isLocalhostOAuthCallbackUrl(localhostUrl)) {
-      throw new Error('步骤 9 只接受真实的 localhost OAuth 回调地址，请重新执行步骤 8。');
+      throw new Error('步骤 10 只接受真实的 localhost OAuth 回调地址，请重新执行步骤 9。');
     }
   }
   if (!localhostUrl) {
     throw new Error('未找到 localhost 回调地址，请先完成步骤 8。');
   }
-  log(`步骤 9：已获取 localhostUrl：${localhostUrl.slice(0, 60)}...`);
+  log(`步骤 10：已获取 localhostUrl：${localhostUrl.slice(0, 60)}...`);
 
-  log('步骤 9：正在查找回调地址输入框...');
+  log('步骤 10：正在查找回调地址输入框...');
 
   // Find the callback URL input
   // Actual DOM: <input class="input" placeholder="http://localhost:1455/auth/callback?code=...&state=...">
@@ -818,7 +818,7 @@ async function step9_vpsVerify(payload) {
 
   await humanPause(600, 1500);
   fillInput(urlInput, localhostUrl);
-  log(`步骤 9：已填写回调地址：${localhostUrl.slice(0, 80)}...`);
+  log(`步骤 10：已填写回调地址：${localhostUrl.slice(0, 80)}...`);
 
   // Find and click the callback submit button in supported UI languages.
   const callbackSubmitPattern = /提交回调\s*URL|Submit\s+Callback\s+URL|Отправить\s+Callback\s+URL/i;
@@ -839,9 +839,9 @@ async function step9_vpsVerify(payload) {
 
   await humanPause(450, 1200);
   simulateClick(submitBtn);
-  log('步骤 9：已点击回调提交按钮，正在等待认证结果...');
+  log('步骤 10：已点击回调提交按钮，正在等待认证结果...');
 
   const verifiedStatus = await waitForExactSuccessBadge();
-  log(`步骤 9：${verifiedStatus}`, 'ok');
-  reportComplete(9, { localhostUrl, verifiedStatus });
+  log(`步骤 10：${verifiedStatus}`, 'ok');
+  reportComplete(10, { localhostUrl, verifiedStatus });
 }

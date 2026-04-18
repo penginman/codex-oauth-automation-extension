@@ -4,34 +4,7 @@
       dom,
       helpers,
       runtime,
-      state,
     } = context;
-
-    function getCurrentGenerator() {
-      return String(state?.getSelectedEmailGenerator?.() || '').trim().toLowerCase();
-    }
-
-    function isStandardMode() {
-      return getCurrentGenerator() === 'icloud-standard-alias';
-    }
-
-    function getIcloudMessageType(type) {
-      if (!isStandardMode()) {
-        return type;
-      }
-      const mapping = {
-        LIST_ICLOUD_ALIASES: 'LIST_STANDARD_ICLOUD_POOL',
-        SET_ICLOUD_ALIAS_USED_STATE: 'SET_STANDARD_ICLOUD_EMAIL_USED_STATE',
-        SET_ICLOUD_ALIAS_PRESERVED_STATE: 'SET_STANDARD_ICLOUD_EMAIL_PRESERVED_STATE',
-        DELETE_ICLOUD_ALIAS: 'DELETE_STANDARD_ICLOUD_EMAIL',
-        DELETE_USED_ICLOUD_ALIASES: 'DELETE_USED_STANDARD_ICLOUD_EMAILS',
-      };
-      return mapping[type] || type;
-    }
-
-    function getIcloudPanelLabel() {
-      return isStandardMode() ? '普通 iCloud 邮箱池' : 'iCloud 别名';
-    }
 
     let refreshQueued = false;
     let renderedAliases = [];
@@ -145,10 +118,8 @@
 
       if (!aliases.length) {
         selectedEmails.clear();
-        dom.icloudList.innerHTML = `<div class="icloud-empty">${isStandardMode() ? '未找到普通 iCloud 可注册邮箱。' : '未找到 iCloud Hide My Email 别名。'}</div>`;
-        dom.icloudSummary.textContent = isStandardMode()
-          ? '加载你的普通 iCloud 邮箱池以便在这里管理。'
-          : '加载你的 iCloud Hide My Email 别名以便在这里管理。';
+        dom.icloudList.innerHTML = '<div class="icloud-empty">未找到 iCloud Hide My Email 别名。</div>';
+        dom.icloudSummary.textContent = '加载你的 iCloud Hide My Email 别名以便在这里管理。';
         if (dom.btnIcloudDeleteUsed) dom.btnIcloudDeleteUsed.disabled = true;
         updateIcloudBulkUI([]);
         return;
@@ -156,9 +127,7 @@
 
       const usedCount = aliases.filter((alias) => alias.used).length;
       const deletableUsedCount = aliases.filter((alias) => alias.used && !alias.preserved).length;
-      dom.icloudSummary.textContent = isStandardMode()
-        ? `已加载 ${aliases.length} 个普通 iCloud 邮箱，其中 ${usedCount} 个已标记为已用。`
-        : `已加载 ${aliases.length} 个别名，其中 ${usedCount} 个已标记为已用。`;
+      dom.icloudSummary.textContent = `已加载 ${aliases.length} 个别名，其中 ${usedCount} 个已标记为已用。`;
       if (dom.btnIcloudDeleteUsed) dom.btnIcloudDeleteUsed.disabled = deletableUsedCount === 0;
 
       const visibleAliases = getFilteredIcloudAliases(aliases);
@@ -219,10 +188,10 @@
         return;
       }
 
-      if (!silent) setIcloudLoadingState(true, isStandardMode() ? '正在加载普通 iCloud 邮箱池...' : '正在加载 iCloud 别名...');
+      if (!silent) setIcloudLoadingState(true, '正在加载 iCloud 别名...');
       try {
         const response = await runtime.sendMessage({
-          type: getIcloudMessageType('LIST_ICLOUD_ALIASES'),
+          type: 'LIST_ICLOUD_ALIASES',
           source: 'sidepanel',
           payload: {},
         });
@@ -232,13 +201,13 @@
       } catch (err) {
         selectedEmails.clear();
         if (dom.icloudList) {
-          dom.icloudList.innerHTML = `<div class="icloud-empty">${isStandardMode() ? '无法加载普通 iCloud 邮箱池。' : '无法加载 iCloud 别名。'}</div>`;
+          dom.icloudList.innerHTML = '<div class="icloud-empty">无法加载 iCloud 别名。</div>';
         }
         if (dom.icloudSummary) {
           dom.icloudSummary.textContent = err.message;
         }
         updateIcloudBulkUI([]);
-        if (!silent) helpers.showToast(`${isStandardMode() ? '普通 iCloud 邮箱池' : 'iCloud 别名'}加载失败：${err.message}`, 'error');
+        if (!silent) helpers.showToast(`iCloud 别名加载失败：${err.message}`, 'error');
       } finally {
         setIcloudLoadingState(false);
       }
@@ -255,10 +224,8 @@
 
     async function deleteSingleIcloudAlias(alias) {
       const confirmed = await helpers.openConfirmModal({
-        title: `删除${getIcloudPanelLabel()}`,
-        message: isStandardMode()
-          ? `确认在本地移除 ${alias.email} 吗？不会删除 iCloud 账户中的地址。`
-          : `确认删除 ${alias.email} 吗？此操作不可撤销。`,
+        title: '删除 iCloud 别名',
+        message: `确认删除 ${alias.email} 吗？此操作不可撤销。`,
         confirmLabel: '确认删除',
         confirmVariant: 'btn-danger',
       });
@@ -269,7 +236,7 @@
       setIcloudLoadingState(true, `正在删除 ${alias.email} ...`);
       try {
         const response = await runtime.sendMessage({
-          type: getIcloudMessageType('DELETE_ICLOUD_ALIAS'),
+          type: 'DELETE_ICLOUD_ALIAS',
           source: 'sidepanel',
           payload: { email: alias.email, anonymousId: alias.anonymousId },
         });
@@ -278,7 +245,7 @@
         await refreshIcloudAliases({ silent: true });
       } catch (err) {
         if (dom.icloudSummary) dom.icloudSummary.textContent = err.message;
-        helpers.showToast(`删除${getIcloudPanelLabel()}失败：${err.message}`, 'error');
+        helpers.showToast(`删除 iCloud 别名失败：${err.message}`, 'error');
       } finally {
         setIcloudLoadingState(false);
       }
@@ -288,7 +255,7 @@
       setIcloudLoadingState(true, `正在更新 ${alias.email} 的使用状态...`);
       try {
         const response = await runtime.sendMessage({
-          type: getIcloudMessageType('SET_ICLOUD_ALIAS_USED_STATE'),
+          type: 'SET_ICLOUD_ALIAS_USED_STATE',
           source: 'sidepanel',
           payload: { email: alias.email, used },
         });
@@ -297,7 +264,7 @@
         await refreshIcloudAliases({ silent: true });
       } catch (err) {
         if (dom.icloudSummary) dom.icloudSummary.textContent = err.message;
-        helpers.showToast(`更新${getIcloudPanelLabel()}使用状态失败：${err.message}`, 'error');
+        helpers.showToast(`更新 iCloud 使用状态失败：${err.message}`, 'error');
       } finally {
         setIcloudLoadingState(false);
       }
@@ -307,7 +274,7 @@
       setIcloudLoadingState(true, `正在更新 ${alias.email} 的保留状态...`);
       try {
         const response = await runtime.sendMessage({
-          type: getIcloudMessageType('SET_ICLOUD_ALIAS_PRESERVED_STATE'),
+          type: 'SET_ICLOUD_ALIAS_PRESERVED_STATE',
           source: 'sidepanel',
           payload: { email: alias.email, preserved },
         });
@@ -316,7 +283,7 @@
         await refreshIcloudAliases({ silent: true });
       } catch (err) {
         if (dom.icloudSummary) dom.icloudSummary.textContent = err.message;
-        helpers.showToast(`更新${getIcloudPanelLabel()}保留状态失败：${err.message}`, 'error');
+        helpers.showToast(`更新 iCloud 保留状态失败：${err.message}`, 'error');
       } finally {
         setIcloudLoadingState(false);
       }
@@ -331,10 +298,8 @@
 
       if (action === 'delete') {
         const confirmed = await helpers.openConfirmModal({
-          title: `批量删除${getIcloudPanelLabel()}`,
-          message: isStandardMode()
-            ? `确认在本地移除选中的 ${selectedAliases.length} 个普通 iCloud 邮箱吗？不会删除 iCloud 账户中的地址。`
-            : `确认删除选中的 ${selectedAliases.length} 个 iCloud 别名吗？此操作不可撤销。`,
+          title: '批量删除 iCloud 别名',
+          message: `确认删除选中的 ${selectedAliases.length} 个 iCloud 别名吗？此操作不可撤销。`,
           confirmLabel: '确认删除',
           confirmVariant: 'btn-danger',
         });
@@ -350,26 +315,26 @@
         unpreserve: '取消保留',
         delete: '删除',
       };
-      setIcloudLoadingState(true, `正在批量${actionLabelMap[action] || '处理'}${getIcloudPanelLabel()}...`);
+      setIcloudLoadingState(true, `正在批量${actionLabelMap[action] || '处理'} iCloud 别名...`);
 
       try {
         for (const alias of selectedAliases) {
           let response = null;
           if (action === 'used' || action === 'unused') {
             response = await runtime.sendMessage({
-              type: getIcloudMessageType('SET_ICLOUD_ALIAS_USED_STATE'),
+              type: 'SET_ICLOUD_ALIAS_USED_STATE',
               source: 'sidepanel',
               payload: { email: alias.email, used: action === 'used' },
             });
           } else if (action === 'preserve' || action === 'unpreserve') {
             response = await runtime.sendMessage({
-              type: getIcloudMessageType('SET_ICLOUD_ALIAS_PRESERVED_STATE'),
+              type: 'SET_ICLOUD_ALIAS_PRESERVED_STATE',
               source: 'sidepanel',
               payload: { email: alias.email, preserved: action === 'preserve' },
             });
           } else if (action === 'delete') {
             response = await runtime.sendMessage({
-              type: getIcloudMessageType('DELETE_ICLOUD_ALIAS'),
+              type: 'DELETE_ICLOUD_ALIAS',
               source: 'sidepanel',
               payload: { email: alias.email, anonymousId: alias.anonymousId },
             });
@@ -381,11 +346,11 @@
           }
         }
 
-        helpers.showToast(`已批量${actionLabelMap[action] || '处理'} ${selectedAliases.length} 个${getIcloudPanelLabel()}`, 'success', 2400);
+        helpers.showToast(`已批量${actionLabelMap[action] || '处理'} ${selectedAliases.length} 个 iCloud 别名`, 'success', 2400);
         await refreshIcloudAliases({ silent: true });
       } catch (err) {
         if (dom.icloudSummary) dom.icloudSummary.textContent = err.message;
-        helpers.showToast(`批量处理${getIcloudPanelLabel()}失败：${err.message}`, 'error');
+        helpers.showToast(`批量处理 iCloud 别名失败：${err.message}`, 'error');
       } finally {
         setIcloudLoadingState(false);
         updateIcloudBulkUI();
@@ -394,10 +359,8 @@
 
     async function deleteUsedIcloudAliases() {
       const confirmed = await helpers.openConfirmModal({
-        title: isStandardMode() ? '删除已用普通 iCloud 邮箱' : '删除已用 iCloud 别名',
-        message: isStandardMode()
-          ? '确认在本地移除所有未保留的已用普通 iCloud 邮箱吗？不会删除 iCloud 账户中的地址。'
-          : '确认删除所有未保留的已用 iCloud 别名吗？此操作不可撤销。',
+        title: '删除已用 iCloud 别名',
+        message: '确认删除所有未保留的已用 iCloud 别名吗？此操作不可撤销。',
         confirmLabel: '确认删除',
         confirmVariant: 'btn-danger',
       });
@@ -405,10 +368,10 @@
         return;
       }
 
-      setIcloudLoadingState(true, isStandardMode() ? '正在本地移除已用普通 iCloud 邮箱...' : '正在删除已用 iCloud 别名...');
+      setIcloudLoadingState(true, '正在删除已用 iCloud 别名...');
       try {
         const response = await runtime.sendMessage({
-          type: getIcloudMessageType('DELETE_USED_ICLOUD_ALIASES'),
+          type: 'DELETE_USED_ICLOUD_ALIASES',
           source: 'sidepanel',
           payload: {},
         });
@@ -419,7 +382,7 @@
         await refreshIcloudAliases({ silent: true });
       } catch (err) {
         if (dom.icloudSummary) dom.icloudSummary.textContent = err.message;
-        helpers.showToast(`删除已用${getIcloudPanelLabel()}失败：${err.message}`, 'error');
+        helpers.showToast(`删除已用 iCloud 别名失败：${err.message}`, 'error');
       } finally {
         setIcloudLoadingState(false);
       }
@@ -459,11 +422,7 @@
       if (dom.inputIcloudSearch) dom.inputIcloudSearch.value = '';
       if (dom.selectIcloudFilter) dom.selectIcloudFilter.value = 'all';
       if (dom.icloudList) dom.icloudList.innerHTML = '';
-      if (dom.icloudSummary) {
-        dom.icloudSummary.textContent = isStandardMode()
-          ? '加载你的普通 iCloud 邮箱池以便在这里管理。'
-          : '加载你的 iCloud Hide My Email 别名以便在这里管理。';
-      }
+      if (dom.icloudSummary) dom.icloudSummary.textContent = '加载你的 iCloud Hide My Email 别名以便在这里管理。';
       updateIcloudBulkUI([]);
       hideIcloudLoginHelp();
     }
@@ -474,22 +433,6 @@
 
     function bindIcloudEvents() {
       dom.btnIcloudRefresh?.addEventListener('click', async () => {
-        if (isStandardMode()) {
-          setIcloudLoadingState(true, '正在同步普通 iCloud 邮箱池...');
-          try {
-            const response = await runtime.sendMessage({
-              type: 'SYNC_STANDARD_ICLOUD_POOL',
-              source: 'sidepanel',
-              payload: { createMissing: false },
-            });
-            if (response?.error) throw new Error(response.error);
-            helpers.showToast('普通 iCloud 邮箱池同步完成', 'success', 2200);
-          } catch (err) {
-            helpers.showToast(`普通 iCloud 邮箱池同步失败：${err.message}`, 'error');
-          } finally {
-            setIcloudLoadingState(false);
-          }
-        }
         await refreshIcloudAliases();
       });
 

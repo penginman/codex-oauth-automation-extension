@@ -7,5 +7,6 @@
 /data/account-run-history.txt
 /.worktrees/
 
-/.worktrees/
-
+/data/account-run-history.json
+.npm-test.log
+.omx/

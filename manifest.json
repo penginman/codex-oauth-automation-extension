@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "多页面自动化",
-  "version": "11.0.0",
+  "version": "2.5",
+  "version_name": "Pro2.5",
   "description": "用于自动执行多步骤 OAuth 注册流程",
   "permissions": [
     "sidePanel",
@@ -46,6 +47,7 @@
       "js": [
         "content/activation-utils.js",
         "content/utils.js",
+        "content/auth-page-recovery.js",
         "content/signup-page.js"
       ],
       "run_at": "document_idle"

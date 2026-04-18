@@ -1,6 +1,7 @@
 // background.js — Service Worker: orchestration, state, tab management, message routing
 
 importScripts(
+  'managed-alias-utils.js',
   'background/account-run-history.js',
   'background/panel-bridge.js',
   'background/generated-email-helpers.js',
@@ -18,6 +19,7 @@ importScripts(
   'background/steps/fill-password.js',
   'background/steps/fetch-signup-code.js',
   'background/steps/fill-profile.js',
+  'background/steps/clear-login-cookies.js',
   'background/steps/oauth-login.js',
   'background/steps/fetch-login-code.js',
   'background/steps/confirm-oauth.js',
@@ -30,6 +32,14 @@ importScripts(
   'icloud-utils.js',
   'content/activation-utils.js'
 );
+
+const SHARED_STEP_DEFINITIONS = self.MultiPageStepDefinitions?.getSteps?.() || [];
+const STEP_IDS = SHARED_STEP_DEFINITIONS
+  .map((definition) => Number(definition?.id))
+  .filter(Number.isFinite)
+  .sort((left, right) => left - right);
+const LAST_STEP_ID = STEP_IDS[STEP_IDS.length - 1] || 10;
+const FINAL_OAUTH_CHAIN_START_STEP = 7;
 
 const {
   extractVerificationCodeFromMessage,
@@ -122,14 +132,20 @@ const CLOUDFLARE_TEMP_EMAIL_PROVIDER = 'cloudflare-temp-email';
 const CLOUDFLARE_TEMP_EMAIL_GENERATOR = 'cloudflare-temp-email';
 const HOTMAIL_MAILBOXES = ['INBOX', 'Junk'];
 const STOP_ERROR_MESSAGE = '流程已被用户停止。';
+const CLOUDFLARE_SECURITY_BLOCK_ERROR_PREFIX = 'CF_SECURITY_BLOCKED::';
+const CLOUDFLARE_SECURITY_BLOCK_USER_MESSAGE = '您已触发Cloudflare 安全防护系统，已完全停止流程，请不要短时间内多次进行重新发送验证码，连续刷新、反复点击重试会加重风控；请先关闭页面等待 15-30 分钟，让系统的临时限制自动解除。或者更换浏览器';
+const NETWORK_TIMEOUT_BLOCK_ERROR_PREFIX = 'NETWORK_TIMEOUT_BLOCKED::';
+const NETWORK_TIMEOUT_BLOCK_USER_MESSAGE = '请检查当前网络节点是否稳定，若你使用的代理 / /VPN 节点无延迟过高问题，请换一个服务器继续使用此邮箱继续登陆';
 const HUMAN_STEP_DELAY_MIN = 700;
 const HUMAN_STEP_DELAY_MAX = 2200;
 const STEP6_MAX_ATTEMPTS = 3;
 const STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS = 8;
+const OAUTH_FLOW_TIMEOUT_MS = 6 * 60 * 1000;
 const SUB2API_STEP1_RESPONSE_TIMEOUT_MS = 90000;
 const SUB2API_STEP9_RESPONSE_TIMEOUT_MS = 120000;
 const DEFAULT_SUB2API_URL = 'https://sub2api.hisence.fun/admin/accounts';
 const DEFAULT_SUB2API_GROUP_NAME = 'codex';
+const DEFAULT_SUB2API_PROXY_NAME = 'shadowrocket';
 const DEFAULT_SUB2API_REDIRECT_URI = 'http://localhost:1455/auth/callback';
 const AUTO_RUN_TIMER_ALARM_NAME = 'auto-run-timer';
 const AUTO_RUN_TIMER_KIND_SCHEDULED_START = 'scheduled_start';
@@ -141,9 +157,12 @@ const AUTO_RUN_RETRY_DELAY_MS = 3000;
 const AUTO_RUN_MAX_RETRIES_PER_ROUND = 3;
 const AUTO_STEP_DELAY_MIN_ALLOWED_SECONDS = 0;
 const AUTO_STEP_DELAY_MAX_ALLOWED_SECONDS = 600;
+const VERIFICATION_RESEND_COUNT_MIN = 0;
+const VERIFICATION_RESEND_COUNT_MAX = 20;
+const DEFAULT_VERIFICATION_RESEND_COUNT = 4;
 const LEGACY_AUTO_STEP_DELAY_KEYS = ['autoStepRandomDelayMinSeconds', 'autoStepRandomDelayMaxSeconds'];
+const LEGACY_VERIFICATION_RESEND_COUNT_KEYS = ['signupVerificationResendCount', 'loginVerificationResendCount'];
 const DEFAULT_LOCAL_CPA_STEP9_MODE = 'submit';
-const DEFAULT_CPA_CALLBACK_MODE = 'step8';
 const MAIL_2925_MODE_PROVIDE = 'provide';
 const MAIL_2925_MODE_RECEIVE = 'receive';
 const DEFAULT_MAIL_2925_MODE = MAIL_2925_MODE_PROVIDE;
@@ -156,14 +175,7 @@ const HOTMAIL_LOCAL_HELPER_TIMEOUT_MS = 45000;
 const DEFAULT_LUCKMAIL_PROJECT_CODE = 'openai';
 const DISPLAY_TIMEZONE = 'Asia/Shanghai';
 const MICROSOFT_TOKEN_DNR_RULE_ID = 1001;
-const PERSISTENT_ALIAS_STATE_KEYS = [
-  'manualAliasUsage',
-  'preservedAliases',
-  'standardIcloudPool',
-  'standardIcloudUsage',
-  'standardIcloudPreserved',
-  'standardIcloudRemoved',
-];
+const PERSISTENT_ALIAS_STATE_KEYS = ['manualAliasUsage', 'preservedAliases'];
 const ACCOUNT_RUN_HISTORY_STORAGE_KEY = 'accountRunHistory';
 
 initializeSessionStorageAccess();
@@ -204,17 +216,18 @@ const PERSISTED_SETTING_DEFAULTS = {
   vpsUrl: '',
   vpsPassword: '',
   localCpaStep9Mode: DEFAULT_LOCAL_CPA_STEP9_MODE,
-  cpaCallbackMode: DEFAULT_CPA_CALLBACK_MODE,
   sub2apiUrl: DEFAULT_SUB2API_URL,
   sub2apiEmail: '',
   sub2apiPassword: '',
   sub2apiGroupName: DEFAULT_SUB2API_GROUP_NAME,
+  sub2apiDefaultProxyName: DEFAULT_SUB2API_PROXY_NAME,
   customPassword: '',
   autoRunSkipFailures: false,
   autoRunFallbackThreadIntervalMinutes: 0,
   autoRunDelayEnabled: false,
   autoRunDelayMinutes: 30,
   autoStepDelaySeconds: null,
+  verificationResendCount: DEFAULT_VERIFICATION_RESEND_COUNT,
   mailProvider: '163',
   mail2925Mode: DEFAULT_MAIL_2925_MODE,
   emailGenerator: 'duck',
@@ -222,6 +235,8 @@ const PERSISTED_SETTING_DEFAULTS = {
   icloudHostPreference: 'auto',
   accountRunHistoryTextEnabled: false,
   accountRunHistoryHelperBaseUrl: DEFAULT_ACCOUNT_RUN_HISTORY_HELPER_BASE_URL,
+  gmailBaseEmail: '',
+  mail2925BaseEmail: '',
   emailPrefix: '',
   inbucketHost: '',
   inbucketMailbox: '',
@@ -242,7 +257,7 @@ const PERSISTED_SETTING_DEFAULTS = {
 const PERSISTED_SETTING_KEYS = Object.keys(PERSISTED_SETTING_DEFAULTS);
 const SETTINGS_EXPORT_SCHEMA_VERSION = 1;
 const SETTINGS_EXPORT_FILENAME_PREFIX = 'multipage-settings';
-const STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS = 3000;
+const STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS = 25000;
 const PRE_LOGIN_COOKIE_CLEAR_DOMAINS = [
   'chatgpt.com',
   'chat.openai.com',
@@ -262,10 +277,7 @@ const PRE_LOGIN_COOKIE_CLEAR_ORIGINS = [
 
 const DEFAULT_STATE = {
   currentStep: 0, // 当前流程执行到的步骤编号。
-  stepStatuses: {
-    1: 'pending', 2: 'pending', 3: 'pending', 4: 'pending', 5: 'pending', // 运行时步骤状态映射，不要手动预填。
-    6: 'pending', 7: 'pending', 8: 'pending', 9: 'pending',
-  },
+  stepStatuses: Object.fromEntries(STEP_IDS.map((stepId) => [stepId, 'pending'])),
   oauthUrl: null, // 运行时抓取到的 OAuth 地址，不要手动预填。
   email: null, // 运行时邮箱，由程序自动获取并写入，不能手动预填。
   password: null, // 运行时实际密码，由 customPassword 或程序自动生成后写入。
@@ -273,10 +285,6 @@ const DEFAULT_STATE = {
   accountRunHistory: [], // 账号运行历史快照，实际持久化在 chrome.storage.local。
   manualAliasUsage: {},
   preservedAliases: {},
-  standardIcloudPool: [],
-  standardIcloudUsage: {},
-  standardIcloudPreserved: {},
-  standardIcloudRemoved: {},
   lastEmailTimestamp: null, // 最近一次获取到邮箱数据的运行时时间戳。
   lastSignupCode: null, // 注册验证码，运行时由程序自动读取并写入。
   lastLoginCode: null, // 登录验证码，运行时由程序自动读取并写入。
@@ -285,6 +293,7 @@ const DEFAULT_STATE = {
   sub2apiOAuthState: null, // SUB2API OpenAI Auth state。
   sub2apiGroupId: null, // SUB2API 目标分组 ID。
   sub2apiDraftName: null, // SUB2API 本轮预生成的账号名称。
+  sub2apiProxyId: null, // SUB2API 本轮使用的代理 ID。
   flowStartTime: null, // 当前流程开始时间。
   tabRegistry: {}, // 程序维护的标签页注册表。
   sourceLastUrls: {}, // 各来源页面最近一次打开的地址记录。
@@ -304,6 +313,7 @@ const DEFAULT_STATE = {
   autoRunCurrentRun: 0, // 自动运行当前执行到第几轮。
   autoRunTotalRuns: 1, // 自动运行计划总轮数。
   autoRunAttemptRun: 0, // 当前轮次的重试序号。
+  autoRunSessionId: 0,
   autoRunRoundSummaries: [], // 自动运行轮次摘要。
   scheduledAutoRunAt: null, // 自动运行计划启动时间戳。
   autoRunTimerPlan: null, // 自动运行可恢复计时计划快照。
@@ -312,6 +322,7 @@ const DEFAULT_STATE = {
   autoRunCountdownNote: '',
   signupVerificationRequestedAt: null,
   loginVerificationRequestedAt: null,
+  oauthFlowDeadlineAt: null,
   currentHotmailAccountId: null,
   preferredIcloudHost: '',
 };
@@ -361,6 +372,23 @@ function normalizeAutoStepDelaySeconds(value, fallback = null) {
   );
 }
 
+function normalizeVerificationResendCount(value, fallback) {
+  const rawValue = String(value ?? '').trim();
+  if (!rawValue) {
+    return fallback;
+  }
+
+  const numeric = Number(rawValue);
+  if (!Number.isFinite(numeric)) {
+    return fallback;
+  }
+
+  return Math.min(
+    VERIFICATION_RESEND_COUNT_MAX,
+    Math.max(VERIFICATION_RESEND_COUNT_MIN, Math.floor(numeric))
+  );
+}
+
 function resolveLegacyAutoStepDelaySeconds(input = {}) {
   const hasLegacyMin = input.autoStepRandomDelayMinSeconds !== undefined;
   const hasLegacyMax = input.autoStepRandomDelayMaxSeconds !== undefined;
@@ -404,6 +432,48 @@ function normalizeAutoRunTimerKind(value = '') {
   return '';
 }
 
+function normalizeAutoRunSessionId(value) {
+  const numeric = Math.floor(Number(value) || 0);
+  return numeric > 0 ? numeric : 0;
+}
+
+function createAutoRunSessionId() {
+  autoRunSessionSeed = Math.max(autoRunSessionSeed + 1, Date.now());
+  autoRunSessionId = autoRunSessionSeed;
+  return autoRunSessionId;
+}
+
+function setCurrentAutoRunSessionId(value) {
+  autoRunSessionId = normalizeAutoRunSessionId(value);
+  return autoRunSessionId;
+}
+
+function clearCurrentAutoRunSessionId(expectedSessionId = null) {
+  if (expectedSessionId === null) {
+    autoRunSessionId = 0;
+    return autoRunSessionId;
+  }
+
+  const normalizedExpected = normalizeAutoRunSessionId(expectedSessionId);
+  if (!normalizedExpected || normalizedExpected === autoRunSessionId) {
+    autoRunSessionId = 0;
+  }
+  return autoRunSessionId;
+}
+
+function isCurrentAutoRunSessionId(value) {
+  const normalized = normalizeAutoRunSessionId(value);
+  return normalized > 0 && normalized === autoRunSessionId;
+}
+
+function throwIfAutoRunSessionStopped(sessionId) {
+  const normalizedSessionId = normalizeAutoRunSessionId(sessionId);
+  if (normalizedSessionId && !isCurrentAutoRunSessionId(normalizedSessionId)) {
+    throw new Error(STOP_ERROR_MESSAGE);
+  }
+  throwIfStopped();
+}
+
 function normalizeAutoRunTimerPlan(plan) {
   if (!plan || typeof plan !== 'object' || Array.isArray(plan)) {
     return null;
@@ -427,6 +497,7 @@ function normalizeAutoRunTimerPlan(plan) {
     0,
     Math.min(AUTO_RUN_MAX_RETRIES_PER_ROUND + 1, Math.floor(Number(plan.attemptRun) || 0))
   );
+  const autoRunSessionId = normalizeAutoRunSessionId(plan.autoRunSessionId ?? plan.sessionId);
   const roundSummaries = serializeAutoRunRoundSummaries(totalRuns, plan.roundSummaries);
   const countdownTitle = String(plan.countdownTitle || '').trim();
   const countdownNote = String(plan.countdownNote || '').trim();
@@ -440,6 +511,7 @@ function normalizeAutoRunTimerPlan(plan) {
       mode,
       currentRun: 0,
       attemptRun: 0,
+      autoRunSessionId,
       roundSummaries: [],
       countdownTitle: countdownTitle || '已计划自动运行',
       countdownNote: countdownNote || `计划于 ${formatAutoRunScheduleTime(fireAt)} 开始`,
@@ -457,6 +529,7 @@ function normalizeAutoRunTimerPlan(plan) {
       mode: 'restart',
       currentRun: normalizedCurrentRun,
       attemptRun: normalizedAttemptRun,
+      autoRunSessionId,
       roundSummaries,
       countdownTitle: countdownTitle || '线程间隔中',
       countdownNote: countdownNote || `第 ${Math.min(normalizedCurrentRun + 1, totalRuns)}/${totalRuns} 轮即将开始`,
@@ -473,6 +546,7 @@ function normalizeAutoRunTimerPlan(plan) {
     mode: 'restart',
     currentRun: normalizedCurrentRun,
     attemptRun: normalizedAttemptRun,
+    autoRunSessionId,
     roundSummaries,
     countdownTitle: countdownTitle || '线程间隔中',
     countdownNote: countdownNote || `第 ${normalizedCurrentRun}/${totalRuns} 轮第 ${normalizedAttemptRun} 次尝试即将开始`,
@@ -499,6 +573,7 @@ function normalizeAutoRunTimerPlanFromState(state = {}) {
     fireAt: legacyScheduledAt,
     totalRuns: state.scheduledAutoRunPlan?.totalRuns ?? state.autoRunTotalRuns,
     autoRunSkipFailures: state.scheduledAutoRunPlan?.autoRunSkipFailures ?? state.autoRunSkipFailures,
+    autoRunSessionId: state.autoRunSessionId,
     mode: state.scheduledAutoRunPlan?.mode,
   });
 }
@@ -519,6 +594,7 @@ function getAutoRunTimerStatusPayload(plan) {
     currentRun: normalizedPlan.currentRun,
     totalRuns: normalizedPlan.totalRuns,
     attemptRun: normalizedPlan.attemptRun,
+    sessionId: normalizedPlan.autoRunSessionId,
     scheduledAt: phase === 'scheduled' ? normalizedPlan.fireAt : null,
     countdownAt: normalizedPlan.fireAt,
     countdownTitle: normalizedPlan.countdownTitle,
@@ -533,9 +609,6 @@ function normalizeEmailGenerator(value = '') {
   }
   if (normalized === 'icloud') {
     return 'icloud';
-  }
-  if (normalized === 'icloud-standard-alias') {
-    return 'icloud-standard-alias';
   }
   if (normalized === 'cloudflare') return 'cloudflare';
   if (normalized === CLOUDFLARE_TEMP_EMAIL_GENERATOR) return CLOUDFLARE_TEMP_EMAIL_GENERATOR;
@@ -620,12 +693,6 @@ function normalizeLocalCpaStep9Mode(value = '') {
     : DEFAULT_LOCAL_CPA_STEP9_MODE;
 }
 
-function normalizeCpaCallbackMode(value = '') {
-  return String(value || '').trim().toLowerCase() === 'step6'
-    ? 'step6'
-    : DEFAULT_CPA_CALLBACK_MODE;
-}
-
 function normalizeCloudflareDomain(rawValue = '') {
   let value = String(rawValue || '').trim().toLowerCase();
   if (!value) return '';
@@ -700,7 +767,7 @@ function normalizeAccountRunHistoryHelperBaseUrl(rawValue = '') {
 
   try {
     const parsed = new URL(value);
-    if (parsed.pathname === '/append-account-log') {
+    if (parsed.pathname === '/append-account-log' || parsed.pathname === '/sync-account-run-records') {
       parsed.pathname = '';
       parsed.search = '';
       parsed.hash = '';
@@ -760,8 +827,6 @@ function normalizePersistentSettingValue(key, value) {
       return String(value || '');
     case 'localCpaStep9Mode':
       return normalizeLocalCpaStep9Mode(value);
-    case 'cpaCallbackMode':
-      return normalizeCpaCallbackMode(value);
     case 'sub2apiUrl':
       return String(value || '').trim();
     case 'sub2apiEmail':
@@ -770,6 +835,8 @@ function normalizePersistentSettingValue(key, value) {
       return String(value || '');
     case 'sub2apiGroupName':
       return String(value || '').trim();
+    case 'sub2apiDefaultProxyName':
+      return String(value || '').trim() || DEFAULT_SUB2API_PROXY_NAME;
     case 'customPassword':
       return String(value || '');
     case 'autoRunSkipFailures':
@@ -781,6 +848,8 @@ function normalizePersistentSettingValue(key, value) {
       return normalizeAutoRunDelayMinutes(value);
     case 'autoStepDelaySeconds':
       return normalizeAutoStepDelaySeconds(value, PERSISTED_SETTING_DEFAULTS.autoStepDelaySeconds);
+    case 'verificationResendCount':
+      return normalizeVerificationResendCount(value, DEFAULT_VERIFICATION_RESEND_COUNT);
     case 'mailProvider':
       return normalizeMailProvider(value);
     case 'mail2925Mode':
@@ -794,6 +863,8 @@ function normalizePersistentSettingValue(key, value) {
       return normalizeIcloudHost(value) || 'auto';
     case 'accountRunHistoryHelperBaseUrl':
       return normalizeAccountRunHistoryHelperBaseUrl(value);
+    case 'gmailBaseEmail':
+    case 'mail2925BaseEmail':
     case 'emailPrefix':
       return String(value || '').trim();
     case 'inbucketHost':
@@ -841,6 +912,14 @@ function buildPersistentSettingsPayload(input = {}, options = {}) {
       normalizedInput.autoStepDelaySeconds = legacyAutoStepDelaySeconds;
     }
   }
+  if (normalizedInput.verificationResendCount === undefined) {
+    const legacyVerificationResendCount = normalizedInput.signupVerificationResendCount !== undefined
+      ? normalizedInput.signupVerificationResendCount
+      : normalizedInput.loginVerificationResendCount;
+    if (legacyVerificationResendCount !== undefined) {
+      normalizedInput.verificationResendCount = legacyVerificationResendCount;
+    }
+  }
 
   const payload = {};
   let matchedKeyCount = 0;
@@ -876,7 +955,11 @@ function buildPersistentSettingsPayload(input = {}, options = {}) {
 }
 
 async function getPersistedSettings() {
-  const stored = await chrome.storage.local.get([...PERSISTED_SETTING_KEYS, ...LEGACY_AUTO_STEP_DELAY_KEYS]);
+  const stored = await chrome.storage.local.get([
+    ...PERSISTED_SETTING_KEYS,
+    ...LEGACY_AUTO_STEP_DELAY_KEYS,
+    ...LEGACY_VERIFICATION_RESEND_COUNT_KEYS,
+  ]);
   return buildPersistentSettingsPayload(stored, { fillDefaults: true });
 }
 
@@ -886,20 +969,12 @@ async function getPersistedAliasState() {
     return {
       manualAliasUsage: normalizeBooleanMap(stored.manualAliasUsage),
       preservedAliases: normalizeBooleanMap(stored.preservedAliases),
-      standardIcloudPool: Array.isArray(stored.standardIcloudPool) ? stored.standardIcloudPool : [],
-      standardIcloudUsage: normalizeBooleanMap(stored.standardIcloudUsage),
-      standardIcloudPreserved: normalizeBooleanMap(stored.standardIcloudPreserved),
-      standardIcloudRemoved: normalizeBooleanMap(stored.standardIcloudRemoved),
     };
   } catch (err) {
     console.warn(LOG_PREFIX, 'Failed to read persisted iCloud alias state:', err?.message || err);
     return {
       manualAliasUsage: {},
       preservedAliases: {},
-      standardIcloudPool: [],
-      standardIcloudUsage: {},
-      standardIcloudPreserved: {},
-      standardIcloudRemoved: {},
     };
   }
 }
@@ -938,20 +1013,6 @@ async function setState(updates) {
     if (Object.prototype.hasOwnProperty.call(updates, 'preservedAliases')) {
       persistentAliasUpdates.preservedAliases = normalizeBooleanMap(updates.preservedAliases);
     }
-    if (Object.prototype.hasOwnProperty.call(updates, 'standardIcloudPool')) {
-      persistentAliasUpdates.standardIcloudPool = Array.isArray(updates.standardIcloudPool)
-        ? updates.standardIcloudPool
-        : [];
-    }
-    if (Object.prototype.hasOwnProperty.call(updates, 'standardIcloudUsage')) {
-      persistentAliasUpdates.standardIcloudUsage = normalizeBooleanMap(updates.standardIcloudUsage);
-    }
-    if (Object.prototype.hasOwnProperty.call(updates, 'standardIcloudPreserved')) {
-      persistentAliasUpdates.standardIcloudPreserved = normalizeBooleanMap(updates.standardIcloudPreserved);
-    }
-    if (Object.prototype.hasOwnProperty.call(updates, 'standardIcloudRemoved')) {
-      persistentAliasUpdates.standardIcloudRemoved = normalizeBooleanMap(updates.standardIcloudRemoved);
-    }
     if (Object.keys(persistentAliasUpdates).length > 0) {
       await chrome.storage.local.set(persistentAliasUpdates);
     }
@@ -964,129 +1025,6 @@ async function setPersistentSettings(updates) {
   if (Object.keys(persistedUpdates).length > 0) {
     await chrome.storage.local.set(persistedUpdates);
   }
-}
-
-function normalizeAccountRunHistory(records) {
-  if (!Array.isArray(records)) {
-    return [];
-  }
-  return records
-    .filter((item) => item && typeof item === 'object')
-    .map((item) => ({
-      email: String(item.email || '').trim(),
-      password: String(item.password || '').trim(),
-      status: String(item.status || '').trim().toLowerCase(),
-      recordedAt: String(item.recordedAt || '').trim(),
-      reason: String(item.reason || '').trim(),
-    }))
-    .filter((item) => item.email && item.password && item.status);
-}
-
-async function getPersistedAccountRunHistory() {
-  try {
-    const stored = await chrome.storage.local.get(ACCOUNT_RUN_HISTORY_STORAGE_KEY);
-    return normalizeAccountRunHistory(stored[ACCOUNT_RUN_HISTORY_STORAGE_KEY]);
-  } catch (err) {
-    console.warn(LOG_PREFIX, 'Failed to read account run history:', err?.message || err);
-    return [];
-  }
-}
-
-function buildAccountRunHistoryRecord(state = {}, status = '', reason = '') {
-  const email = String(state.email || '').trim();
-  const password = String(state.password || state.customPassword || '').trim();
-  const normalizedStatus = String(status || '').trim().toLowerCase();
-  const normalizedReason = String(reason || '').trim();
-
-  if (!email || !password || !normalizedStatus) {
-    return null;
-  }
-
-  return {
-    email,
-    password,
-    status: normalizedStatus,
-    recordedAt: new Date().toISOString(),
-    reason: normalizedReason,
-  };
-}
-
-async function appendAccountRunHistoryRecord(status, stateOverride = null, reason = '') {
-  const state = stateOverride || await getState();
-  const record = buildAccountRunHistoryRecord(state, status, reason);
-  if (!record) {
-    return null;
-  }
-
-  const history = await getPersistedAccountRunHistory();
-  history.push(record);
-  await chrome.storage.local.set({
-    [ACCOUNT_RUN_HISTORY_STORAGE_KEY]: history,
-  });
-  return record;
-}
-
-async function appendAccountRunHistoryTextFile(record, stateOverride = null) {
-  const normalizedRecord = record && typeof record === 'object'
-    ? record
-    : buildAccountRunHistoryRecord(stateOverride || await getState(), '');
-  if (!normalizedRecord?.email || !normalizedRecord?.password || !normalizedRecord?.status) {
-    return null;
-  }
-
-  const state = stateOverride || await getState();
-  const helperBaseUrl = normalizeHotmailLocalBaseUrl(state.hotmailLocalBaseUrl);
-  let response;
-  try {
-    response = await fetch(buildHotmailLocalEndpoint(helperBaseUrl, '/append-account-log'), {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
-      },
-      body: JSON.stringify({
-        email: normalizedRecord.email,
-        password: normalizedRecord.password,
-        status: normalizedRecord.status,
-        recordedAt: normalizedRecord.recordedAt,
-        reason: normalizedRecord.reason || '',
-      }),
-    });
-  } catch (err) {
-    throw new Error(`账号文本记录写入失败：无法连接本地 helper（${getErrorMessage(err)}）`);
-  }
-
-  let payload = null;
-  try {
-    payload = await response.json();
-  } catch (err) {
-    throw new Error(`账号文本记录写入失败：本地 helper 返回了无法解析的响应（${getErrorMessage(err)}）`);
-  }
-
-  if (!response.ok || payload?.ok === false) {
-    throw new Error(`账号文本记录写入失败：${payload?.error || `HTTP ${response.status}`}`);
-  }
-
-  return payload?.filePath || '';
-}
-
-async function appendAccountRunRecord(status, stateOverride = null, reason = '') {
-  const state = stateOverride || await getState();
-  const record = await appendAccountRunHistoryRecord(status, state, reason);
-  if (!record) {
-    return null;
-  }
-
-  try {
-    const filePath = await appendAccountRunHistoryTextFile(record, state);
-    if (filePath) {
-      await addLog(`账号记录已追加到本地文本：${filePath}`, 'info');
-    }
-  } catch (err) {
-    await addLog(getErrorMessage(err), 'warn');
-  }
-
-  return record;
 }
 
 function buildSettingsExportFilename(date = new Date()) {
@@ -1163,13 +1101,6 @@ function broadcastIcloudAliasesChanged(payload = {}) {
   }).catch(() => { });
 }
 
-function broadcastStandardIcloudPoolChanged(payload = {}) {
-  chrome.runtime.sendMessage({
-    type: 'STANDARD_ICLOUD_POOL_CHANGED',
-    payload,
-  }).catch(() => { });
-}
-
 async function setEmailStateSilently(email) {
   await setState({ email });
   broadcastDataUpdate({ email });
@@ -1178,6 +1109,7 @@ async function setEmailStateSilently(email) {
 async function setEmailState(email) {
   await setEmailStateSilently(email);
   if (email) {
+    await appendManualAccountRunRecordIfNeeded('step2_stopped', null, '步骤 2 已使用邮箱，流程尚未完成。');
     await resumeAutoRunIfWaitingForEmail();
   }
 }
@@ -1283,97 +1215,6 @@ function isAliasPreserved(state, email) {
 
 function getEffectiveUsedEmails(state) {
   return toNormalizedEmailSet(getManualAliasUsageMap(state));
-}
-
-function normalizeStandardIcloudSource(value = '') {
-  const normalized = String(value || '').trim().toLowerCase();
-  return normalized === 'standard-primary' ? 'standard-primary' : 'standard-alias';
-}
-
-function normalizeStandardIcloudPoolItem(raw, fallbackHost = 'icloud.com') {
-  if (!raw || typeof raw !== 'object') {
-    return null;
-  }
-  const host = normalizeIcloudHost(raw.host) || normalizeIcloudHost(fallbackHost) || 'icloud.com';
-  const email = String(raw.email || '').trim().toLowerCase();
-  if (!email || !email.includes('@')) {
-    return null;
-  }
-  const parts = email.split('@');
-  if (parts.length !== 2 || !parts[0] || !parts[1]) {
-    return null;
-  }
-  const normalizedDomain = parts[1] === 'me.com' || parts[1] === 'mac.com' ? host : parts[1];
-  if (normalizedDomain !== 'icloud.com' && normalizedDomain !== 'icloud.com.cn') {
-    return null;
-  }
-  return {
-    email: `${parts[0]}@${normalizedDomain}`,
-    label: String(raw.label || '').trim(),
-    note: String(raw.note || '').trim(),
-    active: raw.active !== false,
-    source: normalizeStandardIcloudSource(raw.source),
-  };
-}
-
-function normalizeStandardIcloudPool(rawList, options = {}) {
-  const host = normalizeIcloudHost(options.host) || 'icloud.com';
-  const list = Array.isArray(rawList) ? rawList : [];
-  const map = new Map();
-  for (const raw of list) {
-    const normalized = normalizeStandardIcloudPoolItem(raw, host);
-    if (!normalized) {
-      continue;
-    }
-    map.set(normalized.email, normalized);
-  }
-  return Array.from(map.values()).sort((left, right) => {
-    if (left.source !== right.source) {
-      return left.source === 'standard-primary' ? -1 : 1;
-    }
-    if (left.active !== right.active) {
-      return left.active ? -1 : 1;
-    }
-    return left.email.localeCompare(right.email);
-  });
-}
-
-function getStandardIcloudUsageMap(state) {
-  return normalizeBooleanMap(state?.standardIcloudUsage);
-}
-
-function getStandardIcloudPreservedMap(state) {
-  return normalizeBooleanMap(state?.standardIcloudPreserved);
-}
-
-function getStandardIcloudRemovedMap(state) {
-  return normalizeBooleanMap(state?.standardIcloudRemoved);
-}
-
-function getStandardIcloudPoolRaw(state) {
-  return normalizeStandardIcloudPool(state?.standardIcloudPool || []);
-}
-
-function applyStandardIcloudPoolOverlays(state, pool = []) {
-  const usageMap = getStandardIcloudUsageMap(state);
-  const preservedMap = getStandardIcloudPreservedMap(state);
-  const removedMap = getStandardIcloudRemovedMap(state);
-  return normalizeStandardIcloudPool(pool)
-    .filter((item) => !removedMap[item.email])
-    .map((item) => ({
-      ...item,
-      used: Boolean(usageMap[item.email]),
-      preserved: Boolean(preservedMap[item.email]),
-    }));
-}
-
-function pickReusableStandardIcloudEmail(pool = []) {
-  const candidates = Array.isArray(pool) ? pool : [];
-  const preferred = candidates.find((item) => item.active !== false && !item.used && !item.preserved);
-  if (preferred) {
-    return preferred;
-  }
-  return candidates.find((item) => item.active !== false && !item.used) || null;
 }
 
 async function setIcloudAliasUsedState(payload = {}, options = {}) {
@@ -2185,13 +2026,11 @@ function isGeneratedAliasProvider(stateOrProvider, mail2925Mode = undefined) {
   const provider = typeof stateOrProvider === 'string'
     ? stateOrProvider
     : stateOrProvider?.mailProvider;
-  if (provider === GMAIL_PROVIDER) {
-    return true;
+  const utils = (typeof self !== 'undefined' ? self : globalThis).MultiPageManagedAliasUtils || null;
+  if (utils?.isManagedAliasProvider) {
+    return utils.isManagedAliasProvider(provider);
   }
-  const resolvedMail2925Mode = mail2925Mode !== undefined
-    ? normalizeMail2925Mode(mail2925Mode)
-    : getMail2925Mode(stateOrProvider);
-  return provider === '2925' && resolvedMail2925Mode === MAIL_2925_MODE_PROVIDE;
+  return provider === GMAIL_PROVIDER || provider === '2925';
 }
 
 function shouldUseCustomRegistrationEmail(state = {}) {
@@ -2222,6 +2061,163 @@ function buildGeneratedAliasEmail(state) {
 
   if (provider === '2925' && isGeneratedAliasProvider(state)) {
     return `${emailPrefix}${generateRandomSuffix(6)}@2925.com`;
+  }
+
+  throw new Error(`未支持的别名邮箱类型：${provider}`);
+}
+
+function getManagedAliasUtils() {
+  return (typeof self !== 'undefined' ? self : globalThis).MultiPageManagedAliasUtils || null;
+}
+
+function parseGmailBaseEmail(rawValue) {
+  const utils = getManagedAliasUtils();
+  if (utils?.parseManagedAliasBaseEmail) {
+    return utils.parseManagedAliasBaseEmail(rawValue, GMAIL_PROVIDER);
+  }
+
+  const value = String(rawValue || '').trim().toLowerCase();
+  const match = value.match(/^([^@\s+]+)@((?:gmail|googlemail)\.com)$/i);
+  if (!match) return null;
+  return {
+    localPart: match[1],
+    domain: match[2].toLowerCase(),
+  };
+}
+
+function parseManagedAliasBaseEmail(rawValue, provider) {
+  const utils = getManagedAliasUtils();
+  if (utils?.parseManagedAliasBaseEmail) {
+    return utils.parseManagedAliasBaseEmail(rawValue, provider);
+  }
+
+  if (provider === GMAIL_PROVIDER) {
+    return parseGmailBaseEmail(rawValue);
+  }
+
+  const value = String(rawValue || '').trim().toLowerCase();
+  const match = value.match(/^([^@\s+]+)@(2925\.com)$/i);
+  if (!match) return null;
+  return {
+    localPart: match[1],
+    domain: match[2].toLowerCase(),
+  };
+}
+
+function isManagedAliasEmail(value, provider, baseEmail = '') {
+  const utils = getManagedAliasUtils();
+  if (utils?.isManagedAliasEmail) {
+    return utils.isManagedAliasEmail(value, provider, baseEmail);
+  }
+
+  const normalizedValue = String(value || '').trim().toLowerCase();
+  if (!normalizedValue) return false;
+  const parsedEmail = normalizedValue.match(/^([^@\s]+)@([^@\s]+\.[^@\s]+)$/);
+  if (!parsedEmail) return false;
+
+  const candidateLocalPart = parsedEmail[1];
+  const candidateDomain = parsedEmail[2];
+  if (provider === GMAIL_PROVIDER) {
+    if (!/^(?:gmail|googlemail)\.com$/i.test(candidateDomain)) {
+      return false;
+    }
+    const parsedBaseEmail = parseManagedAliasBaseEmail(baseEmail, provider);
+    if (!parsedBaseEmail) {
+      return true;
+    }
+    return candidateDomain === parsedBaseEmail.domain
+      && candidateLocalPart.split('+')[0] === parsedBaseEmail.localPart;
+  }
+
+  if (provider !== '2925' || candidateDomain !== '2925.com') {
+    return false;
+  }
+
+  const parsedBaseEmail = parseManagedAliasBaseEmail(baseEmail, provider);
+  if (!parsedBaseEmail) {
+    return true;
+  }
+
+  return candidateLocalPart === parsedBaseEmail.localPart || candidateLocalPart.startsWith(parsedBaseEmail.localPart);
+}
+
+function getManagedAliasBaseEmail(state = {}, provider = state?.mailProvider) {
+  const normalizedProvider = String(provider || '').trim().toLowerCase();
+  const legacyEmailPrefix = String(state?.emailPrefix || '').trim();
+  if (normalizedProvider === GMAIL_PROVIDER) {
+    const gmailBaseEmail = String(state?.gmailBaseEmail || '').trim();
+    if (gmailBaseEmail) {
+      return gmailBaseEmail;
+    }
+    return parseManagedAliasBaseEmail(legacyEmailPrefix, normalizedProvider) ? legacyEmailPrefix : '';
+  }
+
+  if (normalizedProvider === '2925') {
+    const mail2925BaseEmail = String(state?.mail2925BaseEmail || '').trim();
+    if (mail2925BaseEmail) {
+      return mail2925BaseEmail;
+    }
+    return parseManagedAliasBaseEmail(legacyEmailPrefix, normalizedProvider) ? legacyEmailPrefix : '';
+  }
+
+  return '';
+}
+
+function isGeneratedAliasProvider(stateOrProvider, mail2925Mode = undefined) {
+  const provider = typeof stateOrProvider === 'string'
+    ? stateOrProvider
+    : stateOrProvider?.mailProvider;
+  const utils = getManagedAliasUtils();
+  if (utils?.isManagedAliasProvider) {
+    return utils.isManagedAliasProvider(provider);
+  }
+  return provider === GMAIL_PROVIDER || provider === '2925';
+}
+
+function shouldUseCustomRegistrationEmail(state = {}) {
+  return isCustomMailProvider(state)
+    || (!isHotmailProvider(state)
+      && !isGeneratedAliasProvider(state)
+      && normalizeEmailGenerator(state.emailGenerator) === 'custom');
+}
+
+function isReusableGeneratedAliasEmail(state = {}, email = state?.email) {
+  if (!isGeneratedAliasProvider(state)) {
+    return false;
+  }
+
+  return isManagedAliasEmail(email, state?.mailProvider, getManagedAliasBaseEmail(state));
+}
+
+function buildGeneratedAliasEmail(state) {
+  const provider = state.mailProvider || '163';
+  const baseEmail = getManagedAliasBaseEmail(state, provider);
+  const baseLabel = provider === GMAIL_PROVIDER ? 'Gmail 原邮箱' : '2925 基邮箱';
+  const exampleEmail = provider === GMAIL_PROVIDER ? 'name@gmail.com' : 'name@2925.com';
+
+  if (!baseEmail) {
+    throw new Error(`${baseLabel}未设置，请先在侧边栏填写，或直接在“注册邮箱”中手动填写完整邮箱。`);
+  }
+
+  if (!parseManagedAliasBaseEmail(baseEmail, provider)) {
+    throw new Error(`${baseLabel}格式不正确，请填写类似 ${exampleEmail} 的地址。`);
+  }
+
+  const utils = getManagedAliasUtils();
+  if (utils?.buildManagedAliasEmail) {
+    return utils.buildManagedAliasEmail(
+      provider,
+      baseEmail,
+      provider === GMAIL_PROVIDER ? generateRandomWordAliasTag() : generateRandomSuffix(6)
+    );
+  }
+
+  const parsedBaseEmail = parseManagedAliasBaseEmail(baseEmail, provider);
+  if (provider === GMAIL_PROVIDER) {
+    return `${parsedBaseEmail.localPart}+${generateRandomWordAliasTag()}@${parsedBaseEmail.domain}`;
+  }
+  if (provider === '2925') {
+    return `${parsedBaseEmail.localPart}${generateRandomSuffix(6)}@${parsedBaseEmail.domain}`;
   }
 
   throw new Error(`未支持的别名邮箱类型：${provider}`);
@@ -3106,35 +3102,9 @@ async function getPreferredIcloudSetupUrls(state = null, error = null) {
 
 function isIcloudLoginRequiredError(error) {
   const message = getErrorMessage(error).toLowerCase();
-  if (!message) {
-    return false;
-  }
-
-  if (
-    message.includes('请先在新打开的 icloud 页面中完成登录')
-    || message.includes('需要先登录 icloud')
-    || message.includes('not logged in')
-    || message.includes('not authenticated')
-    || message.includes('unauthorized')
-    || message.includes('forbidden')
-    || message.includes('auth token is missing')
-    || message.includes('session expired')
-  ) {
-    return true;
-  }
-
-  const statusMatches = Array.from(message.matchAll(/\bstatus\s+(\d{3})\b/g))
-    .map((match) => Number(match?.[1]))
-    .filter(Number.isFinite);
-
-  if (!statusMatches.length) {
-    return false;
-  }
-
-  // Only treat pure auth-denial status groups as login required.
-  return statusMatches.every((statusCode) => (
-    statusCode === 401 || statusCode === 403 || statusCode === 421
-  ));
+  return message.includes('could not validate icloud session')
+    || message.includes('hide my email service was unavailable')
+    || /\bstatus (401|403|409|421)\b/.test(message);
 }
 
 let lastIcloudLoginPromptAt = 0;
@@ -3373,216 +3343,6 @@ async function deleteUsedIcloudAliases() {
   return { deleted, skipped };
 }
 
-function buildStandardIcloudPoolFromSyncResult(payload = {}, fallbackHost = 'icloud.com') {
-  const host = normalizeIcloudHost(payload.host) || normalizeIcloudHost(fallbackHost) || 'icloud.com';
-  const list = [];
-
-  const primaryEmail = String(payload.primaryEmail || '').trim().toLowerCase();
-  if (primaryEmail) {
-    list.push({
-      email: primaryEmail,
-      label: '主要地址',
-      note: '',
-      active: true,
-      source: 'standard-primary',
-      host,
-    });
-  }
-
-  const aliases = Array.isArray(payload.aliases) ? payload.aliases : [];
-  for (const alias of aliases) {
-    const aliasEmail = String(alias?.email || '').trim().toLowerCase();
-    if (aliasEmail && aliasEmail === primaryEmail) {
-      continue;
-    }
-    list.push({
-      email: aliasEmail,
-      label: alias?.label || '',
-      note: alias?.note || '',
-      active: alias?.active !== false,
-      source: 'standard-alias',
-      host,
-    });
-  }
-
-  return normalizeStandardIcloudPool(list, { host });
-}
-
-async function syncStandardIcloudPool(options = {}) {
-  throwIfStopped();
-  const currentState = await getState();
-  const configuredHost = getConfiguredIcloudHostPreference(currentState)
-    || normalizeIcloudHost(currentState?.preferredIcloudHost)
-    || 'icloud.com';
-  const mailUrl = getIcloudMailUrlForHost(configuredHost) || 'https://www.icloud.com/mail/';
-
-  await addLog(`普通 iCloud 邮箱池：正在打开 ${new URL(mailUrl).host} 邮件页面进行同步...`, 'info');
-  await reuseOrCreateTab('icloud-mail', mailUrl);
-
-  const result = await sendToContentScript('icloud-mail', {
-    type: 'SYNC_ICLOUD_STANDARD_POOL',
-    source: 'background',
-    payload: {
-      createMissing: options.createMissing !== false,
-      maxAliasCount: Math.max(0, Math.min(3, Number(options.maxAliasCount) || 3)),
-      maxAttemptsPerAlias: Math.max(1, Number(options.maxAttemptsPerAlias) || 3),
-      pageReadyTimeoutMs: Number(options.pageReadyTimeoutMs) || 15000,
-      submitTimeoutMs: Number(options.submitTimeoutMs) || 10000,
-    },
-  });
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-  if (!result?.ok) {
-    throw new Error('普通 iCloud 邮箱池同步失败：未返回成功结果。');
-  }
-
-  const normalizedPool = buildStandardIcloudPoolFromSyncResult(result, configuredHost);
-  await setState({ standardIcloudPool: normalizedPool });
-
-  const stateAfterSync = await getState();
-  const aliases = applyStandardIcloudPoolOverlays(stateAfterSync, normalizedPool);
-  const primary = aliases.find((item) => item.source === 'standard-primary');
-
-  broadcastStandardIcloudPoolChanged({
-    reason: 'synced',
-    count: aliases.length,
-    createdCount: Number(result.createdCount) || 0,
-  });
-
-  return {
-    ok: true,
-    host: normalizeIcloudHost(result.host) || configuredHost,
-    primaryEmail: primary?.email || '',
-    aliases,
-    createdCount: Number(result.createdCount) || 0,
-  };
-}
-
-async function listStandardIcloudPool() {
-  const state = await getState();
-  return applyStandardIcloudPoolOverlays(state, getStandardIcloudPoolRaw(state));
-}
-
-async function setStandardIcloudEmailUsedState(payload = {}, options = {}) {
-  const email = String(payload.email || '').trim().toLowerCase();
-  if (!email) {
-    throw new Error('未提供普通 iCloud 邮箱地址。');
-  }
-  const used = Boolean(payload.used);
-  const state = await getState();
-  const usage = getStandardIcloudUsageMap(state);
-  usage[email] = used;
-  await setState({ standardIcloudUsage: usage });
-  if (!options.silentLog) {
-    await addLog(`普通 iCloud 邮箱池：已将 ${email} 标记为${used ? '已用' : '未用'}`, 'ok');
-  }
-  broadcastStandardIcloudPoolChanged({ reason: 'used-updated', email, used });
-  return { email, used };
-}
-
-async function setStandardIcloudEmailPreservedState(payload = {}) {
-  const email = String(payload.email || '').trim().toLowerCase();
-  if (!email) {
-    throw new Error('未提供普通 iCloud 邮箱地址。');
-  }
-  const preserved = Boolean(payload.preserved);
-  const state = await getState();
-  const preservedMap = getStandardIcloudPreservedMap(state);
-  preservedMap[email] = preserved;
-  await setState({ standardIcloudPreserved: preservedMap });
-  await addLog(`普通 iCloud 邮箱池：已将 ${email} ${preserved ? '设为保留' : '取消保留'}`, 'ok');
-  broadcastStandardIcloudPoolChanged({ reason: 'preserved-updated', email, preserved });
-  return { email, preserved };
-}
-
-async function deleteStandardIcloudEmail(payload = {}, options = {}) {
-  const email = typeof payload === 'string'
-    ? String(payload).trim().toLowerCase()
-    : String(payload?.email || '').trim().toLowerCase();
-  if (!email) {
-    throw new Error('未提供普通 iCloud 邮箱地址。');
-  }
-
-  const state = await getState();
-  const removedMap = getStandardIcloudRemovedMap(state);
-  const usageMap = getStandardIcloudUsageMap(state);
-  const preservedMap = getStandardIcloudPreservedMap(state);
-
-  removedMap[email] = true;
-  delete usageMap[email];
-  delete preservedMap[email];
-
-  await setState({
-    standardIcloudRemoved: removedMap,
-    standardIcloudUsage: usageMap,
-    standardIcloudPreserved: preservedMap,
-  });
-
-  if (!options.silentLog) {
-    await addLog(`普通 iCloud 邮箱池：已在本地移除 ${email}（不会删除 iCloud 账户中的地址）。`, 'ok');
-  }
-  broadcastStandardIcloudPoolChanged({ reason: 'deleted-local', email });
-  return { email };
-}
-
-async function deleteUsedStandardIcloudEmails() {
-  const aliases = await listStandardIcloudPool();
-  const usedAliases = aliases.filter((alias) => alias.used);
-  if (!usedAliases.length) {
-    return { deleted: [], skipped: [] };
-  }
-
-  const deleted = [];
-  const skipped = [];
-  for (const alias of usedAliases) {
-    if (alias.preserved) {
-      skipped.push({ email: alias.email, error: 'preserved' });
-      continue;
-    }
-    try {
-      await deleteStandardIcloudEmail({ email: alias.email }, { silentLog: true });
-      deleted.push(alias.email);
-    } catch (err) {
-      skipped.push({ email: alias.email, error: getErrorMessage(err) });
-    }
-  }
-
-  broadcastStandardIcloudPoolChanged({ reason: 'batch-delete-local', deleted: deleted.length });
-  return { deleted, skipped };
-}
-
-async function fetchIcloudStandardAliasFromPool(state, options = {}) {
-  throwIfStopped();
-  const currentState = state || await getState();
-  const localPool = applyStandardIcloudPoolOverlays(currentState, getStandardIcloudPoolRaw(currentState));
-  const localSelected = pickReusableStandardIcloudEmail(localPool);
-  if (localSelected) {
-    await setEmailState(localSelected.email);
-    await addLog(`普通 iCloud 邮箱池：复用本地未用邮箱 ${localSelected.email}`, 'ok');
-    broadcastStandardIcloudPoolChanged({ reason: 'selected-local', email: localSelected.email });
-    return localSelected.email;
-  }
-
-  await addLog('普通 iCloud 邮箱池：本地池没有可用邮箱，开始同步并补齐别名...', 'info');
-  await syncStandardIcloudPool({
-    ...options,
-    createMissing: options.createMissing !== false,
-    maxAliasCount: 3,
-  });
-  const pool = await listStandardIcloudPool();
-  const selected = pickReusableStandardIcloudEmail(pool);
-  if (!selected) {
-    throw new Error('普通 iCloud 邮箱池中没有可用邮箱（均已标记已用或不可用）。');
-  }
-
-  await setEmailState(selected.email);
-  await addLog(`普通 iCloud 邮箱池：已选择 ${selected.email}`, 'ok');
-  broadcastStandardIcloudPoolChanged({ reason: 'selected', email: selected.email });
-  return selected.email;
-}
-
 async function fetchIcloudHideMyEmail() {
   return withIcloudLoginHelp('获取 iCloud 隐私邮箱', async () => {
     throwIfStopped();
@@ -3639,23 +3399,7 @@ async function finalizeIcloudAliasAfterSuccessfulFlow(state) {
     return { handled: false, deleted: false };
   }
 
-  const generator = normalizeEmailGenerator(state?.emailGenerator);
-  if (generator === 'icloud-standard-alias') {
-    await setStandardIcloudEmailUsedState({ email, used: true }, { silentLog: true });
-    await addLog(`普通 iCloud 邮箱池：流程成功后已标记 ${email} 为已用。`, 'ok');
-    if (state.autoDeleteUsedIcloudAlias) {
-      if (getStandardIcloudPreservedMap(state)[email]) {
-        await addLog(`普通 iCloud 邮箱池：${email} 已标记保留，跳过本地移除。`, 'info');
-        return { handled: true, deleted: false };
-      }
-      await deleteStandardIcloudEmail({ email }, { silentLog: true });
-      await addLog(`普通 iCloud 邮箱池：流程成功后已本地移除 ${email}。`, 'ok');
-      return { handled: true, deleted: true };
-    }
-    return { handled: true, deleted: false };
-  }
-
-  const knownIcloudAlias = generator === 'icloud'
+  const knownIcloudAlias = normalizeEmailGenerator(state?.emailGenerator) === 'icloud'
     || Object.prototype.hasOwnProperty.call(getManualAliasUsageMap(state), email)
     || Object.prototype.hasOwnProperty.call(getPreservedAliasMap(state), email);
   if (!knownIcloudAlias) {
@@ -3833,14 +3577,6 @@ function shouldBypassStep9ForLocalCpa(state) {
   return normalizeLocalCpaStep9Mode(state?.localCpaStep9Mode) === 'bypass'
     && Boolean(state?.localhostUrl)
     && isLocalCpaUrl(state?.vpsUrl);
-}
-
-function shouldSkipLoginVerificationForCpaCallback(state) {
-  if (typeof navigationUtils !== 'undefined' && navigationUtils?.shouldSkipLoginVerificationForCpaCallback) {
-    return navigationUtils.shouldSkipLoginVerificationForCpaCallback(state);
-  }
-  return getPanelMode(state) === 'cpa'
-    && normalizeCpaCallbackMode(state?.cpaCallbackMode) === 'step6';
 }
 
 function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
@@ -4069,7 +3805,6 @@ function isRetryableContentScriptTransportError(error) {
 
 const navigationUtils = self.MultiPageBackgroundNavigationUtils?.createNavigationUtils({
   DEFAULT_SUB2API_URL,
-  normalizeCpaCallbackMode,
   normalizeLocalCpaStep9Mode,
 });
 
@@ -4093,6 +3828,7 @@ const tabRuntime = self.MultiPageBackgroundTabRuntime?.createTabRuntime({
   LOG_PREFIX,
   matchesSourceUrlFamily,
   setState,
+  sleepWithStop,
   STOP_ERROR_MESSAGE,
   throwIfStopped,
 });
@@ -4104,12 +3840,92 @@ function getErrorMessage(error) {
   return String(typeof error === 'string' ? error : error?.message || '');
 }
 
+function isCloudflareSecurityBlockedError(error) {
+  return getErrorMessage(error).startsWith(CLOUDFLARE_SECURITY_BLOCK_ERROR_PREFIX);
+}
+
+function isNetworkTimeoutBlockedError(error) {
+  return getErrorMessage(error).startsWith(NETWORK_TIMEOUT_BLOCK_ERROR_PREFIX);
+}
+
+function isTerminalSecurityBlockedError(error) {
+  return isCloudflareSecurityBlockedError(error) || isNetworkTimeoutBlockedError(error);
+}
+
+function getCloudflareSecurityBlockedMessage(error) {
+  const message = getErrorMessage(error);
+  if (message.startsWith(CLOUDFLARE_SECURITY_BLOCK_ERROR_PREFIX)) {
+    return message.slice(CLOUDFLARE_SECURITY_BLOCK_ERROR_PREFIX.length).trim() || CLOUDFLARE_SECURITY_BLOCK_USER_MESSAGE;
+  }
+  return CLOUDFLARE_SECURITY_BLOCK_USER_MESSAGE;
+}
+
+function getNetworkTimeoutBlockedMessage(error) {
+  const message = getErrorMessage(error);
+  if (message.startsWith(NETWORK_TIMEOUT_BLOCK_ERROR_PREFIX)) {
+    return message.slice(NETWORK_TIMEOUT_BLOCK_ERROR_PREFIX.length).trim() || NETWORK_TIMEOUT_BLOCK_USER_MESSAGE;
+  }
+  return NETWORK_TIMEOUT_BLOCK_USER_MESSAGE;
+}
+
+function getTerminalSecurityBlockedMessage(error) {
+  if (isNetworkTimeoutBlockedError(error)) {
+    return getNetworkTimeoutBlockedMessage(error);
+  }
+  return getCloudflareSecurityBlockedMessage(error);
+}
+
+function getTerminalSecurityBlockedAlertText(error) {
+  if (isNetworkTimeoutBlockedError(error)) {
+    return '检测到网络节点异常，请暂停当前操作。';
+  }
+  return '检测到 Cloudflare 风控，请暂停当前操作。';
+}
+
+function getTerminalSecurityBlockedTitle(error) {
+  if (isNetworkTimeoutBlockedError(error)) {
+    return '网络节点异常';
+  }
+  return 'Cloudflare 风控拦截';
+}
+
+function broadcastSecurityBlockedAlert(title = '流程已完全停止', message = CLOUDFLARE_SECURITY_BLOCK_USER_MESSAGE, alertText = '检测到 Cloudflare 风控，请暂停当前操作。') {
+  chrome.runtime.sendMessage({
+    type: 'SECURITY_BLOCKED_ALERT',
+    payload: {
+      title,
+      message,
+      alert: {
+        text: alertText,
+        tone: 'danger',
+      },
+    },
+  }).catch(() => { });
+}
+
+async function handleCloudflareSecurityBlocked(error) {
+  const title = getTerminalSecurityBlockedTitle(error);
+  const message = getTerminalSecurityBlockedMessage(error);
+  const alertText = getTerminalSecurityBlockedAlertText(error);
+  await requestStop({ logMessage: message });
+  broadcastSecurityBlockedAlert(title, message, alertText);
+  return message;
+}
+
 function isVerificationMailPollingError(error) {
   if (typeof loggingStatus !== 'undefined' && loggingStatus?.isVerificationMailPollingError) {
     return loggingStatus.isVerificationMailPollingError(error);
   }
   const message = getErrorMessage(error);
   return /未在 .*邮箱中找到新的匹配邮件|未在 Hotmail 收件箱中找到新的匹配验证码|邮箱轮询结束，但未获取到验证码|无法获取新的(?:注册|登录)验证码|页面未能重新就绪|页面通信异常|did not respond in \d+s/i.test(message);
+}
+
+function isAddPhoneAuthFailure(error) {
+  if (typeof loggingStatus !== 'undefined' && loggingStatus?.isAddPhoneAuthFailure) {
+    return loggingStatus.isAddPhoneAuthFailure(error);
+  }
+  const message = getErrorMessage(error);
+  return /https:\/\/auth\.openai\.com\/add-phone(?:[/?#]|$)|\badd-phone\b|添加手机号|手机号码|手机号页|手机号页面|手机号|phone\s+number|telephone/i.test(message);
 }
 
 function getLoginAuthStateLabel(state) {
@@ -4155,7 +3971,7 @@ function getFirstUnfinishedStep(statuses = {}) {
   if (typeof loggingStatus !== 'undefined' && loggingStatus?.getFirstUnfinishedStep) {
     return loggingStatus.getFirstUnfinishedStep(statuses);
   }
-  for (let step = 1; step <= 9; step++) {
+  for (const step of STEP_IDS) {
     if (!isStepDoneStatus(statuses[step] || 'pending')) return step;
   }
   return null;
@@ -4181,6 +3997,7 @@ function getDownstreamStateResets(step) {
       lastEmailTimestamp: null,
       signupVerificationRequestedAt: null,
       loginVerificationRequestedAt: null,
+      oauthFlowDeadlineAt: null,
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
@@ -4192,6 +4009,7 @@ function getDownstreamStateResets(step) {
       lastEmailTimestamp: null,
       signupVerificationRequestedAt: null,
       loginVerificationRequestedAt: null,
+      oauthFlowDeadlineAt: null,
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
@@ -4202,19 +4020,21 @@ function getDownstreamStateResets(step) {
       lastEmailTimestamp: null,
       signupVerificationRequestedAt: null,
       loginVerificationRequestedAt: null,
+      oauthFlowDeadlineAt: null,
       lastSignupCode: null,
       lastLoginCode: null,
       localhostUrl: null,
     };
   }
-  if (step === 5 || step === 6 || step === 7) {
+  if (step === 5 || step === 6 || step === 7 || step === 8) {
     return {
       lastLoginCode: null,
       loginVerificationRequestedAt: null,
+      oauthFlowDeadlineAt: null,
       localhostUrl: null,
     };
   }
-  if (step === 8) {
+  if (step === 9) {
     return {
       localhostUrl: null,
     };
@@ -4228,7 +4048,7 @@ async function invalidateDownstreamAfterStepRestart(step, options = {}) {
   const statuses = { ...(state.stepStatuses || {}) };
   const changedSteps = [];
 
-  for (let downstream = step + 1; downstream <= 9; downstream++) {
+  for (let downstream = step + 1; downstream <= LAST_STEP_ID; downstream++) {
     if (statuses[downstream] !== 'pending') {
       statuses[downstream] = 'pending';
       changedSteps.push(downstream);
@@ -4273,6 +4093,7 @@ function getAutoRunStatusPayload(phase, payload = {}) {
     currentRun: payload.currentRun ?? autoRunCurrentRun,
     totalRuns: payload.totalRuns ?? autoRunTotalRuns,
     attemptRun: payload.attemptRun ?? autoRunAttemptRun,
+    sessionId: payload.sessionId ?? payload.autoRunSessionId ?? autoRunSessionId,
   };
   if (typeof loggingStatus !== 'undefined' && loggingStatus?.getAutoRunStatusPayload) {
     return loggingStatus.getAutoRunStatusPayload(phase, normalizedPayload);
@@ -4288,6 +4109,7 @@ function getAutoRunStatusPayload(phase, payload = {}) {
     autoRunCurrentRun: normalizedPayload.currentRun ?? 0,
     autoRunTotalRuns: normalizedPayload.totalRuns ?? 1,
     autoRunAttemptRun: normalizedPayload.attemptRun ?? 0,
+    autoRunSessionId: normalizeAutoRunSessionId(normalizedPayload.sessionId),
     scheduledAutoRunAt: Number.isFinite(Number(normalizedPayload.scheduledAt)) ? Number(normalizedPayload.scheduledAt) : null,
     autoRunCountdownAt: Number.isFinite(Number(normalizedPayload.countdownAt)) ? Number(normalizedPayload.countdownAt) : null,
     autoRunCountdownTitle: normalizedPayload.countdownTitle === undefined ? '' : String(normalizedPayload.countdownTitle || ''),
@@ -4305,6 +4127,7 @@ async function broadcastAutoRunStatus(phase, payload = {}, extraState = {}) {
     currentRun: payload.currentRun ?? autoRunCurrentRun,
     totalRuns: payload.totalRuns ?? autoRunTotalRuns,
     attemptRun: payload.attemptRun ?? autoRunAttemptRun,
+    sessionId: payload.sessionId ?? payload.autoRunSessionId ?? autoRunSessionId,
     scheduledAt: rawScheduledAt === null ? null : Number(rawScheduledAt),
     countdownAt: rawCountdownAt === null ? null : Number(rawCountdownAt),
     countdownTitle: payload.countdownTitle === undefined ? '' : String(payload.countdownTitle || ''),
@@ -4414,6 +4237,7 @@ function getAutoRunTimerResumeOptions(plan) {
   if (normalizedPlan.kind === AUTO_RUN_TIMER_KIND_SCHEDULED_START) {
     return {
       loopOptions: {
+        autoRunSessionId: normalizedPlan.autoRunSessionId,
         autoRunSkipFailures: normalizedPlan.autoRunSkipFailures,
         mode: normalizedPlan.mode,
       },
@@ -4421,6 +4245,7 @@ function getAutoRunTimerResumeOptions(plan) {
         currentRun: 0,
         totalRuns: normalizedPlan.totalRuns,
         attemptRun: 0,
+        sessionId: normalizedPlan.autoRunSessionId,
       },
     };
   }
@@ -4429,6 +4254,7 @@ function getAutoRunTimerResumeOptions(plan) {
     const nextRun = Math.min(normalizedPlan.currentRun + 1, normalizedPlan.totalRuns);
     return {
       loopOptions: {
+        autoRunSessionId: normalizedPlan.autoRunSessionId,
         autoRunSkipFailures: normalizedPlan.autoRunSkipFailures,
         mode: 'restart',
         resumeCurrentRun: nextRun,
@@ -4439,12 +4265,14 @@ function getAutoRunTimerResumeOptions(plan) {
         currentRun: nextRun,
         totalRuns: normalizedPlan.totalRuns,
         attemptRun: 1,
+        sessionId: normalizedPlan.autoRunSessionId,
       },
     };
   }
 
   return {
     loopOptions: {
+      autoRunSessionId: normalizedPlan.autoRunSessionId,
       autoRunSkipFailures: normalizedPlan.autoRunSkipFailures,
       mode: 'restart',
       resumeCurrentRun: normalizedPlan.currentRun,
@@ -4455,6 +4283,7 @@ function getAutoRunTimerResumeOptions(plan) {
       currentRun: normalizedPlan.currentRun,
       totalRuns: normalizedPlan.totalRuns,
       attemptRun: normalizedPlan.attemptRun,
+      sessionId: normalizedPlan.autoRunSessionId,
     },
   };
 }
@@ -4480,6 +4309,9 @@ async function launchAutoRunTimerPlan(trigger = 'alarm', options = {}) {
     if (autoRunActive) {
       return false;
     }
+    if (plan.autoRunSessionId && !isCurrentAutoRunSessionId(plan.autoRunSessionId)) {
+      return false;
+    }
 
     const resumeOptions = getAutoRunTimerResumeOptions(plan);
     if (!resumeOptions) {
@@ -4497,9 +4329,13 @@ async function launchAutoRunTimerPlan(trigger = 'alarm', options = {}) {
     }
 
     await clearAutoRunTimerAlarm();
+    if (plan.autoRunSessionId && !isCurrentAutoRunSessionId(plan.autoRunSessionId)) {
+      return false;
+    }
     autoRunCurrentRun = resumeOptions.statusPayload.currentRun;
     autoRunTotalRuns = plan.totalRuns;
     autoRunAttemptRun = resumeOptions.statusPayload.attemptRun;
+    autoRunSessionId = normalizeAutoRunSessionId(plan.autoRunSessionId);
     if (plan.kind === AUTO_RUN_TIMER_KIND_SCHEDULED_START && trigger !== 'manual' && state.autoRunDelayEnabled) {
       await setAutoRunDelayEnabledState(false);
     }
@@ -4514,6 +4350,9 @@ async function launchAutoRunTimerPlan(trigger = 'alarm', options = {}) {
       }
     );
 
+    if (plan.autoRunSessionId && !isCurrentAutoRunSessionId(plan.autoRunSessionId)) {
+      return false;
+    }
     clearStopRequest();
     let logMessage = '倒计时结束，自动运行开始执行。';
     if (plan.kind === AUTO_RUN_TIMER_KIND_BETWEEN_ROUNDS) {
@@ -4528,6 +4367,9 @@ async function launchAutoRunTimerPlan(trigger = 'alarm', options = {}) {
       logMessage = '已手动跳过倒计时，自动运行立即开始。';
     }
     await addLog(logMessage, 'info');
+    if (plan.autoRunSessionId && !isCurrentAutoRunSessionId(plan.autoRunSessionId)) {
+      return false;
+    }
 
     startAutoRunLoop(plan.totalRuns, resumeOptions.loopOptions);
     return true;
@@ -4546,17 +4388,20 @@ async function scheduleAutoRun(totalRuns, options = {}) {
   }
 
   const delayMinutes = normalizeAutoRunDelayMinutes(options.delayMinutes);
+  const sessionId = createAutoRunSessionId();
   const timerPlan = normalizeAutoRunTimerPlan({
     kind: AUTO_RUN_TIMER_KIND_SCHEDULED_START,
     fireAt: Date.now() + delayMinutes * 60 * 1000,
     totalRuns,
     autoRunSkipFailures: options.autoRunSkipFailures,
+    autoRunSessionId: sessionId,
     mode: options.mode,
   });
 
   autoRunCurrentRun = 0;
   autoRunTotalRuns = timerPlan.totalRuns;
   autoRunAttemptRun = 0;
+  autoRunSessionId = sessionId;
 
   await persistAutoRunTimerPlan(timerPlan, {
     autoRunSkipFailures: timerPlan.autoRunSkipFailures,
@@ -4579,14 +4424,17 @@ async function cancelScheduledAutoRun(options = {}) {
   autoRunCurrentRun = 0;
   autoRunTotalRuns = plan.totalRuns;
   autoRunAttemptRun = 0;
+  clearCurrentAutoRunSessionId(plan.autoRunSessionId);
   await broadcastAutoRunStatus(
     'idle',
     {
       currentRun: 0,
       totalRuns: plan.totalRuns,
       attemptRun: 0,
+      sessionId: 0,
     },
     {
+      autoRunSessionId: 0,
       autoRunRoundSummaries: [],
       autoRunTimerPlan: null,
       scheduledAutoRunPlan: null,
@@ -4601,21 +4449,37 @@ async function cancelScheduledAutoRun(options = {}) {
 
 async function restoreAutoRunTimerIfNeeded() {
   const state = await getState();
-  const plan = getPendingAutoRunTimerPlan(state);
+  let plan = getPendingAutoRunTimerPlan(state);
   if (!plan) {
+    clearCurrentAutoRunSessionId();
     if (state.autoRunPhase === 'scheduled' || state.autoRunPhase === 'waiting_interval') {
       await clearAutoRunTimerAlarm();
       await broadcastAutoRunStatus('idle', {
         currentRun: 0,
         totalRuns: 1,
         attemptRun: 0,
+        sessionId: 0,
       }, {
+        autoRunSessionId: 0,
         autoRunRoundSummaries: [],
         autoRunTimerPlan: null,
         scheduledAutoRunPlan: null,
       });
     }
     return;
+  }
+
+  if (!plan.autoRunSessionId) {
+    const restoredSessionId = createAutoRunSessionId();
+    plan = await persistAutoRunTimerPlan({
+      ...plan,
+      autoRunSessionId: restoredSessionId,
+    }, {
+      autoRunSkipFailures: plan.autoRunSkipFailures,
+      autoRunRoundSummaries: serializeAutoRunRoundSummaries(plan.totalRuns, plan.roundSummaries),
+    });
+  } else {
+    setCurrentAutoRunSessionId(plan.autoRunSessionId);
   }
 
   if (plan.fireAt <= Date.now()) {
@@ -4628,6 +4492,7 @@ async function restoreAutoRunTimerIfNeeded() {
     statusPayload.phase,
     statusPayload,
     {
+      autoRunSessionId: plan.autoRunSessionId,
       autoRunSkipFailures: plan.autoRunSkipFailures,
       autoRunRoundSummaries: serializeAutoRunRoundSummaries(plan.totalRuns, plan.roundSummaries),
       autoRunTimerPlan: plan,
@@ -4656,7 +4521,7 @@ async function ensureManualInteractionAllowed(actionLabel) {
 async function skipStep(step) {
   const state = await ensureManualInteractionAllowed('跳过步骤');
 
-  if (!Number.isInteger(step) || step < 1 || step > 9) {
+  if (!Number.isInteger(step) || !STEP_IDS.includes(step)) {
     throw new Error(`无效步骤：${step}`);
   }
 
@@ -4681,10 +4546,16 @@ async function skipStep(step) {
 
   if (step === 1) {
     const latestState = await getState();
-    const step2Status = latestState.stepStatuses?.[2];
-    if (!isStepDoneStatus(step2Status) && step2Status !== 'running') {
-      await setStepStatus(2, 'skipped');
-      await addLog('步骤 1 已跳过，步骤 2 也已同时跳过。', 'warn');
+    const skippedSteps = [];
+    for (let linkedStep = 2; linkedStep <= 5; linkedStep += 1) {
+      const linkedStatus = latestState.stepStatuses?.[linkedStep];
+      if (!isStepDoneStatus(linkedStatus) && linkedStatus !== 'running') {
+        await setStepStatus(linkedStep, 'skipped');
+        skippedSteps.push(linkedStep);
+      }
+    }
+    if (skippedSteps.length) {
+      await addLog(`步骤 1 已跳过，步骤 ${skippedSteps.join('、')} 也已同时跳过。`, 'warn');
     }
   }
 
@@ -4716,7 +4587,7 @@ async function clickWithDebugger(tabId, rect) {
     throw new Error('未找到用于调试点击的认证页面标签页。');
   }
   if (!rect || !Number.isFinite(rect.centerX) || !Number.isFinite(rect.centerY)) {
-    throw new Error('步骤 8 的调试器兜底点击需要有效的按钮坐标。');
+    throw new Error('步骤 9 的调试器兜底点击需要有效的按钮坐标。');
   }
 
   const target = { tabId };
@@ -4724,7 +4595,7 @@ async function clickWithDebugger(tabId, rect) {
     await chrome.debugger.attach(target, '1.3');
   } catch (err) {
     throw new Error(
-      `步骤 8 的调试器兜底点击附加失败：${err.message}。` +
+      `步骤 9 的调试器兜底点击附加失败：${err.message}。` +
       '如果认证页标签已打开 DevTools，请先关闭后重试。'
     );
   }
@@ -4849,7 +4720,7 @@ async function handleStepData(step, payload) {
         await setState({ loginVerificationRequestedAt: payload.loginVerificationRequestedAt });
       }
       break;
-    case 6:
+    case 7:
       if (payload.loginVerificationRequestedAt) {
         await setState({ loginVerificationRequestedAt: payload.loginVerificationRequestedAt });
       }
@@ -4860,22 +4731,25 @@ async function handleStepData(step, payload) {
         signupVerificationRequestedAt: null,
       });
       break;
-    case 7:
+    case 8:
       await setState({
         lastEmailTimestamp: payload.emailTimestamp || null,
         loginVerificationRequestedAt: null,
       });
       break;
-    case 8:
+    case 9:
       if (payload.localhostUrl) {
         if (!isLocalhostOAuthCallbackUrl(payload.localhostUrl)) {
-          throw new Error('步骤 8 返回了无效的 localhost OAuth 回调地址。');
+          throw new Error('步骤 9 返回了无效的 localhost OAuth 回调地址。');
         }
-        await setState({ localhostUrl: payload.localhostUrl });
+        await setState({
+          localhostUrl: payload.localhostUrl,
+          oauthFlowDeadlineAt: null,
+        });
         broadcastDataUpdate({ localhostUrl: payload.localhostUrl });
       }
       break;
-    case 9: {
+    case 10: {
       if (payload.localhostUrl) {
         await closeLocalhostCallbackTabs(payload.localhostUrl);
       }
@@ -4920,8 +4794,8 @@ async function handleStepData(step, payload) {
 const stepWaiters = new Map();
 let resumeWaiter = null;
 const AUTO_RUN_SIGNAL_COMPLETION_TIMEOUT_MS = 120000;
-const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([1, 2, 4, 6, 7, 8]);
-const STEP_COMPLETION_SIGNAL_STEPS = new Set([3, 5, 9]);
+const AUTO_RUN_BACKGROUND_COMPLETED_STEPS = new Set([1, 2, 4, 6, 7, 8, 9]);
+const STEP_COMPLETION_SIGNAL_STEPS = new Set([3, 5, 10]);
 
 function waitForStepComplete(step, timeoutMs = 120000) {
   return new Promise((resolve, reject) => {
@@ -4967,11 +4841,11 @@ async function completeStepFromBackground(step, payload = {}) {
     return;
   }
 
-  const completionState = step === 9 ? await getState() : null;
+  const completionState = step === LAST_STEP_ID ? await getState() : null;
   await setStepStatus(step, 'completed');
   await addLog(`步骤 ${step} 已完成`, 'ok');
   await handleStepData(step, payload);
-  if (step === 9) {
+  if (step === LAST_STEP_ID) {
     await appendAndBroadcastAccountRunRecord('success', completionState);
   }
   notifyStepComplete(step, payload);
@@ -4983,10 +4857,6 @@ async function appendManualAccountRunRecordIfNeeded(status, stateOverride = null
   }
 
   const state = stateOverride || await getState();
-  if (isAutoRunLockedState(state)) {
-    return null;
-  }
-
   return appendAndBroadcastAccountRunRecord(status, state, reason);
 }
 
@@ -5099,6 +4969,7 @@ async function requestStop(options = {}) {
     autoRunCurrentRun = timerPlan.currentRun;
     autoRunTotalRuns = timerPlan.totalRuns;
     autoRunAttemptRun = timerPlan.attemptRun;
+    clearCurrentAutoRunSessionId(timerPlan.autoRunSessionId);
     if (options.logMessage !== false) {
       await addLog(options.logMessage || '已停止等待中的自动流程。', 'warn');
     }
@@ -5106,7 +4977,9 @@ async function requestStop(options = {}) {
       currentRun: timerPlan.currentRun,
       totalRuns: timerPlan.totalRuns,
       attemptRun: timerPlan.attemptRun,
+      sessionId: 0,
     }, {
+      autoRunSessionId: 0,
       autoRunSkipFailures: timerPlan.autoRunSkipFailures,
       autoRunRoundSummaries: serializeAutoRunRoundSummaries(timerPlan.totalRuns, timerPlan.roundSummaries),
       autoRunTimerPlan: null,
@@ -5120,6 +4993,7 @@ async function requestStop(options = {}) {
   if (stopRequested) return;
 
   stopRequested = true;
+  clearCurrentAutoRunSessionId();
   cancelPendingCommands();
   cleanupStep8NavigationListeners();
   rejectPendingStep8(new Error(STOP_ERROR_MESSAGE));
@@ -5143,7 +5017,9 @@ async function requestStop(options = {}) {
     currentRun: autoRunCurrentRun,
     totalRuns: autoRunTotalRuns,
     attemptRun: autoRunAttemptRun,
+    sessionId: 0,
   }, {
+    autoRunSessionId: 0,
     autoRunTimerPlan: null,
     scheduledAutoRunPlan: null,
   });
@@ -5176,6 +5052,10 @@ async function executeStep(step, options = {}) {
       await addLog(`步骤 ${step} 已被用户停止`, 'warn');
       await appendManualAccountRunRecordIfNeeded(`step${step}_stopped`, state, getErrorMessage(err));
       throw err;
+    }
+    if (isTerminalSecurityBlockedError(err)) {
+      await handleCloudflareSecurityBlocked(err);
+      throw new Error(STOP_ERROR_MESSAGE);
     }
     if (!(deferRetryableTransportError && doesStepUseCompletionSignal(step) && isRetryableContentScriptTransportError(err))) {
       await setStepStatus(step, 'failed');
@@ -5245,31 +5125,26 @@ function getEmailGeneratorLabel(generator) {
   if (generator === 'icloud') {
     return 'iCloud 隐私邮箱';
   }
-  if (generator === 'icloud-standard-alias') {
-    return '普通 iCloud 别名邮箱';
-  }
   if (generator === 'cloudflare') return 'Cloudflare 邮箱';
   if (generator === CLOUDFLARE_TEMP_EMAIL_GENERATOR) return 'Cloudflare Temp Email';
   return 'Duck 邮箱';
 }
 const generatedEmailHelpers = self.MultiPageGeneratedEmailHelpers?.createGeneratedEmailHelpers({
   addLog,
+  buildGeneratedAliasEmail,
   buildCloudflareTempEmailHeaders,
   CLOUDFLARE_TEMP_EMAIL_GENERATOR,
   DUCK_AUTOFILL_URL,
   fetch,
   fetchIcloudHideMyEmail,
-  fetchIcloudStandardAliasFromPool,
-  getConfiguredIcloudHostPreference,
   getCloudflareTempEmailAddressFromResponse,
   getCloudflareTempEmailConfig,
-  getIcloudMailUrlForHost,
   getState,
   joinCloudflareTempEmailUrl,
-  normalizeIcloudHost,
   normalizeCloudflareDomain,
   normalizeCloudflareTempEmailAddress,
   normalizeEmailGenerator,
+  isGeneratedAliasProvider,
   reuseOrCreateTab,
   sendToContentScript,
   setEmailState,
@@ -5312,6 +5187,8 @@ let autoRunActive = false;
 let autoRunCurrentRun = 0;
 let autoRunTotalRuns = 1;
 let autoRunAttemptRun = 0;
+let autoRunSessionId = 0;
+let autoRunSessionSeed = 0;
 const EMAIL_FETCH_MAX_ATTEMPTS = 5;
 const VERIFICATION_POLL_MAX_ROUNDS = 5;
 const STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS = 25000;
@@ -5362,6 +5239,16 @@ async function appendAndBroadcastAccountRunRecord(status, stateOverride = null, 
   return record;
 }
 
+async function clearAndBroadcastAccountRunHistory(stateOverride = null) {
+  if (!accountRunHistoryHelpers?.clearAccountRunHistory) {
+    return { clearedCount: 0 };
+  }
+
+  const result = await accountRunHistoryHelpers.clearAccountRunHistory(stateOverride);
+  await broadcastAccountRunHistoryUpdate();
+  return result;
+}
+
 const autoRunController = self.MultiPageBackgroundAutoRunController?.createAutoRunController({
   addLog,
   appendAccountRunRecord: (...args) => appendAndBroadcastAccountRunRecord(...args),
@@ -5373,6 +5260,7 @@ const autoRunController = self.MultiPageBackgroundAutoRunController?.createAutoR
   broadcastStopToContentScripts,
   cancelPendingCommands,
   clearStopRequest: () => clearStopRequest(),
+  createAutoRunSessionId: () => createAutoRunSessionId(),
   getAutoRunStatusPayload,
   getErrorMessage,
   getFirstUnfinishedStep,
@@ -5381,6 +5269,7 @@ const autoRunController = self.MultiPageBackgroundAutoRunController?.createAutoR
   getState,
   getStopRequested: () => stopRequested,
   hasSavedProgress,
+  isAddPhoneAuthFailure,
   isRestartCurrentAttemptError,
   isStopError,
   launchAutoRunTimerPlan,
@@ -5394,16 +5283,19 @@ const autoRunController = self.MultiPageBackgroundAutoRunController?.createAutoR
       autoRunCurrentRun,
       autoRunTotalRuns,
       autoRunAttemptRun,
+      autoRunSessionId,
     }),
     set: (updates = {}) => {
       if (updates.autoRunActive !== undefined) autoRunActive = Boolean(updates.autoRunActive);
       if (updates.autoRunCurrentRun !== undefined) autoRunCurrentRun = Number(updates.autoRunCurrentRun) || 0;
       if (updates.autoRunTotalRuns !== undefined) autoRunTotalRuns = Number(updates.autoRunTotalRuns) || 0;
       if (updates.autoRunAttemptRun !== undefined) autoRunAttemptRun = Number(updates.autoRunAttemptRun) || 0;
+      if (updates.autoRunSessionId !== undefined) autoRunSessionId = normalizeAutoRunSessionId(updates.autoRunSessionId);
     },
   },
   setState,
   sleepWithStop,
+  throwIfAutoRunSessionStopped: (sessionId) => throwIfAutoRunSessionStopped(sessionId),
   waitForRunningStepsToFinish,
   throwIfStopped: () => throwIfStopped(),
   chrome,
@@ -5525,26 +5417,132 @@ async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
   return resumedState.email;
 }
 
+async function ensureAutoEmailReady(targetRun, totalRuns, attemptRuns) {
+  const currentState = await getState();
+  if (isHotmailProvider(currentState)) {
+    const account = await ensureHotmailAccountForFlow({
+      allowAllocate: true,
+      markUsed: true,
+      preferredAccountId: null,
+    });
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：已分配 Hotmail 账号 ${account.email}（第 ${attemptRuns} 次尝试）===`, 'ok');
+    return account.email;
+  }
+
+  if (isLuckmailProvider(currentState)) {
+    const purchase = await ensureLuckmailPurchaseForFlow({ allowReuse: true });
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：LuckMail 邮箱已就绪：${purchase.email_address}（第 ${attemptRuns} 次尝试）===`, 'ok');
+    return purchase.email_address;
+  }
+
+  if (isGeneratedAliasProvider(currentState)) {
+    if (isReusableGeneratedAliasEmail(currentState)) {
+      await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：当前已复用 ${currentState.email}，将直接继续执行（第 ${attemptRuns} 次尝试）===`, 'info');
+      return currentState.email;
+    }
+
+    const baseEmail = getManagedAliasBaseEmail(currentState);
+    if (!baseEmail && !currentState.email) {
+      const baseLabel = currentState.mailProvider === GMAIL_PROVIDER ? 'Gmail 原邮箱' : '2925 基邮箱';
+      throw new Error(`${baseLabel}未设置，请先填写，或直接在“注册邮箱”中手动填写完整邮箱。`);
+    }
+
+    await addLog(
+      `=== 目标 ${targetRun}/${totalRuns} 轮：${currentState.mailProvider === GMAIL_PROVIDER ? 'Gmail +tag' : '2925'} 模式已启用，将在步骤 3 自动生成邮箱（第 ${attemptRuns} 次尝试）===`,
+      'info'
+    );
+    return null;
+  }
+
+  if (currentState.email) {
+    return currentState.email;
+  }
+
+  if (shouldUseCustomRegistrationEmail(currentState)) {
+    await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮已暂停：请先填写自定义注册邮箱，然后继续 ===`, 'warn');
+    await broadcastAutoRunStatus('waiting_email', {
+      currentRun: targetRun,
+      totalRuns,
+      attemptRun: attemptRuns,
+    });
+
+    await waitForResume();
+
+    const resumedState = await getState();
+    if (!resumedState.email) {
+      throw new Error('无法继续：当前没有注册邮箱。');
+    }
+    return resumedState.email;
+  }
+
+  const generator = normalizeEmailGenerator(currentState.emailGenerator);
+  const generatorLabel = getEmailGeneratorLabel(generator);
+  let lastError = null;
+  for (let attempt = 1; attempt <= EMAIL_FETCH_MAX_ATTEMPTS; attempt++) {
+    try {
+      if (attempt > 1) {
+        await addLog(`${generatorLabel}：正在进行第 ${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS} 次自动获取重试...`, 'warn');
+      }
+      const generatedEmail = await fetchGeneratedEmail(currentState, { generateNew: true, generator });
+      await addLog(
+        `=== 目标 ${targetRun}/${totalRuns} 轮：${generatorLabel}已就绪：${generatedEmail}（第 ${attemptRuns} 次尝试，第 ${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS} 次获取）===`,
+        'ok'
+      );
+      return generatedEmail;
+    } catch (err) {
+      lastError = err;
+      await addLog(`${generatorLabel}自动获取失败（${attempt}/${EMAIL_FETCH_MAX_ATTEMPTS}）：${err.message}`, 'warn');
+      if (
+        (generator === 'cloudflare' && /域名/.test(String(err.message || '')))
+        || (generator === CLOUDFLARE_TEMP_EMAIL_GENERATOR && /(服务地址|Admin Auth|域名)/.test(String(err.message || '')))
+      ) {
+        break;
+      }
+    }
+  }
+
+  await addLog(`${generatorLabel}自动获取已连续失败 ${EMAIL_FETCH_MAX_ATTEMPTS} 次：${lastError?.message || '未知错误'}`, 'error');
+  await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮已暂停：请先自动获取邮箱或手动粘贴邮箱，然后继续 ===`, 'warn');
+  await broadcastAutoRunStatus('waiting_email', {
+    currentRun: targetRun,
+    totalRuns,
+    attemptRun: attemptRuns,
+  });
+
+  await waitForResume();
+
+  const resumedState = await getState();
+  if (!resumedState.email) {
+    throw new Error('无法继续：当前没有邮箱地址。');
+  }
+  return resumedState.email;
+}
+
 async function runAutoSequenceFromStep(startStep, context = {}) {
   const { targetRun, totalRuns, attemptRuns, continued = false } = context;
-  let postStep6RestartCount = 0;
+  let postStep7RestartCount = 0;
+  let step4RestartCount = 0;
+  let currentStartStep = startStep;
+  let continueCurrentAttempt = continued;
 
-  if (continued) {
+  while (true) {
+
+  if (continueCurrentAttempt) {
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：继续当前进度，从步骤 ${startStep} 开始（第 ${attemptRuns} 次尝试）===`, 'info');
   } else {
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：第 ${attemptRuns} 次尝试，阶段 1，打开官网并进入密码页 ===`, 'info');
   }
 
-  if (startStep <= 1) {
+  if (currentStartStep <= 1) {
     await executeStepAndWait(1, AUTO_STEP_DELAYS[1]);
   }
 
-  if (startStep <= 2) {
+  if (currentStartStep <= 2) {
     await ensureAutoEmailReady(targetRun, totalRuns, attemptRuns);
     await executeStepAndWait(2, AUTO_STEP_DELAYS[2]);
   }
 
-  if (startStep <= 3) {
+  if (currentStartStep <= 3) {
     const latestState = await getState();
     const step3Status = latestState.stepStatuses?.[3] || 'pending';
     await addLog(`=== 目标 ${targetRun}/${totalRuns} 轮：阶段 2，填写密码、验证、登录并完成授权（第 ${attemptRuns} 次尝试）===`, 'info');
@@ -5567,20 +5565,46 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
     await chrome.tabs.update(signupTabId, { active: true });
   }
 
-  let step = Math.max(startStep, 4);
-  while (step <= 9) {
+  let restartFromStep1WithCurrentEmail = false;
+  let step = Math.max(currentStartStep, 4);
+  while (step <= LAST_STEP_ID) {
     try {
       await executeStepAndWait(step, AUTO_STEP_DELAYS[step]);
       const latestState = await getState();
-      if (step === 6 && shouldSkipLoginVerificationForCpaCallback(latestState)) {
-        step = 8;
-        continue;
-      }
       step += 1;
     } catch (err) {
+      if (isStopError(err)) {
+        throw err;
+      }
+
+      if (step === 4) {
+        step4RestartCount += 1;
+        const preservedState = await getState();
+        const preservedEmail = String(preservedState.email || '').trim();
+        const preservedPassword = String(preservedState.password || '').trim();
+        const emailSuffix = preservedEmail ? `当前邮箱：${preservedEmail}；` : '';
+        await addLog(
+          `步骤 4：执行失败，准备沿用当前邮箱回到步骤 1 重新开始（第 ${step4RestartCount} 次重开）。${emailSuffix}原因：${getErrorMessage(err)}`,
+          'warn'
+        );
+        await invalidateDownstreamAfterStepRestart(1, {
+          logLabel: `步骤 4 报错后准备回到步骤 1 沿用当前邮箱重试（第 ${step4RestartCount} 次重开）`,
+        });
+        const restorePayload = {};
+        if (preservedEmail) restorePayload.email = preservedEmail;
+        if (preservedPassword) restorePayload.password = preservedPassword;
+        if (Object.keys(restorePayload).length) {
+          await setState(restorePayload);
+        }
+        currentStartStep = 1;
+        continueCurrentAttempt = true;
+        restartFromStep1WithCurrentEmail = true;
+        break;
+      }
+
       const restartDecision = await getPostStep6AutoRestartDecision(step, err);
       if (restartDecision.shouldRestart) {
-        postStep6RestartCount += 1;
+        postStep7RestartCount += 1;
         const authState = restartDecision.authState;
         const authStateLabel = authState?.state ? getLoginAuthStateLabel(authState.state) : '未知页面';
         const authStateSuffix = authState?.url
@@ -5589,23 +5613,30 @@ async function runAutoSequenceFromStep(startStep, context = {}) {
             ? `当前认证页：${authStateLabel}`
             : '未获取到认证页状态';
         await addLog(
-          `步骤 ${step}：检测到报错且当前未进入 add-phone，正在回到步骤 6 重新开始授权流程（第 ${postStep6RestartCount} 次重开）。${authStateSuffix}；原因：${restartDecision.errorMessage || '未知错误'}`,
+          `步骤 ${step}：检测到报错且当前未进入 add-phone，正在回到步骤 7 重新开始授权流程（第 ${postStep7RestartCount} 次重开）。${authStateSuffix}；原因：${restartDecision.errorMessage || '未知错误'}`,
           'warn'
         );
-        await invalidateDownstreamAfterStepRestart(5, {
-          logLabel: `步骤 ${step} 报错后准备回到步骤 6 重试（第 ${postStep6RestartCount} 次重开）`,
+        await invalidateDownstreamAfterStepRestart(6, {
+          logLabel: `步骤 ${step} 报错后准备回到步骤 7 重试（第 ${postStep7RestartCount} 次重开）`,
         });
-        step = 6;
+        step = 7;
         continue;
       }
 
       if (restartDecision.blockedByAddPhone) {
         const addPhoneUrl = restartDecision.authState?.url || 'https://auth.openai.com/add-phone';
-        await addLog(`步骤 ${step}：检测到认证流程进入 add-phone（${addPhoneUrl}），停止自动回到步骤 6 重开。`, 'warn');
+        await addLog(`步骤 ${step}：检测到认证流程进入 add-phone（${addPhoneUrl}），停止自动回到步骤 7 重开。`, 'warn');
       }
       throw err;
     }
   }
+
+  if (restartFromStep1WithCurrentEmail) {
+    continue;
+  }
+
+  break;
+}
 }
 
 async function waitForResume() {
@@ -5700,6 +5731,7 @@ async function resumeAutoRun() {
 
   await addLog('检测到自动流程暂停上下文已丢失，正在从当前进度恢复自动运行...', 'warn');
   startAutoRunLoop(totalRuns, {
+    autoRunSessionId: normalizeAutoRunSessionId(state.autoRunSessionId),
     autoRunSkipFailures: Boolean(state.autoRunSkipFailures),
     mode: 'continue',
     resumeCurrentRun: currentRun,
@@ -5714,7 +5746,7 @@ async function resumeAutoRun() {
 // ============================================================
 
 const SIGNUP_ENTRY_URL = 'https://chatgpt.com/';
-const SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/signup-page.js'];
+const SIGNUP_PAGE_INJECT_FILES = ['content/utils.js', 'content/auth-page-recovery.js', 'content/signup-page.js'];
 const panelBridge = self.MultiPageBackgroundPanelBridge?.createPanelBridge({
   chrome,
   addLog,
@@ -5738,6 +5770,7 @@ const signupFlowHelpers = self.MultiPageSignupFlowHelpers?.createSignupFlowHelpe
   ensureLuckmailPurchaseForFlow,
   getTabId,
   isGeneratedAliasProvider,
+  isReusableGeneratedAliasEmail,
   isSignupEmailVerificationPageUrl,
   isHotmailProvider,
   isLuckmailProvider,
@@ -5782,7 +5815,7 @@ const verificationFlowHelpers = self.MultiPageBackgroundVerificationFlow?.create
 const step1Executor = self.MultiPageBackgroundStep1?.createStep1Executor({
   addLog,
   completeStepFromBackground,
-  ensureSignupEntryPageReady,
+  openSignupEntryTab,
 });
 const step2Executor = self.MultiPageBackgroundStep2?.createStep2Executor({
   addLog,
@@ -5834,29 +5867,35 @@ const step5Executor = self.MultiPageBackgroundStep5?.createStep5Executor({
   sendToContentScript,
 });
 const step6Executor = self.MultiPageBackgroundStep6?.createStep6Executor({
+  completeStepFromBackground,
+  runPreStep6CookieCleanup,
+});
+const step7Executor = self.MultiPageBackgroundStep7?.createStep7Executor({
   addLog,
   completeStepFromBackground,
   getErrorMessage,
   getLoginAuthStateLabel,
+  getOAuthFlowStepTimeoutMs,
   getState,
+  isAddPhoneAuthFailure,
   isStep6RecoverableResult,
   isStep6SuccessResult,
   refreshOAuthUrlBeforeStep6,
   reuseOrCreateTab,
-  runPreStep6CookieCleanup,
   sendToContentScriptResilient,
-  shouldSkipLoginVerificationForCpaCallback,
-  skipLoginVerificationStepsForCpaCallback,
+  startOAuthFlowTimeoutWindow,
   STEP6_MAX_ATTEMPTS,
   throwIfStopped,
 });
-const step7Executor = self.MultiPageBackgroundStep7?.createStep7Executor({
+const step8Executor = self.MultiPageBackgroundStep8?.createStep8Executor({
   addLog,
   chrome,
   CLOUDFLARE_TEMP_EMAIL_PROVIDER,
   confirmCustomVerificationStepBypass: verificationFlowHelpers.confirmCustomVerificationStepBypass,
-  ensureStep7VerificationPageReady,
-  executeStep6: (...args) => executeStep6(...args),
+  ensureStep8VerificationPageReady,
+  executeStep7: (...args) => executeStep7(...args),
+  getOAuthFlowRemainingMs,
+  getOAuthFlowStepTimeoutMs,
   getPanelMode,
   getMailConfig,
   getState,
@@ -5869,14 +5908,13 @@ const step7Executor = self.MultiPageBackgroundStep7?.createStep7Executor({
   reuseOrCreateTab,
   setState,
   setStepStatus,
-  shouldSkipLoginVerificationForCpaCallback,
   shouldUseCustomRegistrationEmail,
   sleepWithStop,
   STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS,
   STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS,
   throwIfStopped,
 });
-const step9Executor = self.MultiPageBackgroundStep9?.createStep9Executor({
+const step10Executor = self.MultiPageBackgroundStep10?.createStep10Executor({
   addLog,
   chrome,
   closeConflictingTabsForSource,
@@ -5894,17 +5932,18 @@ const step9Executor = self.MultiPageBackgroundStep9?.createStep9Executor({
   shouldBypassStep9ForLocalCpa,
   SUB2API_STEP9_RESPONSE_TIMEOUT_MS,
 });
-const stepDefinitions = self.MultiPageStepDefinitions?.getSteps?.() || [];
+const stepDefinitions = SHARED_STEP_DEFINITIONS;
 const stepExecutorsByKey = {
-  'open-chatgpt': () => executeStep1(),
+  'open-chatgpt': () => step1Executor.executeStep1(),
   'submit-signup-email': (state) => step2Executor.executeStep2(state),
   'fill-password': (state) => step3Executor.executeStep3(state),
   'fetch-signup-code': (state) => step4Executor.executeStep4(state),
   'fill-profile': (state) => step5Executor.executeStep5(state),
-  'oauth-login': (state) => step6Executor.executeStep6(state),
-  'fetch-login-code': (state) => step7Executor.executeStep7(state),
-  'confirm-oauth': (state) => step8Executor.executeStep8(state),
-  'platform-verify': (state) => step9Executor.executeStep9(state),
+  'clear-login-cookies': () => step6Executor.executeStep6(),
+  'oauth-login': (state) => step7Executor.executeStep7(state),
+  'fetch-login-code': (state) => step8Executor.executeStep8(state),
+  'confirm-oauth': (state) => step9Executor.executeStep9(state),
+  'platform-verify': (state) => step10Executor.executeStep10(state),
 };
 const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter({
   addLog,
@@ -5916,6 +5955,7 @@ const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter
   broadcastDataUpdate,
   cancelScheduledAutoRun,
   checkIcloudSession,
+  clearAccountRunHistory: (...args) => clearAndBroadcastAccountRunHistory(...args),
   clearAutoRunTimerAlarm,
   clearLuckmailRuntimeState,
   clearStopRequest,
@@ -5932,6 +5972,15 @@ const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter
   executeStepViaCompletionSignal,
   exportSettingsBundle,
   fetchGeneratedEmail,
+  finalizeStep3Completion: async () => {
+    const currentState = await getState();
+    const signupTabId = await getTabId('signup-page');
+    return signupFlowHelpers.finalizeSignupPasswordSubmitInTab(
+      signupTabId,
+      currentState.password || currentState.customPassword || '',
+      3
+    );
+  },
   finalizeIcloudAliasAfterSuccessfulFlow,
   findHotmailAccount,
   flushCommand,
@@ -5940,9 +5989,11 @@ const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter
   getSourceLabel,
   getState,
   getStopRequested: () => stopRequested,
+  handleCloudflareSecurityBlocked,
   handleAutoRunLoopUnhandledError,
   importSettingsBundle,
   invalidateDownstreamAfterStepRestart,
+  isCloudflareSecurityBlockedError: isTerminalSecurityBlockedError,
   isAutoRunLockedState,
   isHotmailProvider,
   isLocalhostOAuthCallbackUrl,
@@ -5950,7 +6001,6 @@ const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter
   isStopError,
   launchAutoRunTimerPlan,
   listIcloudAliases,
-  listStandardIcloudPool,
   listLuckmailPurchasesForManagement,
   normalizeHotmailAccounts,
   normalizeRunCount,
@@ -5969,11 +6019,6 @@ const messageRouter = self.MultiPageBackgroundMessageRouter?.createMessageRouter
   setEmailStateSilently,
   setIcloudAliasPreservedState,
   setIcloudAliasUsedState,
-  setStandardIcloudEmailPreservedState,
-  setStandardIcloudEmailUsedState,
-  syncStandardIcloudPool,
-  deleteStandardIcloudEmail,
-  deleteUsedStandardIcloudEmails,
   setLuckmailPurchaseDisabledState,
   setLuckmailPurchasePreservedState,
   setLuckmailPurchaseUsedState,
@@ -6032,7 +6077,6 @@ async function resolveSignupEmailForFlow(state) {
 // ============================================================
 
 async function executeStep1() {
-  await runPreStep1CookieCleanup();
   return step1Executor.executeStep1();
 }
 
@@ -6174,83 +6218,6 @@ async function submitVerificationCode(step, code) {
   return verificationFlowHelpers.submitVerificationCode(step, code);
 }
 
-async function submitVerificationCodeWithPageRecovery(step, code, options = {}) {
-  const maxAttempts = Math.max(1, Number(options.maxAttempts) || 3);
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    if (step === 4) {
-      await recoverSignupPageFromMethodNotAllowed(4);
-    }
-
-    try {
-      return await submitVerificationCode(step, code);
-    } catch (err) {
-      lastError = err;
-      if (step !== 4 || attempt >= maxAttempts) {
-        throw err;
-      }
-
-      const recovered = await recoverSignupPageFromMethodNotAllowed(4);
-      if (!recovered) {
-        throw err;
-      }
-
-      await addLog(`步骤 4：填写验证码前页面跳到了 405，已按原路径恢复后重试提交（${attempt + 1}/${maxAttempts}）。`, 'warn');
-    }
-  }
-
-  throw lastError || new Error(`步骤 ${step}：验证码提交失败。`);
-}
-
-async function prepareStep4VerificationPageWithRecovery(state, options = {}) {
-  const maxAttempts = Math.max(1, Number(options.maxAttempts) || 3);
-  let lastError = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    await recoverSignupPageFromMethodNotAllowed(4);
-    throwIfStopped();
-
-    try {
-      const prepareResult = await sendToContentScriptResilient(
-        'signup-page',
-        {
-          type: 'PREPARE_SIGNUP_VERIFICATION',
-          step: 4,
-          source: 'background',
-          payload: { password: state.password || state.customPassword || '' },
-        },
-        {
-          timeoutMs: 30000,
-          retryDelayMs: 700,
-          logMessage: '步骤 4：认证页正在切换，等待页面重新就绪后继续检测...',
-        }
-      );
-
-      if (prepareResult?.error) {
-        throw new Error(prepareResult.error);
-      }
-
-      return prepareResult || {};
-    } catch (err) {
-      throwIfStopped(err);
-      lastError = err;
-      if (attempt >= maxAttempts) {
-        break;
-      }
-
-      const recovered = await recoverSignupPageFromMethodNotAllowed(4);
-      if (!recovered) {
-        throw err;
-      }
-
-      await addLog(`步骤 4：准备验证码页时检测到 405，已按原路径恢复并重试（${attempt + 1}/${maxAttempts}）。`, 'warn');
-    }
-  }
-
-  throw lastError || new Error('步骤 4：验证码页面准备失败。');
-}
-
 async function resolveVerificationStep(step, state, mail, options = {}) {
   return verificationFlowHelpers.resolveVerificationStep(step, state, mail, options);
 }
@@ -6349,26 +6316,16 @@ async function removeCookieDirectly(cookie) {
   }
 }
 
-async function runPreLoginCookieCleanup(options = {}) {
-  const {
-    stepLabel = '步骤 6',
-    waitMs = STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS,
-    continueMessage = '准备继续获取链接并登录。',
-  } = options;
+async function runPreStep6CookieCleanup() {
+  await addLog(
+    `步骤 6：开始前等待 ${Math.round(STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS / 1000)} 秒，然后直接删除 ChatGPT / OpenAI cookies...`,
+    'info'
+  );
 
-  const normalizedWaitMs = Math.max(0, Number(waitMs) || 0);
-  if (normalizedWaitMs > 0) {
-    await addLog(
-      `${stepLabel}：开始前等待 ${Math.round(normalizedWaitMs / 1000)} 秒，然后直接删除 ChatGPT / OpenAI cookies...`,
-      'info'
-    );
-    await sleepWithStop(normalizedWaitMs);
-  } else {
-    await addLog(`${stepLabel}：开始前直接删除 ChatGPT / OpenAI cookies...`, 'info');
-  }
+  await sleepWithStop(STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS);
 
   if (!chrome.cookies?.getAll || !chrome.cookies?.remove) {
-    await addLog(`${stepLabel}：当前浏览器不支持 cookies API，无法直接删除 cookies。`, 'warn');
+    await addLog('步骤 6：当前浏览器不支持 cookies API，无法直接删除 cookies。', 'warn');
     return;
   }
 
@@ -6389,40 +6346,21 @@ async function runPreLoginCookieCleanup(options = {}) {
         origins: PRE_LOGIN_COOKIE_CLEAR_ORIGINS,
       });
     } catch (err) {
-      await addLog(`${stepLabel}：browsingData 补扫 cookies 失败：${getErrorMessage(err)}`, 'warn');
+      await addLog(`步骤 6：browsingData 补扫 cookies 失败：${getErrorMessage(err)}`, 'warn');
     }
   }
 
-  await addLog(
-    `${stepLabel}：已直接删除 ${removedCount} 个 ChatGPT / OpenAI cookies，${continueMessage}`,
-    'ok'
-  );
-}
-
-async function runPreStep1CookieCleanup() {
-  return runPreLoginCookieCleanup({
-    stepLabel: '步骤 1',
-    waitMs: 0,
-    continueMessage: '准备继续打开 ChatGPT 首页。',
-  });
-}
-
-async function runPreStep6CookieCleanup() {
-  return runPreLoginCookieCleanup({
-    stepLabel: '步骤 6',
-    waitMs: STEP6_PRE_LOGIN_COOKIE_CLEAR_DELAY_MS,
-    continueMessage: '准备继续获取链接并登录。',
-  });
+  await addLog(`步骤 6：已直接删除 ${removedCount} 个 ChatGPT / OpenAI cookies，准备继续获取链接并登录。`, 'ok');
 }
 
 // ============================================================
-// Step 6: Login and ensure the auth page reaches the login verification page
+// Step 7: Login and ensure the auth page reaches the login verification page
 // ============================================================
 
 async function refreshOAuthUrlBeforeStep6(state) {
-  await addLog(`步骤 6：正在刷新登录用的 ${getPanelModeLabel(state)} OAuth 链接...`);
+  await addLog(`步骤 7：正在刷新登录用的 ${getPanelModeLabel(state)} OAuth 链接...`);
   console.log(LOG_PREFIX, '[refreshOAuthUrlBeforeStep6] requesting fresh OAuth directly from panel');
-  const refreshResult = await requestOAuthUrlFromPanel(state, { logLabel: '步骤 6' });
+  const refreshResult = await requestOAuthUrlFromPanel(state, { logLabel: '步骤 7' });
   await handleStepData(1, refreshResult);
 
   if (!refreshResult?.oauthUrl) {
@@ -6430,6 +6368,64 @@ async function refreshOAuthUrlBeforeStep6(state) {
   }
 
   return refreshResult.oauthUrl;
+}
+
+function buildOAuthFlowTimeoutError(step, actionLabel = '后续授权流程') {
+  return new Error(
+    `步骤 ${step}：从拿到 OAuth 登录地址开始，${Math.round(OAUTH_FLOW_TIMEOUT_MS / 60000)} 分钟内未完成${actionLabel}，结束当前链路，准备从步骤 7 重新开始。`
+  );
+}
+
+function normalizeOAuthFlowDeadlineAt(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) {
+    return null;
+  }
+  return Math.floor(numeric);
+}
+
+async function startOAuthFlowTimeoutWindow(options = {}) {
+  const step = Number(options.step) || 7;
+  const deadlineAt = Date.now() + OAUTH_FLOW_TIMEOUT_MS;
+  await setState({ oauthFlowDeadlineAt: deadlineAt });
+  await addLog(`步骤 ${step}：已拿到新的 OAuth 登录地址，开始 6 分钟倒计时。`, 'info');
+  return deadlineAt;
+}
+
+async function getOAuthFlowRemainingMs(options = {}) {
+  const step = Number(options.step) || 7;
+  const actionLabel = String(options.actionLabel || '后续授权流程').trim() || '后续授权流程';
+  const state = options.state || await getState();
+  const deadlineAt = normalizeOAuthFlowDeadlineAt(state?.oauthFlowDeadlineAt);
+  if (!deadlineAt) {
+    return null;
+  }
+
+  const remainingMs = deadlineAt - Date.now();
+  if (remainingMs <= 0) {
+    throw buildOAuthFlowTimeoutError(step, actionLabel);
+  }
+
+  return remainingMs;
+}
+
+async function getOAuthFlowStepTimeoutMs(defaultTimeoutMs, options = {}) {
+  const normalizedDefault = Math.max(1000, Number(defaultTimeoutMs) || 1000);
+  const reserveMs = Math.max(0, Number(options.reserveMs) || 0);
+  const remainingMs = await getOAuthFlowRemainingMs(options);
+  if (remainingMs === null) {
+    return normalizedDefault;
+  }
+
+  const budgetMs = remainingMs - reserveMs;
+  if (budgetMs <= 0) {
+    throw buildOAuthFlowTimeoutError(
+      Number(options.step) || 7,
+      String(options.actionLabel || '后续授权流程').trim() || '后续授权流程'
+    );
+  }
+
+  return Math.max(1000, Math.min(normalizedDefault, budgetMs));
 }
 
 function isStep6SuccessResult(result) {
@@ -6453,7 +6449,7 @@ function isAddPhoneAuthState(authState = {}) {
 async function getPostStep6AutoRestartDecision(step, error) {
   const normalizedStep = Number(step);
   const errorMessage = getErrorMessage(error);
-  if (!Number.isFinite(normalizedStep) || normalizedStep < 6 || normalizedStep > 9) {
+  if (!Number.isFinite(normalizedStep) || normalizedStep < 7 || normalizedStep > LAST_STEP_ID) {
     return {
       shouldRestart: false,
       blockedByAddPhone: false,
@@ -6462,7 +6458,7 @@ async function getPostStep6AutoRestartDecision(step, error) {
     };
   }
 
-  if (isAddPhoneAuthUrl(errorMessage)) {
+  if (isAddPhoneAuthFailure(error) || isAddPhoneAuthUrl(errorMessage)) {
     return {
       shouldRestart: false,
       blockedByAddPhone: true,
@@ -6474,7 +6470,7 @@ async function getPostStep6AutoRestartDecision(step, error) {
   let authState = null;
   try {
     authState = await getLoginAuthStateFromContent({
-      logMessage: `步骤 ${normalizedStep}：正在确认当前认证页状态，以决定是否回到步骤 6 重开...`,
+      logMessage: `步骤 ${normalizedStep}：正在确认当前认证页状态，以决定是否回到步骤 7 重开...`,
     });
   } catch (inspectError) {
     console.warn(LOG_PREFIX, '[AutoRun] failed to inspect login auth state after post-step6 error', {
@@ -6502,7 +6498,7 @@ async function getPostStep6AutoRestartDecision(step, error) {
 }
 
 async function getLoginAuthStateFromContent(options = {}) {
-  const { logMessage = '步骤 7：认证页正在切换，等待页面重新就绪后继续确认验证码页状态...' } = options;
+  const { logMessage = '步骤 8：认证页正在切换，等待页面重新就绪后继续确认验证码页状态...' } = options;
   const result = await sendToContentScriptResilient(
     'signup-page',
     {
@@ -6511,8 +6507,9 @@ async function getLoginAuthStateFromContent(options = {}) {
       payload: {},
     },
     {
-      timeoutMs: 15000,
-      retryDelayMs: 600,
+      timeoutMs: options.timeoutMs ?? 15000,
+      retryDelayMs: options.retryDelayMs ?? 600,
+      responseTimeoutMs: options.responseTimeoutMs ?? (options.timeoutMs ?? 15000),
       logMessage,
     }
   );
@@ -6524,94 +6521,40 @@ async function getLoginAuthStateFromContent(options = {}) {
   return result || {};
 }
 
-async function getSignupPageHealthFromContent() {
-  const result = await sendToContentScriptResilient(
-    'signup-page',
-    {
-      type: 'GET_SIGNUP_PAGE_HEALTH',
-      source: 'background',
-      payload: {},
-    },
-    {
-      timeoutMs: 15000,
-      retryDelayMs: 600,
-      logMessage: '步骤 4：认证页正在切换，等待页面恢复后继续检查 405 状态...',
-    }
-  );
-
-  if (result?.error) {
-    throw new Error(result.error);
-  }
-
-  return result || {};
-}
-
-async function recoverSignupPageFromMethodNotAllowed(step = 4) {
-  const health = await getSignupPageHealthFromContent();
-  if (!health?.isMethodNotAllowed || !health?.url) {
-    return false;
-  }
-
-  await addLog(`步骤 ${step}：检测到认证页出现 405 Method Not Allowed，正在按当前页面路径重新打开...`, 'warn');
-  const leaveTabId = await reuseOrCreateTab('signup-page', SIGNUP_ENTRY_URL, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-  });
-
-  await ensureContentScriptReadyOnTab('signup-page', leaveTabId, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `步骤 ${step}：认证页正在从 405 页面恢复，等待重新加载...`,
-  });
-  await addLog(`步骤 ${step}：已按当前路径重新打开认证页，继续执行。`, 'ok');
-  await sleepWithStop(600);
-  const tabId = await reuseOrCreateTab('signup-page', health.url, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-  });
-  await ensureContentScriptReadyOnTab('signup-page', tabId, {
-    inject: SIGNUP_PAGE_INJECT_FILES,
-    injectSource: 'signup-page',
-    timeoutMs: 45000,
-    retryDelayMs: 900,
-    logMessage: `步骤 ${step}：认证页正在重新进入原路径，等待页面恢复...`,
-  });
-  return true;
-}
-
-async function ensureStep7VerificationPageReady() {
-  const pageState = await getLoginAuthStateFromContent();
+async function ensureStep8VerificationPageReady(options = {}) {
+  const pageState = await getLoginAuthStateFromContent(options);
   if (pageState.state === 'verification_page') {
     return pageState;
   }
 
+  if (pageState.maxCheckAttemptsBlocked) {
+    throw new Error(`${CLOUDFLARE_SECURITY_BLOCK_ERROR_PREFIX}${CLOUDFLARE_SECURITY_BLOCK_USER_MESSAGE}`);
+  }
+  if (pageState.operationTimedOutBlocked) {
+    throw new Error(`${NETWORK_TIMEOUT_BLOCK_ERROR_PREFIX}${NETWORK_TIMEOUT_BLOCK_USER_MESSAGE}`);
+  }
+
+  if (pageState.state === 'login_timeout_error_page') {
+    const urlPart = pageState.url ? ` URL: ${pageState.url}` : '';
+    throw new Error(`STEP8_RESTART_STEP7::步骤 8：当前认证页进入登录超时报错页，请回到步骤 7 重新开始。${urlPart}`.trim());
+  }
+
+  if (pageState.state === 'add_phone_page') {
+    const urlPart = pageState.url ? ` URL: ${pageState.url}` : '';
+    throw new Error(`步骤 8：当前认证页进入手机号页面，当前流程无法继续自动授权。${urlPart}`.trim());
+  }
+
   const stateLabel = getLoginAuthStateLabel(pageState.state);
   const urlPart = pageState.url ? ` URL: ${pageState.url}` : '';
-  throw new Error(`当前未进入登录验证码页面，请先重新完成步骤 6。当前状态：${stateLabel}.${urlPart}`.trim());
+  throw new Error(`当前未进入登录验证码页面，请先重新完成步骤 7。当前状态：${stateLabel}.${urlPart}`.trim());
 }
 
-async function skipLoginVerificationStepsForCpaCallback() {
-  await setState({
-    lastLoginCode: null,
-    loginVerificationRequestedAt: null,
-  });
-  await setStepStatus(6, 'skipped');
-  await addLog('步骤 6：当前已选择“第六步回调”，直接跳过步骤 6、7。', 'warn');
-  const latestState = await getState();
-  if (!isStepDoneStatus(latestState.stepStatuses?.[7])) {
-    await setStepStatus(7, 'skipped');
-    await addLog('步骤 7：当前已选择“第六步回调”，本轮无需获取登录验证码。', 'warn');
-  }
-}
-
-async function executeStep6(state, options = {}) {
-  return step6Executor.executeStep6(state, options);
+async function executeStep6() {
+  return step6Executor.executeStep6();
 }
 
 // ============================================================
-// Step 7: Poll login verification mail and submit the login code
+// Step 7: Refresh OAuth and log in
 // ============================================================
 
 async function executeStep7(state) {
@@ -6619,7 +6562,15 @@ async function executeStep7(state) {
 }
 
 // ============================================================
-// Step 8: 完成 OAuth（自动点击 + localhost 回调监听）
+// Step 8: Poll login verification mail and submit the login code
+// ============================================================
+
+async function executeStep8(state) {
+  return step8Executor.executeStep8(state);
+}
+
+// ============================================================
+// Step 9: 完成 OAuth（自动点击 + localhost 回调监听）
 // ============================================================
 
 let webNavListener = null;
@@ -6726,21 +6677,42 @@ async function getStep8PageState(tabId, responseTimeoutMs = 1500) {
 async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS) {
   const start = Date.now();
   let recovered = false;
+  let retryRecovered = false;
 
   while (Date.now() - start < timeoutMs) {
     throwIfStopped();
     const pageState = await getStep8PageState(tabId);
+    if (pageState?.maxCheckAttemptsBlocked) {
+      throw new Error(`${CLOUDFLARE_SECURITY_BLOCK_ERROR_PREFIX}${CLOUDFLARE_SECURITY_BLOCK_USER_MESSAGE}`);
+    }
+    if (pageState?.operationTimedOutBlocked) {
+      throw new Error(`${NETWORK_TIMEOUT_BLOCK_ERROR_PREFIX}${NETWORK_TIMEOUT_BLOCK_USER_MESSAGE}`);
+    }
     if (pageState?.addPhonePage) {
-      throw new Error('步骤 8：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
+      throw new Error('步骤 9：认证页进入了手机号页面，当前不是 OAuth 同意页，无法继续自动授权。');
+    }
+    if (pageState?.retryPage) {
+      await recoverAuthRetryPageOnTab(tabId, {
+        flow: 'auth',
+        logLabel: '步骤 9：检测到认证页重试页，正在点击“重试”恢复',
+        step: 8,
+        timeoutMs: Math.max(1000, Math.min(12000, timeoutMs)),
+      });
+      retryRecovered = true;
+      await sleepWithStop(250);
+      continue;
     }
     if (pageState?.consentReady) {
+      if (retryRecovered) {
+        await addLog('步骤 9：认证页重试页已恢复，准备重新定位“继续”按钮...', 'info');
+      }
       return pageState;
     }
     if (pageState === null && !recovered) {
       recovered = true;
       await ensureStep8SignupPageReady(tabId, {
         timeoutMs: Math.min(10000, timeoutMs),
-        logMessage: '步骤 8：认证页内容脚本已失联，正在等待页面重新就绪...',
+        logMessage: '步骤 9：认证页内容脚本已失联，正在等待页面重新就绪...',
       });
       continue;
     }
@@ -6748,22 +6720,25 @@ async function waitForStep8Ready(tabId, timeoutMs = STEP8_READY_WAIT_TIMEOUT_MS)
     await sleepWithStop(250);
   }
 
-  throw new Error('步骤 8：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
+  throw new Error('步骤 9：长时间未进入 OAuth 同意页，无法定位“继续”按钮。');
 }
 
-async function prepareStep8DebuggerClick(tabId) {
+async function prepareStep8DebuggerClick(tabId, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const responseTimeoutMs = options.responseTimeoutMs ?? timeoutMs;
   await ensureStep8SignupPageReady(tabId, {
-    timeoutMs: 15000,
-    logMessage: '步骤 8：认证页内容脚本已失联，正在恢复后继续定位按钮...',
+    timeoutMs,
+    logMessage: '步骤 9：认证页内容脚本已失联，正在恢复后继续定位按钮...',
   });
   const result = await sendToContentScriptResilient('signup-page', {
     type: 'STEP8_FIND_AND_CLICK',
     source: 'background',
     payload: {},
   }, {
-    timeoutMs: 15000,
+    timeoutMs,
+    responseTimeoutMs,
     retryDelayMs: 600,
-    logMessage: '步骤 8：认证页正在切换，等待 OAuth 同意页按钮重新就绪...',
+    logMessage: '步骤 9：认证页正在切换，等待 OAuth 同意页按钮重新就绪...',
   });
 
   if (result?.error) {
@@ -6773,10 +6748,12 @@ async function prepareStep8DebuggerClick(tabId) {
   return result;
 }
 
-async function triggerStep8ContentStrategy(tabId, strategy) {
+async function triggerStep8ContentStrategy(tabId, strategy, options = {}) {
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const responseTimeoutMs = options.responseTimeoutMs ?? timeoutMs;
   await ensureStep8SignupPageReady(tabId, {
-    timeoutMs: 15000,
-    logMessage: '步骤 8：认证页内容脚本已失联，正在恢复后继续点击“继续”按钮...',
+    timeoutMs,
+    logMessage: '步骤 9：认证页内容脚本已失联，正在恢复后继续点击“继续”按钮...',
   });
   const result = await sendToContentScriptResilient('signup-page', {
     type: 'STEP8_TRIGGER_CONTINUE',
@@ -6787,9 +6764,37 @@ async function triggerStep8ContentStrategy(tabId, strategy) {
       enabledTimeoutMs: 3000,
     },
   }, {
-    timeoutMs: 15000,
+    timeoutMs,
+    responseTimeoutMs,
     retryDelayMs: 600,
-    logMessage: '步骤 8：认证页正在切换，等待“继续”按钮重新就绪...',
+    logMessage: '步骤 9：认证页正在切换，等待“继续”按钮重新就绪...',
+  });
+
+  if (result?.error) {
+    throw new Error(result.error);
+  }
+
+  return result;
+}
+
+async function recoverAuthRetryPageOnTab(tabId, payload = {}, options = {}) {
+  const readyTimeoutMs = options.readyTimeoutMs ?? 15000;
+  const timeoutMs = options.timeoutMs ?? 15000;
+  const responseTimeoutMs = options.responseTimeoutMs ?? timeoutMs;
+  await ensureStep8SignupPageReady(tabId, {
+    timeoutMs: readyTimeoutMs,
+    retryDelayMs: options.retryDelayMs ?? 600,
+    logMessage: options.readyLogMessage || '步骤 9：认证页内容脚本已失联，正在恢复后继续处理重试页...',
+  });
+  const result = await sendToContentScriptResilient('signup-page', {
+    type: 'RECOVER_AUTH_RETRY_PAGE',
+    source: 'background',
+    payload,
+  }, {
+    timeoutMs,
+    responseTimeoutMs,
+    retryDelayMs: options.retryDelayMs ?? 600,
+    logMessage: options.logMessage || '步骤 9：认证页正在切换，等待“重试”按钮重新就绪...',
   });
 
   if (result?.error) {
@@ -6801,7 +6806,7 @@ async function triggerStep8ContentStrategy(tabId, strategy) {
 
 async function reloadStep8ConsentPage(tabId, timeoutMs = 30000) {
   if (!Number.isInteger(tabId)) {
-    throw new Error('步骤 8：缺少有效的认证页标签页，无法刷新后重试。');
+    throw new Error('步骤 9：缺少有效的认证页标签页，无法刷新后重试。');
   }
 
   await chrome.tabs.update(tabId, { active: true }).catch(() => { });
@@ -6812,7 +6817,7 @@ async function reloadStep8ConsentPage(tabId, timeoutMs = 30000) {
       if (settled) return;
       settled = true;
       chrome.tabs.onUpdated.removeListener(listener);
-      reject(new Error('步骤 8：刷新认证页后等待页面完成加载超时。'));
+      reject(new Error('步骤 9：刷新认证页后等待页面完成加载超时。'));
     }, timeoutMs);
 
     const listener = (updatedTabId, changeInfo) => {
@@ -6837,7 +6842,7 @@ async function reloadStep8ConsentPage(tabId, timeoutMs = 30000) {
 
   await ensureStep8SignupPageReady(tabId, {
     timeoutMs: Math.min(15000, timeoutMs),
-    logMessage: '步骤 8：认证页刷新后内容脚本尚未就绪，正在等待页面恢复...',
+    logMessage: '步骤 9：认证页刷新后内容脚本尚未就绪，正在等待页面恢复...',
   });
 }
 
@@ -6850,7 +6855,7 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
 
     const tab = await chrome.tabs.get(tabId).catch(() => null);
     if (!tab) {
-      throw new Error('步骤 8：认证页面标签页已关闭，无法继续自动授权。');
+      throw new Error('步骤 9：认证页面标签页已关闭，无法继续自动授权。');
     }
 
     if (baselineUrl && typeof tab.url === 'string' && tab.url !== baselineUrl) {
@@ -6858,15 +6863,35 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
     }
 
     const pageState = await getStep8PageState(tabId);
+    if (pageState?.maxCheckAttemptsBlocked) {
+      throw new Error(`${CLOUDFLARE_SECURITY_BLOCK_ERROR_PREFIX}${CLOUDFLARE_SECURITY_BLOCK_USER_MESSAGE}`);
+    }
+    if (pageState?.operationTimedOutBlocked) {
+      throw new Error(`${NETWORK_TIMEOUT_BLOCK_ERROR_PREFIX}${NETWORK_TIMEOUT_BLOCK_USER_MESSAGE}`);
+    }
     if (pageState?.addPhonePage) {
-      throw new Error('步骤 8：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
+      throw new Error('步骤 9：点击“继续”后页面跳到了手机号页面，当前流程无法继续自动授权。');
+    }
+    if (pageState?.retryPage) {
+      await recoverAuthRetryPageOnTab(tabId, {
+        flow: 'auth',
+        logLabel: '步骤 9：点击“继续”后进入重试页，正在点击“重试”恢复',
+        step: 8,
+        timeoutMs: Math.max(1000, Math.min(12000, timeoutMs)),
+      });
+      return {
+        progressed: false,
+        reason: 'retry_page_recovered',
+        restartCurrentStep: true,
+        url: pageState.url || baselineUrl || '',
+      };
     }
     if (pageState === null) {
       if (!recovered) {
         recovered = true;
         await ensureStep8SignupPageReady(tabId, {
-          timeoutMs: Math.max(3000, Math.min(8000, timeoutMs)),
-          logMessage: '步骤 8：点击后认证页正在重载，正在等待内容脚本重新就绪...',
+          timeoutMs: Math.max(1000, Math.min(8000, timeoutMs)),
+          logMessage: '步骤 9：点击后认证页正在重载，正在等待内容脚本重新就绪...',
         }).catch(() => null);
         continue;
       }
@@ -6874,6 +6899,14 @@ async function waitForStep8ClickEffect(tabId, baselineUrl, timeoutMs = STEP8_CLI
       continue;
     }
     recovered = false;
+
+    if (pageState?.consentPage === false && !pageState?.verificationPage) {
+      return {
+        progressed: true,
+        reason: 'left_consent_page',
+        url: pageState.url || baselineUrl || '',
+      };
+    }
 
     await sleepWithStop(200);
   }
@@ -6885,6 +6918,8 @@ function getStep8EffectLabel(effect) {
   switch (effect?.reason) {
     case 'url_changed':
       return `URL 已变化：${effect.url}`;
+    case 'retry_page_recovered':
+      return '页面进入重试页并已恢复，需要重新执行当前步骤';
     case 'page_reloading':
       return '页面正在跳转或重载';
     case 'left_consent_page':
@@ -6894,13 +6929,14 @@ function getStep8EffectLabel(effect) {
   }
 }
 
-const step8Executor = self.MultiPageBackgroundStep8?.createStep8Executor({
+const step9Executor = self.MultiPageBackgroundStep9?.createStep9Executor({
   addLog,
   chrome,
   cleanupStep8NavigationListeners,
   clickWithDebugger,
   completeStepFromBackground,
   ensureStep8SignupPageReady,
+  getOAuthFlowStepTimeoutMs,
   getStep8CallbackUrlFromNavigation,
   getStep8CallbackUrlFromTabUpdate,
   getStep8EffectLabel,
@@ -6927,16 +6963,16 @@ const step8Executor = self.MultiPageBackgroundStep8?.createStep8Executor({
   waitForStep8Ready,
 });
 
-async function executeStep8(state) {
-  return step8Executor.executeStep8(state);
+async function executeStep9(state) {
+  return step9Executor.executeStep9(state);
 }
 
 // ============================================================
-// Step 9: 平台回调验证
+// Step 10: 平台回调验证
 // ============================================================
 
-async function executeStep9(state) {
-  return step9Executor.executeStep9(state);
+async function executeStep10(state) {
+  return step10Executor.executeStep10(state);
 }
 
 // ============================================================

@@ -52,6 +52,8 @@ function extractFunction(source, name) {
 }
 
 const helperBundle = [
+  extractFunction(helperSource, 'normalizeAutoRunSessionId'),
+  extractFunction(helperSource, 'clearCurrentAutoRunSessionId'),
   extractFunction(helperSource, 'throwIfStopped'),
   extractFunction(helperSource, 'cleanupStep8NavigationListeners'),
   extractFunction(helperSource, 'rejectPendingStep8'),
@@ -71,6 +73,7 @@ let autoRunActive = true;
 let autoRunCurrentRun = 2;
 let autoRunTotalRuns = 3;
 let autoRunAttemptRun = 4;
+let autoRunSessionId = 99;
 const AUTO_RUN_TIMER_KIND_SCHEDULED_START = 'scheduled_start';
 const STEP8_CLICK_RETRY_DELAY_MS = 500;
 const STEP8_MAX_ROUNDS = 5;
@@ -203,7 +206,7 @@ function setStep8PendingReject(handler) {
 ${helperBundle}
 ${step8ModuleSource}
 
-const executor = self.MultiPageBackgroundStep8.createStep8Executor({
+const executor = self.MultiPageBackgroundStep9.createStep9Executor({
   addLog,
   chrome,
   cleanupStep8NavigationListeners,
@@ -237,7 +240,7 @@ const executor = self.MultiPageBackgroundStep8.createStep8Executor({
 });
 
 return {
-  executeStep8: executor.executeStep8,
+  executeStep9: executor.executeStep9,
   requestStop,
   resolveTabId(tabId) {
     if (!resolveTabId) {
@@ -257,13 +260,14 @@ return {
       sentMessages,
       clickCount,
       autoRunActive,
+      autoRunSessionId,
     };
   },
 };
 `)(step8ModuleSource);
 
 (async () => {
-  const step8Promise = api.executeStep8({ oauthUrl: 'https://example.com/oauth' });
+  const step8Promise = api.executeStep9({ oauthUrl: 'https://example.com/oauth' });
   const settledStep8Promise = step8Promise.catch((err) => err);
 
   await new Promise((resolve) => setImmediate(resolve));
@@ -288,6 +292,7 @@ return {
   assert.strictEqual(state.webNavCommittedListener, null, 'Stop 后 onCommitted 引用应为空');
   assert.strictEqual(state.step8TabUpdatedListener, null, 'Stop 后 tabs.onUpdated 引用应为空');
   assert.strictEqual(state.step8PendingReject, null, 'Stop 后不应保留 Step 8 挂起 reject');
+  assert.strictEqual(state.autoRunSessionId, 0, 'Stop 后自动运行 session 应失效');
 
   console.log('step8 stop cleanup tests passed');
 })().catch((error) => {

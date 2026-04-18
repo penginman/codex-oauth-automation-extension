@@ -12,6 +12,7 @@
       broadcastDataUpdate,
       cancelScheduledAutoRun,
       checkIcloudSession,
+      clearAccountRunHistory,
       clearAutoRunTimerAlarm,
       clearLuckmailRuntimeState,
       clearStopRequest,
@@ -28,6 +29,7 @@
       executeStepViaCompletionSignal,
       exportSettingsBundle,
       fetchGeneratedEmail,
+      finalizeStep3Completion,
       finalizeIcloudAliasAfterSuccessfulFlow,
       findHotmailAccount,
       flushCommand,
@@ -39,6 +41,7 @@
       handleAutoRunLoopUnhandledError,
       importSettingsBundle,
       invalidateDownstreamAfterStepRestart,
+      isCloudflareSecurityBlockedError,
       isAutoRunLockedState,
       isHotmailProvider,
       isLocalhostOAuthCallbackUrl,
@@ -46,7 +49,6 @@
       isStopError,
       launchAutoRunTimerPlan,
       listIcloudAliases,
-      listStandardIcloudPool,
       listLuckmailPurchasesForManagement,
       normalizeHotmailAccounts,
       normalizeRunCount,
@@ -56,6 +58,7 @@
       patchHotmailAccount,
       registerTab,
       requestStop,
+      handleCloudflareSecurityBlocked,
       resetState,
       resumeAutoRun,
       scheduleAutoRun,
@@ -65,11 +68,6 @@
       setEmailStateSilently,
       setIcloudAliasPreservedState,
       setIcloudAliasUsedState,
-      setStandardIcloudEmailPreservedState,
-      setStandardIcloudEmailUsedState,
-      syncStandardIcloudPool,
-      deleteStandardIcloudEmail,
-      deleteUsedStandardIcloudEmails,
       setLuckmailPurchaseDisabledState,
       setLuckmailPurchasePreservedState,
       setLuckmailPurchaseUsedState,
@@ -110,6 +108,7 @@
           if (payload.sub2apiOAuthState !== undefined) updates.sub2apiOAuthState = payload.sub2apiOAuthState || null;
           if (payload.sub2apiGroupId !== undefined) updates.sub2apiGroupId = payload.sub2apiGroupId || null;
           if (payload.sub2apiDraftName !== undefined) updates.sub2apiDraftName = payload.sub2apiDraftName || null;
+          if (payload.sub2apiProxyId !== undefined) updates.sub2apiProxyId = payload.sub2apiProxyId || null;
           if (Object.keys(updates).length) {
             await setState(updates);
           }
@@ -137,7 +136,7 @@
             await setState({ loginVerificationRequestedAt: payload.loginVerificationRequestedAt });
           }
           break;
-        case 6:
+        case 7:
           if (payload.loginVerificationRequestedAt) {
             await setState({ loginVerificationRequestedAt: payload.loginVerificationRequestedAt });
           }
@@ -148,22 +147,22 @@
             signupVerificationRequestedAt: null,
           });
           break;
-        case 7:
+        case 8:
           await setState({
             lastEmailTimestamp: payload.emailTimestamp || null,
             loginVerificationRequestedAt: null,
           });
           break;
-        case 8:
+        case 9:
           if (payload.localhostUrl) {
             if (!isLocalhostOAuthCallbackUrl(payload.localhostUrl)) {
-              throw new Error('步骤 8 返回了无效的 localhost OAuth 回调地址。');
+              throw new Error('步骤 9 返回了无效的 localhost OAuth 回调地址。');
             }
             await setState({ localhostUrl: payload.localhostUrl });
             broadcastDataUpdate({ localhostUrl: payload.localhostUrl });
           }
           break;
-        case 9: {
+        case 10: {
           if (payload.localhostUrl) {
             await closeLocalhostCallbackTabs(payload.localhostUrl);
           }
@@ -224,11 +223,31 @@
             notifyStepError(message.step, '流程已被用户停止。');
             return { ok: true };
           }
-          const completionState = message.step === 9 ? await getState() : null;
+          try {
+            if (message.step === 3 && typeof finalizeStep3Completion === 'function') {
+              await finalizeStep3Completion(message.payload || {});
+            }
+          } catch (error) {
+            if (typeof isCloudflareSecurityBlockedError === 'function' && isCloudflareSecurityBlockedError(error)) {
+              const userMessage = typeof handleCloudflareSecurityBlocked === 'function'
+                ? await handleCloudflareSecurityBlocked(error)
+                : (error?.message || String(error || ''));
+              notifyStepError(message.step, '流程已被用户停止。');
+              return { ok: true, error: userMessage };
+            }
+            const errorMessage = error?.message || String(error || '步骤 3 提交后确认失败');
+            await setStepStatus(message.step, 'failed');
+            await addLog(`步骤 ${message.step} 失败：${errorMessage}`, 'error');
+            await appendManualAccountRunRecordIfNeeded(`step${message.step}_failed`, null, errorMessage);
+            notifyStepError(message.step, errorMessage);
+            return { ok: true, error: errorMessage };
+          }
+
+          const completionState = message.step === 10 ? await getState() : null;
           await setStepStatus(message.step, 'completed');
           await addLog(`步骤 ${message.step} 已完成`, 'ok');
           await handleStepData(message.step, message.payload);
-          if (message.step === 9 && typeof appendAccountRunRecord === 'function') {
+          if (message.step === 10 && typeof appendAccountRunRecord === 'function') {
             await appendAccountRunRecord('success', completionState);
           }
           notifyStepComplete(message.step, message.payload);
@@ -236,6 +255,13 @@
         }
 
         case 'STEP_ERROR': {
+          if (typeof isCloudflareSecurityBlockedError === 'function' && isCloudflareSecurityBlockedError(message.error)) {
+            const userMessage = typeof handleCloudflareSecurityBlocked === 'function'
+              ? await handleCloudflareSecurityBlocked(message.error)
+              : (typeof message.error === 'string' ? message.error : String(message.error || ''));
+            notifyStepError(message.step, '流程已被用户停止。');
+            return { ok: true, error: userMessage };
+          }
           if (isStopError(message.error)) {
             await setStepStatus(message.step, 'stopped');
             await addLog(`步骤 ${message.step} 已被用户停止`, 'warn');
@@ -260,6 +286,18 @@
           await resetState();
           await addLog('流程已重置', 'info');
           return { ok: true };
+        }
+
+        case 'CLEAR_ACCOUNT_RUN_HISTORY': {
+          const state = await getState();
+          if (isAutoRunLockedState(state)) {
+            throw new Error('自动流程运行中，当前不能清理邮箱记录。');
+          }
+          if (typeof clearAccountRunHistory !== 'function') {
+            return { ok: true, clearedCount: 0 };
+          }
+          const result = await clearAccountRunHistory(state);
+          return { ok: true, ...result };
         }
 
         case 'EXECUTE_STEP': {
@@ -546,42 +584,6 @@
         case 'DELETE_USED_ICLOUD_ALIASES': {
           clearStopRequest();
           const result = await deleteUsedIcloudAliases();
-          return { ok: true, ...result };
-        }
-
-        case 'LIST_STANDARD_ICLOUD_POOL': {
-          clearStopRequest();
-          const aliases = await listStandardIcloudPool();
-          return { ok: true, aliases };
-        }
-
-        case 'SYNC_STANDARD_ICLOUD_POOL': {
-          clearStopRequest();
-          const result = await syncStandardIcloudPool({ ...(message.payload || {}), createMissing: false });
-          return { ok: true, ...result };
-        }
-
-        case 'SET_STANDARD_ICLOUD_EMAIL_USED_STATE': {
-          clearStopRequest();
-          const result = await setStandardIcloudEmailUsedState(message.payload || {});
-          return { ok: true, ...result };
-        }
-
-        case 'SET_STANDARD_ICLOUD_EMAIL_PRESERVED_STATE': {
-          clearStopRequest();
-          const result = await setStandardIcloudEmailPreservedState(message.payload || {});
-          return { ok: true, ...result };
-        }
-
-        case 'DELETE_STANDARD_ICLOUD_EMAIL': {
-          clearStopRequest();
-          const result = await deleteStandardIcloudEmail(message.payload || {});
-          return { ok: true, ...result };
-        }
-
-        case 'DELETE_USED_STANDARD_ICLOUD_EMAILS': {
-          clearStopRequest();
-          const result = await deleteUsedStandardIcloudEmails();
           return { ok: true, ...result };
         }
 

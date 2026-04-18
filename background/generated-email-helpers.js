@@ -4,22 +4,20 @@
   function createGeneratedEmailHelpers(deps = {}) {
     const {
       addLog,
+      buildGeneratedAliasEmail,
       buildCloudflareTempEmailHeaders,
       CLOUDFLARE_TEMP_EMAIL_GENERATOR,
       DUCK_AUTOFILL_URL,
       fetch,
       fetchIcloudHideMyEmail,
-      fetchIcloudStandardAliasFromPool,
-      getConfiguredIcloudHostPreference,
       getCloudflareTempEmailAddressFromResponse,
       getCloudflareTempEmailConfig,
-      getIcloudMailUrlForHost,
       getState,
       joinCloudflareTempEmailUrl,
-      normalizeIcloudHost,
       normalizeCloudflareDomain,
       normalizeCloudflareTempEmailAddress,
       normalizeEmailGenerator,
+      isGeneratedAliasProvider,
       reuseOrCreateTab,
       sendToContentScript,
       setEmailState,
@@ -189,21 +187,38 @@
       return result.email;
     }
 
-    async function fetchIcloudStandardAlias(state, options = {}) {
-      return fetchIcloudStandardAliasFromPool(state, options);
+    async function fetchManagedAliasEmail(state, options = {}) {
+      throwIfStopped();
+      const provider = String(options.mailProvider || state?.mailProvider || '').trim().toLowerCase();
+      const mergedState = {
+        ...(state || {}),
+        mailProvider: provider,
+      };
+      if (options.gmailBaseEmail !== undefined) {
+        mergedState.gmailBaseEmail = String(options.gmailBaseEmail || '').trim();
+      }
+      if (options.mail2925BaseEmail !== undefined) {
+        mergedState.mail2925BaseEmail = String(options.mail2925BaseEmail || '').trim();
+      }
+
+      const email = buildGeneratedAliasEmail(mergedState);
+      await setEmailState(email);
+      await addLog(`${provider === 'gmail' ? 'Gmail +tag' : '2925'}：已生成 ${email}`, 'ok');
+      return email;
     }
 
     async function fetchGeneratedEmail(state, options = {}) {
       const currentState = state || await getState();
+      const provider = String(options.mailProvider || currentState.mailProvider || '').trim().toLowerCase();
+      if (isGeneratedAliasProvider?.(provider)) {
+        return fetchManagedAliasEmail(currentState, options);
+      }
       const generator = normalizeEmailGenerator(options.generator ?? currentState.emailGenerator);
       if (generator === 'custom') {
         throw new Error('当前邮箱生成方式为自定义邮箱，请直接填写注册邮箱。');
       }
       if (generator === 'icloud') {
         return fetchIcloudHideMyEmail();
-      }
-      if (generator === 'icloud-standard-alias') {
-        return fetchIcloudStandardAlias(currentState, options);
       }
       if (generator === 'cloudflare') {
         return fetchCloudflareEmail(currentState, options);
@@ -220,7 +235,6 @@
       fetchCloudflareTempEmailAddress,
       fetchDuckEmail,
       fetchGeneratedEmail,
-      fetchIcloudStandardAlias,
       generateCloudflareAliasLocalPart,
       requestCloudflareTempEmailJson,
     };

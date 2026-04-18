@@ -39,7 +39,11 @@
           type: 'PREPARE_SIGNUP_VERIFICATION',
           step: 4,
           source: 'background',
-          payload: { password: state.password || state.customPassword || '' },
+          payload: {
+            password: state.password || state.customPassword || '',
+            prepareSource: 'step4_execute',
+            prepareLogLabel: '步骤 4 执行',
+          },
         },
         {
           timeoutMs: 30000,
@@ -87,7 +91,7 @@
       }
 
       await resolveVerificationStep(4, state, mail, {
-        filterAfterTimestamp: mail.provider === HOTMAIL_PROVIDER ? undefined : stepStartedAt,
+        filterAfterTimestamp: stepStartedAt,
         requestFreshCodeFirst: mail.provider === HOTMAIL_PROVIDER ? false : true,
         resendIntervalMs: (mail.provider === HOTMAIL_PROVIDER || mail.provider === '2925')
           ? 0

@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 
 <head>
@@ -22,7 +22,7 @@
       </svg>
       <div class="header-version-block">
         <div class="header-version-main">
-          <div id="extension-update-status" class="header-version-title">v0.0.0</div>
+          <div id="extension-update-status" class="header-version-title">Pro0.0</div>
           <button id="btn-release-log" class="header-link-btn" type="button" hidden>更新日志</button>
         </div>
         <span id="extension-version-meta" class="header-version-meta" hidden></span>
@@ -118,16 +118,9 @@
       </div>
       <div class="data-row" id="row-local-cpa-step9-mode">
         <span class="data-label">本地 CPA</span>
-        <div id="local-cpa-step9-mode-group" class="choice-group" role="group" aria-label="本地 CPA 第 9 步策略">
+        <div id="local-cpa-step9-mode-group" class="choice-group" role="group" aria-label="本地 CPA 第 10 步策略">
           <button type="button" class="choice-btn" data-local-cpa-step9-mode="submit">全部回调</button>
-          <button type="button" class="choice-btn" data-local-cpa-step9-mode="bypass">跳过第9步</button>
-        </div>
-      </div>
-      <div class="data-row" id="row-cpa-callback-mode">
-        <span class="data-label">CPA回调</span>
-        <div id="cpa-callback-mode-group" class="choice-group" role="group" aria-label="CPA 回调阶段">
-          <button type="button" class="choice-btn" data-cpa-callback-mode="step6">第六步回调</button>
-          <button type="button" class="choice-btn" data-cpa-callback-mode="step8">第八步回调</button>
+          <button type="button" class="choice-btn" data-local-cpa-step9-mode="bypass">跳过第10步</button>
         </div>
       </div>
       <div class="data-row" id="row-sub2api-url" style="display:none;">
@@ -146,6 +139,11 @@
       <div class="data-row" id="row-sub2api-group" style="display:none;">
         <span class="data-label">分组</span>
         <input type="text" id="input-sub2api-group" class="data-input" placeholder="默认 codex" />
+      </div>
+      <div class="data-row" id="row-sub2api-default-proxy" style="display:none;">
+        <span class="data-label">默认代理</span>
+        <input type="text" id="input-sub2api-default-proxy" class="data-input"
+          placeholder="shadowrocket 或代理 ID" />
       </div>
       <div class="data-row">
         <span class="data-label">账户密码</span>
@@ -187,7 +185,6 @@
           <option value="duck">DuckDuckGo</option>
           <option value="cloudflare">Cloudflare</option>
           <option value="icloud">iCloud 隐私邮箱</option>
-          <option value="icloud-standard-alias">普通 iCloud 别名邮箱</option>
           <option value="cloudflare-temp-email">Cloudflare Temp Email</option>
         </select>
       </div>
@@ -226,8 +223,8 @@
         </div>
       </div>
       <div class="data-row" id="row-email-prefix" style="display:none;">
-        <span class="data-label" id="label-email-prefix">邮箱前缀</span>
-        <input type="text" id="input-email-prefix" class="data-input" placeholder="例如 abc" />
+        <span class="data-label" id="label-email-prefix">别名基邮箱</span>
+        <input type="text" id="input-email-prefix" class="data-input" placeholder="例如 yourname@example.com" />
       </div>
       <div class="data-row" id="row-inbucket-host" style="display:none;">
         <span class="data-label">Inbucket</span>
@@ -242,25 +239,6 @@
         <div class="data-inline">
           <input type="text" id="input-email" class="data-input" placeholder="自动生成或手动粘贴邮箱" />
           <button id="btn-fetch-email" class="btn btn-outline btn-sm data-inline-btn" type="button">获取</button>
-        </div>
-      </div>
-      <div class="data-row">
-        <span class="data-label">自动重试</span>
-        <div class="data-inline fallback-inline">
-          <label class="toggle-switch" for="input-auto-skip-failures">
-            <input type="checkbox" id="input-auto-skip-failures" />
-            <span class="toggle-switch-track" aria-hidden="true">
-              <span class="toggle-switch-thumb"></span>
-            </span>
-          </label>
-          <div class="timing-field timing-field-labeled timing-field-right fallback-thread-interval">
-            <span class="auto-delay-caption">线程间隔</span>
-            <div class="auto-delay-controls">
-              <input type="number" id="input-auto-skip-failures-thread-interval-minutes" class="data-input auto-delay-input" value="0"
-                min="0" max="1440" step="1" title="兜底模式下，两轮线程之间的等待分钟数" />
-              <span class="data-unit">分钟</span>
-            </div>
-          </div>
         </div>
       </div>
       <div class="data-row">
@@ -290,19 +268,45 @@
         </div>
       </div>
       <div class="data-row">
-        <span class="data-label">本地留档</span>
-        <div class="data-inline">
+        <span class="data-label">自动重试</span>
+        <div class="data-inline fallback-inline">
+          <label class="toggle-switch" for="input-auto-skip-failures">
+            <input type="checkbox" id="input-auto-skip-failures" />
+            <span class="toggle-switch-track" aria-hidden="true">
+              <span class="toggle-switch-thumb"></span>
+            </span>
+          </label>
+          <div class="timing-field timing-field-labeled timing-field-right fallback-thread-interval">
+            <span class="auto-delay-caption">线程间隔</span>
+            <div class="auto-delay-controls">
+              <input type="number" id="input-auto-skip-failures-thread-interval-minutes" class="data-input auto-delay-input" value="0"
+                min="0" max="1440" step="1" title="兜底模式下，两轮线程之间的等待分钟数" />
+              <span class="data-unit">分钟</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="data-row">
+        <span class="data-label">本地同步</span>
+        <div class="data-inline auto-delay-inline">
           <label class="toggle-switch" for="input-account-run-history-text-enabled">
             <input type="checkbox" id="input-account-run-history-text-enabled" />
             <span class="toggle-switch-track" aria-hidden="true">
               <span class="toggle-switch-thumb"></span>
             </span>
           </label>
-          <span class="data-value">同步写入账号运行历史 txt</span>
+          <div class="timing-field timing-field-right setting-inline-right">
+            <span class="auto-delay-caption">验证码重发</span>
+            <div class="auto-delay-controls">
+              <input type="number" id="input-verification-resend-count" class="data-input auto-delay-input" value="4"
+                min="0" max="20" step="1" title="自动点击重新发送验证码的次数" />
+              <span class="data-unit">次</span>
+            </div>
+          </div>
         </div>
       </div>
       <div class="data-row" id="row-account-run-history-helper-base-url" style="display:none;">
-        <span class="data-label">留档服务</span>
+        <span class="data-label">同步服务</span>
         <input type="text" id="input-account-run-history-helper-base-url" class="data-input mono" placeholder="http://127.0.0.1:17373" />
       </div>
       <div class="data-row">
@@ -549,7 +553,10 @@
   <section id="log-section">
     <div class="log-header">
       <span class="section-label">日志</span>
-      <button id="btn-clear-log" class="btn btn-ghost btn-xs" title="清空日志">清空</button>
+      <div class="log-header-actions">
+        <button id="btn-open-account-records" class="btn btn-ghost btn-xs" title="查看邮箱记录">记录</button>
+        <button id="btn-clear-log" class="btn btn-ghost btn-xs" title="清空日志">清空</button>
+      </div>
     </div>
     <div id="account-run-history-strip" class="account-run-history-strip" hidden>
       <div class="account-run-history-head">
@@ -563,6 +570,28 @@
     </div>
     <div id="log-area"></div>
   </section>
+
+  <div id="account-records-overlay" class="account-records-overlay" hidden>
+    <div class="account-records-panel">
+      <div class="account-records-panel-header">
+        <div class="account-records-panel-copy">
+          <span class="account-records-panel-title">邮箱记录</span>
+          <span id="account-records-meta" class="account-records-panel-meta">暂无邮箱记录</span>
+        </div>
+        <div class="account-records-panel-actions">
+          <button id="btn-clear-account-records" class="btn btn-ghost btn-xs" type="button">清理记录</button>
+          <button id="btn-close-account-records" class="modal-close" type="button" aria-label="关闭">×</button>
+        </div>
+      </div>
+      <div id="account-records-stats" class="account-records-stats"></div>
+      <div id="account-records-list" class="account-records-list"></div>
+      <div class="account-records-pagination">
+        <button id="btn-account-records-prev" class="btn btn-outline btn-xs" type="button">上一页</button>
+        <span id="account-records-page-label" class="account-records-page-label mono">0 / 0</span>
+        <button id="btn-account-records-next" class="btn btn-outline btn-xs" type="button">下一页</button>
+      </div>
+    </div>
+  </div>
 
   <div id="auto-start-modal" class="modal-overlay" hidden>
     <div class="modal-card">
@@ -588,6 +617,7 @@
 
   <div id="toast-container"></div>
   <input id="input-import-settings-file" type="file" accept=".json,application/json" hidden />
+  <script src="../managed-alias-utils.js"></script>
   <script src="../icloud-utils.js"></script>
   <script src="../hotmail-utils.js"></script>
   <script src="../luckmail-utils.js"></script>
@@ -596,6 +626,7 @@
   <script src="hotmail-manager.js"></script>
   <script src="icloud-manager.js"></script>
   <script src="luckmail-manager.js"></script>
+  <script src="account-records-manager.js"></script>
   <script src="sidepanel.js"></script>
 </body>
 

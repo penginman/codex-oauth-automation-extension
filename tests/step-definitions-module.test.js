@@ -10,7 +10,7 @@ test('step definitions module exposes ordered shared step metadata', () => {
   const steps = api.getSteps();
 
   assert.equal(Array.isArray(steps), true);
-  assert.equal(steps.length >= 9, true);
+  assert.equal(steps.length >= 10, true);
   assert.deepStrictEqual(
     steps.map((step) => step.order),
     steps.map((step) => step.order).slice().sort((left, right) => left - right)
@@ -23,6 +23,7 @@ test('step definitions module exposes ordered shared step metadata', () => {
       'fill-password',
       'fetch-signup-code',
       'fill-profile',
+      'clear-login-cookies',
       'oauth-login',
       'fetch-login-code',
       'confirm-oauth',
