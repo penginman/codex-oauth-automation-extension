@@ -10,6 +10,7 @@
       DUCK_AUTOFILL_URL,
       fetch,
       fetchIcloudHideMyEmail,
+      getConfiguredIcloudHostPreference,
       getCloudflareTempEmailAddressFromResponse,
       getCloudflareTempEmailConfig,
       getState,
@@ -187,24 +188,35 @@
       return result.email;
     }
 
-    async function fetchManagedAliasEmail(state, options = {}) {
+    async function fetchIcloudStandardAlias(state, options = {}) {
       throwIfStopped();
-      const provider = String(options.mailProvider || state?.mailProvider || '').trim().toLowerCase();
-      const mergedState = {
-        ...(state || {}),
-        mailProvider: provider,
-      };
-      if (options.gmailBaseEmail !== undefined) {
-        mergedState.gmailBaseEmail = String(options.gmailBaseEmail || '').trim();
+      const currentState = state || await getState();
+      const configuredHost = getConfiguredIcloudHostPreference(currentState)
+        || normalizeIcloudHost(currentState?.preferredIcloudHost)
+        || 'icloud.com';
+      const mailUrl = getIcloudMailUrlForHost(configuredHost) || 'https://www.icloud.com/mail/';
+
+      await addLog(`普通 iCloud 别名邮箱：正在打开 ${new URL(mailUrl).host} 邮件页...`, 'info');
+      await reuseOrCreateTab('icloud-mail', mailUrl);
+
+      const result = await sendToContentScript('icloud-mail', {
+        type: 'CREATE_ICLOUD_STANDARD_ALIAS',
+        source: 'background',
+        payload: {
+          maxAttempts: Math.max(1, Number(options.maxAttempts) || 1),
+        },
+      });
+
+      if (result?.error) {
+        throw new Error(result.error);
       }
-      if (options.mail2925BaseEmail !== undefined) {
-        mergedState.mail2925BaseEmail = String(options.mail2925BaseEmail || '').trim();
+      if (!result?.email) {
+        throw new Error('普通 iCloud 别名邮箱未返回可用邮箱地址。');
       }
 
-      const email = buildGeneratedAliasEmail(mergedState);
-      await setEmailState(email);
-      await addLog(`${provider === 'gmail' ? 'Gmail +tag' : '2925'}：已生成 ${email}`, 'ok');
-      return email;
+      await setEmailState(result.email);
+      await addLog(`普通 iCloud 别名邮箱：已创建 ${result.email}`, 'ok');
+      return result.email;
     }
 
     async function fetchGeneratedEmail(state, options = {}) {
