@@ -51,8 +51,6 @@ function extractFunction(name) {
 }
 
 const bundle = [
-  extractFunction('getPageTextSnapshot'),
-  extractFunction('getLoginVerificationDisplayedEmail'),
   extractFunction('inspectLoginAuthState'),
   extractFunction('normalizeStep6Snapshot'),
 ].join('\n');
@@ -62,13 +60,6 @@ function createApi(overrides = {}) {
 const location = {
   href: ${JSON.stringify(overrides.href || 'https://auth.openai.com/log-in')},
   pathname: ${JSON.stringify(overrides.pathname || '/log-in')},
-};
-
-const document = {
-  body: {
-    innerText: ${JSON.stringify(overrides.pageText || '')},
-    textContent: ${JSON.stringify(overrides.pageText || '')},
-  },
 };
 
 function getLoginTimeoutErrorPageState() {
@@ -134,16 +125,6 @@ return {
     'email_page',
     '第六步在 /log-in 页应优先识别为邮箱页'
   );
-}
-
-{
-  const api = createApi({
-    verificationTarget: { id: 'otp' },
-    pageText: 'We emailed a code to display.user@example.com. Enter it below.',
-  });
-
-  const snapshot = api.inspectLoginAuthState();
-  assert.strictEqual(snapshot.displayedEmail, 'display.user@example.com');
 }
 
 {

@@ -53,7 +53,6 @@ function extractFunction(source, name) {
 
 const helperBundle = [
   extractFunction(helperSource, 'clearStopRequest'),
-  extractFunction(helperSource, 'normalizeAutoRunSessionId'),
   extractFunction(helperSource, 'throwIfStopped'),
   extractFunction(helperSource, 'isStopError'),
   extractFunction(helperSource, 'isStepDoneStatus'),
@@ -71,7 +70,6 @@ const AUTO_RUN_MAX_RETRIES_PER_ROUND = 3;
 const AUTO_RUN_RETRY_DELAY_MS = 3000;
 const AUTO_RUN_TIMER_KIND_BETWEEN_ROUNDS = 'between_rounds';
 const AUTO_RUN_TIMER_KIND_BEFORE_RETRY = 'before_retry';
-const STEP_IDS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 const DEFAULT_STATE = {
   stepStatuses: {
     1: 'pending',
@@ -83,14 +81,11 @@ const DEFAULT_STATE = {
     7: 'pending',
     8: 'pending',
     9: 'pending',
-    10: 'pending',
   },
 };
 
 let stopRequested = false;
 let runCalls = 0;
-let autoRunSessionId = 0;
-let autoRunSessionSeed = 1000;
 
 const logs = [];
 const broadcasts = [];
@@ -107,8 +102,6 @@ let currentState = {
   autoStepDelaySeconds: null,
   mailProvider: '163',
   emailGenerator: 'duck',
-  gmailBaseEmail: 'demo@gmail.com',
-  mail2925BaseEmail: 'demo@2925.com',
   emailPrefix: 'demo',
   inbucketHost: '',
   inbucketMailbox: '',
@@ -158,8 +151,6 @@ async function resetState() {
     autoStepDelaySeconds: prev.autoStepDelaySeconds,
     mailProvider: prev.mailProvider,
     emailGenerator: prev.emailGenerator,
-    gmailBaseEmail: prev.gmailBaseEmail,
-    mail2925BaseEmail: prev.mail2925BaseEmail,
     emailPrefix: prev.emailPrefix,
     inbucketHost: prev.inbucketHost,
     inbucketMailbox: prev.inbucketMailbox,
@@ -194,17 +185,6 @@ async function persistAutoRunTimerPlan() {}
 async function launchAutoRunTimerPlan() { return false; }
 function getPendingAutoRunTimerPlan() { return null; }
 function getErrorMessage(error) { return error?.message || String(error || ''); }
-function createAutoRunSessionId() {
-  autoRunSessionSeed += 1;
-  autoRunSessionId = autoRunSessionSeed;
-  return autoRunSessionId;
-}
-function throwIfAutoRunSessionStopped(sessionId) {
-  if (sessionId && sessionId !== autoRunSessionId) {
-    throw new Error(STOP_ERROR_MESSAGE);
-  }
-  throwIfStopped();
-}
 const chrome = {
   runtime: {
     sendMessage() {
@@ -236,7 +216,6 @@ async function runAutoSequenceFromStep() {
       7: 'completed',
       8: 'completed',
       9: 'completed',
-      10: 'completed',
     },
     tabRegistry: {
       'signup-page': { tabId: 88, ready: true },
@@ -256,7 +235,6 @@ const runtime = {
     autoRunCurrentRun: 0,
     autoRunTotalRuns: 1,
     autoRunAttemptRun: 0,
-    autoRunSessionId: 0,
   },
   get() {
     return { ...this.state };
@@ -276,7 +254,6 @@ const controller = self.MultiPageBackgroundAutoRunController.createAutoRunContro
   broadcastStopToContentScripts,
   cancelPendingCommands,
   clearStopRequest,
-  createAutoRunSessionId,
   getAutoRunStatusPayload,
   getErrorMessage,
   getFirstUnfinishedStep,
@@ -295,7 +272,6 @@ const controller = self.MultiPageBackgroundAutoRunController.createAutoRunContro
   runtime,
   setState,
   sleepWithStop,
-  throwIfAutoRunSessionStopped,
   waitForRunningStepsToFinish,
   throwIfStopped,
   chrome,
@@ -326,9 +302,6 @@ return {
   assert.strictEqual(snapshot.currentState.autoRunPhase, 'complete', 'both runs should complete after reset');
   assert.strictEqual(snapshot.currentState.autoRunCurrentRun, 2, 'final run index should be recorded');
   assert.strictEqual(snapshot.autoRunActive, false, 'auto-run should exit active state after completion');
-  assert.strictEqual(snapshot.currentState.autoRunSessionId, 0, 'session id should be cleared after completion');
-  assert.strictEqual(snapshot.currentState.gmailBaseEmail, 'demo@gmail.com', 'gmail base email should survive fresh-attempt reset');
-  assert.strictEqual(snapshot.currentState.mail2925BaseEmail, 'demo@2925.com', '2925 base email should survive fresh-attempt reset');
 
   console.log('auto-run fresh attempt reset tests passed');
 })().catch((error) => {

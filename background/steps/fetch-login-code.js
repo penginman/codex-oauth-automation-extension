@@ -1,16 +1,15 @@
-(function attachBackgroundStep8(root, factory) {
-  root.MultiPageBackgroundStep8 = factory();
-})(typeof self !== 'undefined' ? self : globalThis, function createBackgroundStep8Module() {
-  function createStep8Executor(deps = {}) {
+(function attachBackgroundStep7(root, factory) {
+  root.MultiPageBackgroundStep7 = factory();
+})(typeof self !== 'undefined' ? self : globalThis, function createBackgroundStep7Module() {
+  function createStep7Executor(deps = {}) {
     const {
       addLog,
       chrome,
       CLOUDFLARE_TEMP_EMAIL_PROVIDER,
       confirmCustomVerificationStepBypass,
-      ensureStep8VerificationPageReady,
-      executeStep7,
-      getOAuthFlowRemainingMs,
-      getOAuthFlowStepTimeoutMs,
+      ensureStep7VerificationPageReady,
+      executeStep6,
+      getPanelMode,
       getMailConfig,
       getState,
       getTabId,
@@ -22,6 +21,7 @@
       reuseOrCreateTab,
       setState,
       setStepStatus,
+      shouldSkipLoginVerificationForCpaCallback,
       shouldUseCustomRegistrationEmail,
       sleepWithStop,
       STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS,
@@ -29,36 +29,9 @@
       throwIfStopped,
     } = deps;
 
-    async function getStep8ReadyTimeoutMs(actionLabel) {
-      if (typeof getOAuthFlowStepTimeoutMs !== 'function') {
-        return 15000;
-      }
-
-      return getOAuthFlowStepTimeoutMs(15000, {
-        step: 8,
-        actionLabel,
-      });
-    }
-
-    function getStep8RemainingTimeResolver() {
-      if (typeof getOAuthFlowRemainingMs !== 'function') {
-        return undefined;
-      }
-
-      return async (details = {}) => getOAuthFlowRemainingMs({
-        step: 8,
-        actionLabel: details.actionLabel || '登录验证码流程',
-      });
-    }
-
-    function normalizeStep8VerificationTargetEmail(value) {
-      return String(value || '').trim().toLowerCase();
-    }
-
-    async function runStep8Attempt(state) {
+    async function runStep7Attempt(state) {
       const mail = getMailConfig(state);
       if (mail.error) throw new Error(mail.error);
-
       const stepStartedAt = Date.now();
       const authTabId = await getTabId('signup-page');
 
@@ -66,46 +39,25 @@
         await chrome.tabs.update(authTabId, { active: true });
       } else {
         if (!state.oauthUrl) {
-          throw new Error('缺少登录用 OAuth 链接，请先完成步骤 7。');
+          throw new Error('缺少登录用 OAuth 链接，请先完成步骤 6。');
         }
         await reuseOrCreateTab('signup-page', state.oauthUrl);
       }
 
       throwIfStopped();
-      const pageState = await ensureStep8VerificationPageReady({
-        timeoutMs: await getStep8ReadyTimeoutMs('确认登录验证码页已就绪'),
-      });
-      const shouldCompareVerificationEmail = mail.provider !== '2925';
-      const displayedVerificationEmail = shouldCompareVerificationEmail
-        ? normalizeStep8VerificationTargetEmail(pageState?.displayedEmail)
-        : '';
-      const fixedTargetEmail = shouldCompareVerificationEmail
-        ? (displayedVerificationEmail || normalizeStep8VerificationTargetEmail(state?.email))
-        : '';
-
-      await setState({
-        step8VerificationTargetEmail: displayedVerificationEmail || '',
-      });
-
-      await addLog('步骤 8：登录验证码页面已就绪，开始获取验证码。', 'info');
-      if (shouldCompareVerificationEmail && displayedVerificationEmail) {
-        await addLog(`步骤 8：已固定当前验证码页显示邮箱 ${displayedVerificationEmail} 作为后续匹配目标。`, 'info');
-      }
+      await ensureStep7VerificationPageReady();
+      await addLog('步骤 7：登录验证码页面已就绪，开始获取验证码。', 'info');
 
       if (shouldUseCustomRegistrationEmail(state)) {
-        await confirmCustomVerificationStepBypass(8);
+        await confirmCustomVerificationStepBypass(7);
         return;
       }
 
       throwIfStopped();
-      if (
-        mail.provider === HOTMAIL_PROVIDER
-        || mail.provider === LUCKMAIL_PROVIDER
-        || mail.provider === CLOUDFLARE_TEMP_EMAIL_PROVIDER
-      ) {
-        await addLog(`步骤 8：正在通过 ${mail.label} 轮询验证码...`);
+      if (mail.provider === HOTMAIL_PROVIDER || mail.provider === LUCKMAIL_PROVIDER || mail.provider === CLOUDFLARE_TEMP_EMAIL_PROVIDER) {
+        await addLog(`步骤 7：正在通过 ${mail.label} 轮询验证码...`);
       } else {
-        await addLog(`步骤 8：正在打开${mail.label}...`);
+        await addLog(`步骤 7：正在打开${mail.label}...`);
 
         const alive = await isTabAlive(mail.source);
         if (alive) {
@@ -126,49 +78,68 @@
         }
       }
 
-      await resolveVerificationStep(8, {
-        ...state,
-        step8VerificationTargetEmail: displayedVerificationEmail || '',
-      }, mail, {
-        filterAfterTimestamp: stepStartedAt,
-        getRemainingTimeMs: getStep8RemainingTimeResolver(),
+      const shouldRefreshOAuthBeforeSubmit = getPanelMode(state) === 'cpa';
+      let step6ReplayCompleted = false;
+
+      await resolveVerificationStep(7, state, mail, {
+        filterAfterTimestamp: mail.provider === HOTMAIL_PROVIDER ? undefined : Math.max(0, stepStartedAt - 60000),
         requestFreshCodeFirst: false,
-        targetEmail: fixedTargetEmail,
         resendIntervalMs: (mail.provider === HOTMAIL_PROVIDER || mail.provider === '2925')
           ? 0
           : STANDARD_MAIL_VERIFICATION_RESEND_INTERVAL_MS,
+        beforeSubmit: shouldRefreshOAuthBeforeSubmit ? async (result) => {
+          if (step6ReplayCompleted) {
+            return;
+          }
+
+          step6ReplayCompleted = true;
+          await addLog(`步骤 7：已拿到登录验证码 ${result.code}，先刷新 CPA OAuth 链接并重走步骤 6，再回填验证码。`, 'warn');
+          await rerunStep6ForStep7Recovery({
+            logMessage: '步骤 7：正在重新获取最新 CPA OAuth 链接，并快速重走步骤 6...',
+            skipPreLoginCleanup: true,
+            postStepDelayMs: 1200,
+          });
+          await ensureStep7VerificationPageReady();
+          await addLog('步骤 7：登录验证码页面已重新就绪，开始回填刚才获取到的验证码。', 'info');
+        } : undefined,
       });
     }
 
-    async function rerunStep7ForStep8Recovery(options = {}) {
+    async function rerunStep6ForStep7Recovery(options = {}) {
       const {
-        logMessage = '步骤 8：正在回到步骤 7，重新发起登录验证码流程...',
+        logMessage = '步骤 7：正在回到步骤 6，重新发起登录验证码流程...',
+        skipPreLoginCleanup = false,
         postStepDelayMs = 3000,
       } = options;
       const currentState = await getState();
       await addLog(logMessage, 'warn');
-      await executeStep7(currentState);
+      await executeStep6(currentState, { skipPreLoginCleanup });
       if (postStepDelayMs > 0) {
         await sleepWithStop(postStepDelayMs);
       }
     }
 
-    function isStep8RestartStep7Error(error) {
-      const message = String(error?.message || error || '');
-      return /STEP8_RESTART_STEP7::/i.test(message);
-    }
+    async function executeStep7(state) {
+      if (shouldSkipLoginVerificationForCpaCallback(state)) {
+        await setState({
+          lastLoginCode: null,
+          loginVerificationRequestedAt: null,
+        });
+        await setStepStatus(7, 'skipped');
+        await addLog('步骤 7：当前已选择“第六步回调”，本轮无需获取登录验证码。', 'warn');
+        return;
+      }
 
-    async function executeStep8(state) {
       let currentState = state;
       let mailPollingAttempt = 1;
       let lastMailPollingError = null;
 
       while (true) {
         try {
-          await runStep8Attempt(currentState);
+          await runStep7Attempt(currentState);
           return;
         } catch (err) {
-          if (!isVerificationMailPollingError(err) && !isStep8RestartStep7Error(err)) {
+          if (!isVerificationMailPollingError(err)) {
             throw err;
           }
 
@@ -179,31 +150,25 @@
 
           mailPollingAttempt += 1;
           await addLog(
-            isStep8RestartStep7Error(err)
-              ? `步骤 8：检测到认证页进入重试/超时报错状态，准备从步骤 7 重新开始（${mailPollingAttempt}/${STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS}）...`
-              : `步骤 8：检测到邮箱轮询类失败，准备从步骤 7 重新开始（${mailPollingAttempt}/${STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS}）...`,
+            `步骤 7：检测到邮箱轮询类失败，准备从步骤 6 重新开始（${mailPollingAttempt}/${STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS}）...`,
             'warn'
           );
-          await rerunStep7ForStep8Recovery({
-            logMessage: isStep8RestartStep7Error(err)
-              ? '步骤 8：认证页进入重试/超时报错状态，正在回到步骤 7 重新发起登录流程...'
-              : '步骤 8：正在回到步骤 7，重新发起登录验证码流程...',
-          });
+          await rerunStep6ForStep7Recovery();
           currentState = await getState();
         }
       }
 
       if (lastMailPollingError) {
         throw new Error(
-          `步骤 8：登录验证码流程在 ${STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS} 轮邮箱轮询恢复后仍未成功。最后一次原因：${lastMailPollingError.message}`
+          `步骤 7：登录验证码流程在 ${STEP7_MAIL_POLLING_RECOVERY_MAX_ATTEMPTS} 轮邮箱轮询恢复后仍未成功。最后一次原因：${lastMailPollingError.message}`
         );
       }
 
-      throw new Error('步骤 8：登录验证码流程未成功完成。');
+      throw new Error('步骤 7：登录验证码流程未成功完成。');
     }
 
-    return { executeStep8 };
+    return { executeStep7 };
   }
 
-  return { createStep8Executor };
+  return { createStep7Executor };
 });

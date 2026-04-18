@@ -4,6 +4,7 @@
   function createNavigationUtils(deps = {}) {
     const {
       DEFAULT_SUB2API_URL,
+      normalizeCpaCallbackMode,
       normalizeLocalCpaStep9Mode,
     } = deps;
 
@@ -89,6 +90,11 @@
         && isLocalCpaUrl(state?.vpsUrl);
     }
 
+    function shouldSkipLoginVerificationForCpaCallback(state) {
+      return getPanelMode(state) === 'cpa'
+        && normalizeCpaCallbackMode(state?.cpaCallbackMode) === 'step6';
+    }
+
     function matchesSourceUrlFamily(source, candidateUrl, referenceUrl) {
       const candidate = parseUrlSafely(candidateUrl);
       if (!candidate) return false;
@@ -106,6 +112,9 @@
           return is163MailHost(candidate.hostname);
         case 'gmail-mail':
           return candidate.hostname === 'mail.google.com';
+        case 'icloud-mail':
+          return candidate.hostname === 'www.icloud.com'
+            || candidate.hostname === 'www.icloud.com.cn';
         case 'inbucket-mail':
           return Boolean(reference)
             && candidate.origin === reference.origin
@@ -163,6 +172,7 @@
       normalizeSub2ApiUrl,
       parseUrlSafely,
       shouldBypassStep9ForLocalCpa,
+      shouldSkipLoginVerificationForCpaCallback,
     };
   }
 

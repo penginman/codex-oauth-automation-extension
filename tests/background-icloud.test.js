@@ -54,7 +54,6 @@ function extractFunction(name) {
 const bundle = [
   extractFunction('normalizeEmailGenerator'),
   extractFunction('getEmailGeneratorLabel'),
-  extractFunction('normalizeVerificationResendCount'),
   extractFunction('normalizePersistentSettingValue'),
   extractFunction('finalizeIcloudAliasAfterSuccessfulFlow'),
 ].join('\n');
@@ -67,9 +66,6 @@ const CLOUDFLARE_TEMP_EMAIL_GENERATOR = 'cloudflare-temp-email';
 const DEFAULT_LOCAL_CPA_STEP9_MODE = 'submit';
 const DEFAULT_HOTMAIL_REMOTE_BASE_URL = '';
 const DEFAULT_HOTMAIL_LOCAL_BASE_URL = 'http://127.0.0.1:17373';
-const DEFAULT_VERIFICATION_RESEND_COUNT = 4;
-const VERIFICATION_RESEND_COUNT_MIN = 0;
-const VERIFICATION_RESEND_COUNT_MAX = 20;
 const PERSISTED_SETTING_DEFAULTS = {
   mailProvider: '163',
   autoStepDelaySeconds: null,
@@ -168,10 +164,12 @@ return {
 `)(overrides);
 }
 
-test('normalizeEmailGenerator and label support icloud', () => {
+test('normalizeEmailGenerator and label support icloud generators', () => {
   const api = createApi();
   assert.equal(api.normalizeEmailGenerator('icloud'), 'icloud');
   assert.equal(api.getEmailGeneratorLabel('icloud'), 'iCloud 隐私邮箱');
+  assert.equal(api.normalizeEmailGenerator('icloud-standard-alias'), 'icloud-standard-alias');
+  assert.equal(api.getEmailGeneratorLabel('icloud-standard-alias'), '普通 iCloud 别名邮箱');
 });
 
 test('normalizePersistentSettingValue handles icloud settings', () => {
@@ -179,8 +177,6 @@ test('normalizePersistentSettingValue handles icloud settings', () => {
   assert.equal(api.normalizePersistentSettingValue('icloudHostPreference', 'icloud.com'), 'icloud.com');
   assert.equal(api.normalizePersistentSettingValue('icloudHostPreference', 'bad-host'), 'auto');
   assert.equal(api.normalizePersistentSettingValue('autoDeleteUsedIcloudAlias', 1), true);
-  assert.equal(api.normalizePersistentSettingValue('verificationResendCount', '6'), 6);
-  assert.equal(api.normalizePersistentSettingValue('verificationResendCount', 99), 20);
   assert.equal(api.normalizePersistentSettingValue('cloudflareTempEmailReceiveMailbox', ' Forward@Example.com '), 'forward@example.com');
 });
 

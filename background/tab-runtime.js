@@ -12,72 +12,11 @@
       LOG_PREFIX,
       matchesSourceUrlFamily,
       setState,
-      sleepWithStop,
       STOP_ERROR_MESSAGE,
       throwIfStopped,
     } = deps;
 
     const pendingCommands = new Map();
-
-    async function sleepOrStop(ms) {
-      if (typeof sleepWithStop === 'function') {
-        await sleepWithStop(ms);
-        return;
-      }
-
-      const start = Date.now();
-      while (Date.now() - start < ms) {
-        throwIfStopped();
-        await new Promise((resolve) => setTimeout(resolve, Math.min(100, ms - (Date.now() - start))));
-      }
-    }
-
-    function waitForTabUpdateComplete(tabId, timeoutMs = 30000) {
-      return new Promise((resolve, reject) => {
-        let settled = false;
-        let stopTimer = null;
-
-        const cleanup = () => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          clearTimeout(stopTimer);
-          chrome.tabs.onUpdated.removeListener(listener);
-        };
-
-        const resolveSafely = () => {
-          cleanup();
-          resolve();
-        };
-
-        const rejectSafely = (error) => {
-          cleanup();
-          reject(error);
-        };
-
-        const listener = (updatedTabId, info) => {
-          if (updatedTabId === tabId && info.status === 'complete') {
-            resolveSafely();
-          }
-        };
-
-        const timer = setTimeout(resolveSafely, timeoutMs);
-        chrome.tabs.onUpdated.addListener(listener);
-
-        const pollStop = () => {
-          if (settled) return;
-          try {
-            throwIfStopped();
-          } catch (error) {
-            rejectSafely(error);
-            return;
-          }
-          stopTimer = setTimeout(pollStop, 100);
-        };
-
-        pollStop();
-      });
-    }
 
     async function getTabRegistry() {
       const state = await getState();
@@ -240,7 +179,7 @@
         } catch {
           return null;
         }
-        await sleepOrStop(retryDelayMs);
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
       }
       return null;
     }
@@ -258,7 +197,7 @@
         } catch {
           return null;
         }
-        await sleepOrStop(retryDelayMs);
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
       }
       return null;
     }
@@ -276,7 +215,7 @@
         } catch {
           return null;
         }
-        await sleepOrStop(retryDelayMs);
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
       }
 
       try {
@@ -357,7 +296,7 @@
           logged = true;
         }
 
-        await sleepOrStop(retryDelayMs);
+        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
       }
 
       throw lastError || new Error(`${getSourceLabel(source)} 内容脚本长时间未就绪。`);
@@ -479,7 +418,17 @@
             if (registry[source]) registry[source].ready = false;
             await setState({ tabRegistry: registry });
             await chrome.tabs.reload(tabId);
-            await waitForTabUpdateComplete(tabId);
+            await new Promise((resolve) => {
+              const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 30000);
+              const listener = (tid, info) => {
+                if (tid === tabId && info.status === 'complete') {
+                  chrome.tabs.onUpdated.removeListener(listener);
+                  clearTimeout(timer);
+                  resolve();
+                }
+              };
+              chrome.tabs.onUpdated.addListener(listener);
+            });
           }
 
           if (options.inject) {
@@ -498,7 +447,7 @@
               target: { tabId },
               files: options.inject,
             });
-            await sleepOrStop(500);
+            await new Promise((resolve) => setTimeout(resolve, 500));
           }
 
           await rememberSourceLastUrl(source, url);
@@ -509,7 +458,17 @@
         await setState({ tabRegistry: registry });
         await chrome.tabs.update(tabId, { url, active: true });
 
-        await waitForTabUpdateComplete(tabId);
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 30000);
+          const listener = (tid, info) => {
+            if (tid === tabId && info.status === 'complete') {
+              chrome.tabs.onUpdated.removeListener(listener);
+              clearTimeout(timer);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+        });
 
         if (options.inject) {
           if (options.injectSource) {
@@ -527,7 +486,7 @@
           });
         }
 
-        await sleepOrStop(500);
+        await new Promise((resolve) => setTimeout(resolve, 500));
         await rememberSourceLastUrl(source, url);
         return tabId;
       }
@@ -536,7 +495,17 @@
       const tab = await chrome.tabs.create({ url, active: true });
 
       if (options.inject) {
-        await waitForTabUpdateComplete(tab.id);
+        await new Promise((resolve) => {
+          const timer = setTimeout(() => { chrome.tabs.onUpdated.removeListener(listener); resolve(); }, 30000);
+          const listener = (tabId, info) => {
+            if (tabId === tab.id && info.status === 'complete') {
+              chrome.tabs.onUpdated.removeListener(listener);
+              clearTimeout(timer);
+              resolve();
+            }
+          };
+          chrome.tabs.onUpdated.addListener(listener);
+        });
         if (options.injectSource) {
           await chrome.scripting.executeScript({
             target: { tabId: tab.id },
@@ -578,12 +547,7 @@
     }
 
     async function sendToContentScriptResilient(source, message, options = {}) {
-      const {
-        timeoutMs = 30000,
-        retryDelayMs = 600,
-        logMessage = '',
-        responseTimeoutMs,
-      } = options;
+      const { timeoutMs = 30000, retryDelayMs = 600, logMessage = '' } = options;
       const start = Date.now();
       let lastError = null;
       let logged = false;
@@ -594,11 +558,7 @@
         attempt += 1;
 
         try {
-          return await sendToContentScript(
-            source,
-            message,
-            responseTimeoutMs !== undefined ? { responseTimeoutMs } : {}
-          );
+          return await sendToContentScript(source, message);
         } catch (err) {
           const retryable = isRetryableContentScriptTransportError(err);
           if (!retryable) {
@@ -611,7 +571,7 @@
             logged = true;
           }
 
-          await sleepOrStop(retryDelayMs);
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
         }
       }
 
@@ -619,11 +579,7 @@
     }
 
     async function sendToMailContentScriptResilient(mail, message, options = {}) {
-      const {
-        timeoutMs = 45000,
-        maxRecoveryAttempts = 2,
-        responseTimeoutMs,
-      } = options;
+      const { timeoutMs = 45000, maxRecoveryAttempts = 2 } = options;
       const start = Date.now();
       let lastError = null;
       let recoveries = 0;
@@ -633,11 +589,7 @@
         throwIfStopped();
 
         try {
-          return await sendToContentScript(
-            mail.source,
-            message,
-            responseTimeoutMs !== undefined ? { responseTimeoutMs } : {}
-          );
+          return await sendToContentScript(mail.source, message);
         } catch (err) {
           if (!isRetryableContentScriptTransportError(err)) {
             throw err;
@@ -659,7 +611,7 @@
             injectSource: mail.injectSource,
             reloadIfSameUrl: true,
           });
-          await sleepOrStop(800);
+          await new Promise((resolve) => setTimeout(resolve, 800));
         }
       }
 

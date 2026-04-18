@@ -11,10 +11,6 @@ function createRouter(overrides = {}) {
     logs: [],
     stepStatuses: [],
     emailStates: [],
-    finalizePayloads: [],
-    notifyCompletions: [],
-    notifyErrors: [],
-    securityBlocks: [],
   };
 
   const router = api.createMessageRouter({
@@ -45,9 +41,6 @@ function createRouter(overrides = {}) {
     executeStepViaCompletionSignal: async () => {},
     exportSettingsBundle: async () => ({}),
     fetchGeneratedEmail: async () => '',
-    finalizeStep3Completion: overrides.finalizeStep3Completion || (async (payload) => {
-      events.finalizePayloads.push(payload);
-    }),
     finalizeIcloudAliasAfterSuccessfulFlow: async () => {},
     findHotmailAccount: async () => null,
     flushCommand: async () => {},
@@ -57,14 +50,8 @@ function createRouter(overrides = {}) {
     getState: async () => overrides.state || { stepStatuses: { 3: 'pending' } },
     getStopRequested: () => false,
     handleAutoRunLoopUnhandledError: async () => {},
-    handleCloudflareSecurityBlocked: overrides.handleCloudflareSecurityBlocked || (async (error) => {
-      const message = typeof error === 'string' ? error : error?.message || '';
-      events.securityBlocks.push(message);
-      return message.replace(/^(?:CF_SECURITY_BLOCKED|NETWORK_TIMEOUT_BLOCKED)::/, '') || message;
-    }),
     importSettingsBundle: async () => {},
     invalidateDownstreamAfterStepRestart: async () => {},
-    isCloudflareSecurityBlockedError: overrides.isCloudflareSecurityBlockedError || ((error) => /^(?:CF_SECURITY_BLOCKED|NETWORK_TIMEOUT_BLOCKED)::/.test(typeof error === 'string' ? error : error?.message || '')),
     isAutoRunLockedState: () => false,
     isHotmailProvider: () => false,
     isLocalhostOAuthCallbackUrl: () => true,
@@ -76,12 +63,8 @@ function createRouter(overrides = {}) {
     normalizeHotmailAccounts: (items) => items,
     normalizeRunCount: (value) => value,
     AUTO_RUN_TIMER_KIND_SCHEDULED_START: 'scheduled',
-    notifyStepComplete: (step, payload) => {
-      events.notifyCompletions.push({ step, payload });
-    },
-    notifyStepError: (step, error) => {
-      events.notifyErrors.push({ step, error });
-    },
+    notifyStepComplete: () => {},
+    notifyStepError: () => {},
     patchHotmailAccount: async () => {},
     registerTab: async () => {},
     requestStop: async () => {},
@@ -141,111 +124,4 @@ test('message router does not overwrite a completed step 3 when step 2 is replay
   });
 
   assert.deepStrictEqual(events.stepStatuses, []);
-});
-
-test('message router finalizes step 3 before marking it completed', async () => {
-  const { router, events } = createRouter();
-
-  const response = await router.handleMessage({
-    type: 'STEP_COMPLETE',
-    step: 3,
-    source: 'signup-page',
-    payload: {
-      email: 'user@example.com',
-      signupVerificationRequestedAt: 123,
-    },
-  }, {});
-
-  assert.deepStrictEqual(events.finalizePayloads, [
-    {
-      email: 'user@example.com',
-      signupVerificationRequestedAt: 123,
-    },
-  ]);
-  assert.deepStrictEqual(events.stepStatuses, [{ step: 3, status: 'completed' }]);
-  assert.deepStrictEqual(events.emailStates, ['user@example.com']);
-  assert.deepStrictEqual(events.notifyCompletions, [
-    {
-      step: 3,
-      payload: {
-        email: 'user@example.com',
-        signupVerificationRequestedAt: 123,
-      },
-    },
-  ]);
-  assert.deepStrictEqual(response, { ok: true });
-});
-
-test('message router marks step 3 failed when post-submit finalize fails', async () => {
-  const { router, events } = createRouter({
-    finalizeStep3Completion: async () => {
-      throw new Error('步骤 3 提交后仍停留在密码页。');
-    },
-  });
-
-  const response = await router.handleMessage({
-    type: 'STEP_COMPLETE',
-    step: 3,
-    source: 'signup-page',
-    payload: {
-      email: 'user@example.com',
-    },
-  }, {});
-
-  assert.deepStrictEqual(events.stepStatuses, [{ step: 3, status: 'failed' }]);
-  assert.deepStrictEqual(events.notifyErrors, [
-    {
-      step: 3,
-      error: '步骤 3 提交后仍停留在密码页。',
-    },
-  ]);
-  assert.equal(events.logs.some(({ message }) => /步骤 3 失败：步骤 3 提交后仍停留在密码页。/.test(message)), true);
-  assert.deepStrictEqual(response, { ok: true, error: '步骤 3 提交后仍停留在密码页。' });
-});
-
-test('message router stops the flow and surfaces cloudflare security block errors', async () => {
-  const { router, events } = createRouter();
-
-  const response = await router.handleMessage({
-    type: 'STEP_ERROR',
-    step: 7,
-    source: 'signup-page',
-    payload: {},
-    error: 'CF_SECURITY_BLOCKED::您已触发Cloudflare 安全防护系统',
-  }, {});
-
-  assert.deepStrictEqual(events.securityBlocks, ['CF_SECURITY_BLOCKED::您已触发Cloudflare 安全防护系统']);
-  assert.deepStrictEqual(events.notifyErrors, [
-    {
-      step: 7,
-      error: '流程已被用户停止。',
-    },
-  ]);
-  assert.deepStrictEqual(response, {
-    ok: true,
-    error: '您已触发Cloudflare 安全防护系统',
-  });
-});
-test('message router stops the flow and surfaces network timeout block errors', async () => {
-  const { router, events } = createRouter();
-
-  const response = await router.handleMessage({
-    type: 'STEP_ERROR',
-    step: 7,
-    source: 'signup-page',
-    payload: {},
-    error: 'NETWORK_TIMEOUT_BLOCKED::请检查当前网络节点是否稳定',
-  }, {});
-
-  assert.deepStrictEqual(events.securityBlocks, ['NETWORK_TIMEOUT_BLOCKED::请检查当前网络节点是否稳定']);
-  assert.deepStrictEqual(events.notifyErrors, [
-    {
-      step: 7,
-      error: '流程已被用户停止。',
-    },
-  ]);
-  assert.deepStrictEqual(response, {
-    ok: true,
-    error: '请检查当前网络节点是否稳定',
-  });
 });
