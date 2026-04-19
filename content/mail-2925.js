@@ -11,10 +11,22 @@ if (!isTopFrame) {
 } else {
 
 let seenCodes = new Set();
+let seenCodeSessionKey = '';
+let seenCodesReadyPromise = null;
 
 async function loadSeenCodes() {
   try {
-    const data = await chrome.storage.session.get('seen2925Codes');
+    const data = await chrome.storage.session.get(['seen2925CodeState', 'seen2925Codes']);
+    const state = data?.seen2925CodeState || null;
+    if (state && typeof state === 'object') {
+      seenCodeSessionKey = String(state.sessionKey || '');
+      if (Array.isArray(state.codes)) {
+        seenCodes = new Set(state.codes);
+      }
+      console.log(MAIL2925_PREFIX, `Loaded ${seenCodes.size} seen codes for session ${seenCodeSessionKey || 'default'}`);
+      return;
+    }
+
     if (data.seen2925Codes && Array.isArray(data.seen2925Codes)) {
       seenCodes = new Set(data.seen2925Codes);
       console.log(MAIL2925_PREFIX, `Loaded ${seenCodes.size} previously seen codes`);
@@ -24,14 +36,44 @@ async function loadSeenCodes() {
   }
 }
 
-loadSeenCodes();
+seenCodesReadyPromise = loadSeenCodes();
 
 async function persistSeenCodes() {
   try {
-    await chrome.storage.session.set({ seen2925Codes: [...seenCodes] });
+    await chrome.storage.session.set({
+      seen2925Codes: [...seenCodes],
+      seen2925CodeState: {
+        sessionKey: seenCodeSessionKey,
+        codes: [...seenCodes],
+      },
+    });
   } catch (err) {
     console.warn(MAIL2925_PREFIX, 'Could not persist seen codes, continuing in-memory only:', err?.message || err);
   }
+}
+
+function buildSeenCodeSessionKey(step, payload = {}) {
+  const timestamp = Number(payload?.filterAfterTimestamp);
+  if (Number.isFinite(timestamp) && timestamp > 0) {
+    return `${step}:${timestamp}`;
+  }
+  return `${step}:default`;
+}
+
+async function ensureSeenCodesSession(step, payload = {}) {
+  if (seenCodesReadyPromise) {
+    await seenCodesReadyPromise;
+    seenCodesReadyPromise = null;
+  }
+
+  const nextSessionKey = buildSeenCodeSessionKey(step, payload);
+  if (seenCodeSessionKey === nextSessionKey) {
+    return;
+  }
+
+  seenCodeSessionKey = nextSessionKey;
+  seenCodes = new Set();
+  await persistSeenCodes();
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -292,6 +334,7 @@ async function refreshInbox() {
 }
 
 async function handlePollEmail(step, payload) {
+  await ensureSeenCodesSession(step, payload);
   const {
     senderFilters,
     subjectFilters,

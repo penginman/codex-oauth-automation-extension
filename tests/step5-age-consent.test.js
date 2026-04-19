@@ -61,35 +61,43 @@ function getStep5Bundle() {
   ].join('\n');
 }
 
-test('step 5 clicks submit and completes immediately on birthday page', async () => {
-  const step5Source = extractFunction('step5_fillNameBirthday');
-  assert.ok(
-    !step5Source.includes('waitForStep5SubmitOutcome('),
-    'Step 5 提交后不应再等待页面结果'
-  );
-
+test('step 5 clicks the top all-consent checkbox on age page before submit', async () => {
   const api = new Function(`
 const logs = [];
 const completions = [];
 const clicks = [];
-const selectedBirthday = {};
 
 const nameInput = { value: '', hidden: false };
-const hiddenBirthday = {
-  value: '',
-  hidden: false,
-  dispatchEvent() {},
-};
+const ageInput = { value: '', hidden: false };
 const completeButton = {
   tagName: 'BUTTON',
-  textContent: '完成帐户创建',
+  textContent: '\\u5b8c\\u6210\\u8d26\\u6237\\u521b\\u5efa',
   hidden: false,
 };
-
-const birthdaySelects = {
-  '年': { label: '年', button: { hidden: false }, nativeSelect: {} },
-  '月': { label: '月', button: { hidden: false }, nativeSelect: {} },
-  '天': { label: '天', button: { hidden: false }, nativeSelect: {} },
+const allConsentLabel = {
+  hidden: false,
+  textContent: '\\u6211\\u540c\\u610f\\u4ee5\\u4e0b\\u6240\\u6709\\u5404\\u9879',
+  closest() {
+    return null;
+  },
+};
+const allConsentCheckbox = {
+  checked: false,
+  hidden: true,
+  name: 'allCheckboxes',
+  type: 'checkbox',
+  click() {
+    this.checked = true;
+  },
+  getAttribute(name) {
+    if (name === 'name') return this.name;
+    if (name === 'type') return this.type;
+    return '';
+  },
+  closest(selector) {
+    if (selector === 'label') return allConsentLabel;
+    return null;
+  },
 };
 
 const document = {
@@ -98,10 +106,10 @@ const document = {
       case '[role="spinbutton"][data-type="year"]':
       case '[role="spinbutton"][data-type="month"]':
       case '[role="spinbutton"][data-type="day"]':
-      case 'input[name="age"]':
-        return null;
       case 'input[name="birthday"]':
-        return hiddenBirthday;
+        return null;
+      case 'input[name="age"]':
+        return ageInput;
       case 'button[type="submit"]':
         return completeButton;
       default:
@@ -110,7 +118,10 @@ const document = {
   },
   querySelectorAll(selector) {
     if (selector === 'input[name="allCheckboxes"][type="checkbox"]') {
-      return [];
+      return [allConsentCheckbox];
+    }
+    if (selector === 'input[type="checkbox"]') {
+      return [allConsentCheckbox];
     }
     return [];
   },
@@ -120,11 +131,6 @@ const document = {
 const location = {
   href: 'https://auth.openai.com/u/signup/profile',
 };
-
-function Event(type, init = {}) {
-  this.type = type;
-  this.bubbles = Boolean(init.bubbles);
-}
 
 function log(message, level = 'info') {
   logs.push({ message, level });
@@ -141,19 +147,16 @@ function fillInput(input, value) {
   input.value = value;
 }
 
-function findBirthdayReactAriaSelect(label) {
-  return birthdaySelects[label] || null;
+function findBirthdayReactAriaSelect() {
+  return null;
 }
 
 function isVisibleElement(el) {
   return Boolean(el) && !el.hidden;
 }
 
-async function setReactAriaBirthdaySelect(select, value) {
-  selectedBirthday[select.label] = String(value).padStart(select.label === '年' ? 4 : 2, '0');
-  if (selectedBirthday['年'] && selectedBirthday['月'] && selectedBirthday['天']) {
-    hiddenBirthday.value = \`\${selectedBirthday['年']}-\${selectedBirthday['月']}-\${selectedBirthday['天']}\`;
-  }
+async function setReactAriaBirthdaySelect() {
+  throw new Error('setReactAriaBirthdaySelect should not run in age-mode test');
 }
 
 async function waitForElementByText() {
@@ -162,17 +165,20 @@ async function waitForElementByText() {
 
 function simulateClick(el) {
   clicks.push(el.textContent || el.tagName || 'element');
+  if (el === allConsentLabel || el === allConsentCheckbox) {
+    allConsentCheckbox.checked = true;
+  }
 }
 
 function reportComplete(step, payload) {
   completions.push({ step, payload });
 }
 
-  function normalizeInlineText(text) {
-    return String(text || '').replace(/\\s+/g, ' ').trim();
-  }
+function normalizeInlineText(text) {
+  return String(text || '').replace(/\\s+/g, ' ').trim();
+}
 
-  ${getStep5Bundle()}
+${getStep5Bundle()}
 
 return {
   async run(payload) {
@@ -184,43 +190,40 @@ return {
       completions,
       clicks,
       nameValue: nameInput.value,
-      birthdayValue: hiddenBirthday.value,
+      ageValue: ageInput.value,
+      consentChecked: allConsentCheckbox.checked,
     };
   },
 };
 `)();
 
   const result = await api.run({
-    firstName: 'Test',
-    lastName: 'User',
-    year: 2003,
-    month: 6,
-    day: 19,
+    firstName: 'Mia',
+    lastName: 'Harris',
+    age: 19,
   });
 
   const snapshot = api.snapshot();
-  assert.deepStrictEqual(
-    result,
-    {
-      skippedPostSubmitCheck: true,
-      directProceedToStep6: true,
-    },
-    '生日模式点击提交后应直接返回完成载荷'
-  );
+  assert.deepStrictEqual(result, {
+    skippedPostSubmitCheck: true,
+    directProceedToStep6: true,
+    ageMode: true,
+  });
+  assert.equal(snapshot.nameValue, 'Mia Harris');
+  assert.equal(snapshot.ageValue, '19');
+  assert.equal(snapshot.consentChecked, true);
+  assert.deepStrictEqual(snapshot.clicks, [
+    '\u6211\u540c\u610f\u4ee5\u4e0b\u6240\u6709\u5404\u9879',
+    '\u5b8c\u6210\u8d26\u6237\u521b\u5efa',
+  ]);
   assert.deepStrictEqual(snapshot.completions, [
     {
       step: 5,
       payload: {
         skippedPostSubmitCheck: true,
         directProceedToStep6: true,
+        ageMode: true,
       },
     },
   ]);
-  assert.deepStrictEqual(snapshot.clicks, ['完成帐户创建']);
-  assert.equal(snapshot.nameValue, 'Test User');
-  assert.equal(snapshot.birthdayValue, '2003-06-19');
-  assert.ok(
-    snapshot.logs.some(({ message }) => /不再等待页面结果/.test(message)),
-    '日志应明确说明 Step 5 已直接完成'
-  );
 });
