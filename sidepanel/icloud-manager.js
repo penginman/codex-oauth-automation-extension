@@ -20,6 +20,7 @@
         return type;
       }
       const mapping = {
+        CHECK_ICLOUD_SESSION: 'SYNC_STANDARD_ICLOUD_POOL',
         LIST_ICLOUD_ALIASES: 'LIST_STANDARD_ICLOUD_POOL',
         SET_ICLOUD_ALIAS_USED_STATE: 'SET_STANDARD_ICLOUD_EMAIL_USED_STATE',
         SET_ICLOUD_ALIAS_PRESERVED_STATE: 'SET_STANDARD_ICLOUD_EMAIL_PRESERVED_STATE',
@@ -431,7 +432,7 @@
       }
       try {
         const response = await runtime.sendMessage({
-          type: 'CHECK_ICLOUD_SESSION',
+          type: getIcloudMessageType('CHECK_ICLOUD_SESSION'),
           source: 'sidepanel',
           payload: {},
         });
@@ -439,7 +440,13 @@
           throw new Error(response.error);
         }
         hideIcloudLoginHelp();
-        helpers.showToast('iCloud 会话已恢复，别名列表已刷新。', 'success', 2600);
+        helpers.showToast(
+          isStandardMode()
+            ? '普通 iCloud 邮箱池连接已恢复，列表已刷新。'
+            : 'iCloud 会话已恢复，别名列表已刷新。',
+          'success',
+          2600
+        );
         await refreshIcloudAliases({ silent: true });
       } catch (err) {
         helpers.showToast(`看起来还没有登录完成：${err.message}`, 'warn', 4200);
